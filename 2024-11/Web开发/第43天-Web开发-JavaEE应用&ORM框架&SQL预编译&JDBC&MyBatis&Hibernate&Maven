@@ -1,0 +1,336 @@
+引言：数据库安全在WEB开发中的重要性
+
+在现代JavaEE开发中，数据库访问是几乎所有企业级应用的核心环节。随着WEB应用的复杂性增加，数据安全问题变得尤为突出，其中SQL注入攻击因其实现简单、危害巨大而成为最常见的WEB安全威胁之一。本文将从理论出发，结合实际开发案例，深入探讨JavaEE生态中各持久层技术的SQL注入防护机制。
+
+一、SQL注入原理与危害解析
+
+理论基础
+
+SQL注入攻击的本质是攻击者通过在应用程序的输入参数中插入恶意SQL代码，从而改变原始SQL语句的语义，执行非授权的数据库操作。这种攻击之所以能够成功，根本原因在于应用程序将用户输入的数据与SQL语句直接拼接，而没有进行适当的过滤和转义。
+
+攻击场景示例
+
+假设一个简单的用户登录查询：
+
+```sql
+-- 原始意图
+SELECT * FROM users WHERE username='admin' AND password='123456'
+
+-- 注入攻击后
+SELECT * FROM users WHERE username='admin' OR '1'='1' --' AND password='xxx'
+```
+
+攻击者通过输入admin' OR '1'='1' --作为用户名，使得WHERE条件永远为真，从而绕过了身份验证。
+
+二、JDBC层的安全防护实践
+
+传统Statement的风险
+
+```java
+// 危险代码示例
+String sql = "SELECT * FROM admin WHERE id=" + id;
+Statement stmt = connection.createStatement();
+ResultSet rs = stmt.executeQuery(sql);
+```
+
+当id参数为1 OR 1=1时，实际执行的SQL变为：
+
+```sql
+SELECT * FROM admin WHERE id=1 OR 1=1
+```
+
+这将返回所有管理员记录，导致严重的数据泄露。
+
+PreparedStatement的防护机制
+
+```java
+// 安全代码实践
+String sql = "SELECT * FROM admin WHERE id=?";
+PreparedStatement pstmt = connection.prepareStatement(sql);
+pstmt.setInt(1, Integer.parseInt(id));
+ResultSet rs = pstmt.executeQuery();
+```
+
+工作原理分析：
+
+1. 预编译阶段：SQL语句模板被发送到数据库进行预编译
+2. 参数分离：参数值与SQL语句结构分离存储
+3. 类型安全：通过setXXX方法确保参数类型正确
+4. 自动转义：数据库驱动负责特殊字符的转义处理
+
+Maven依赖配置
+
+```xml
+<dependency>
+    <groupId>mysql</groupId>
+    <artifactId>mysql-connector-java</artifactId>
+    <version>8.0.33</version>
+</dependency>
+```
+
+三、Hibernate框架的安全实践
+
+HQL注入风险
+
+```java
+// 不安全写法
+String username = request.getParameter("username");
+String hql = "FROM User WHERE username='" + username + "'";
+Query query = session.createQuery(hql);
+
+// 攻击示例：username输入 admin' OR '1'='1
+// 实际HQL: FROM User WHERE username='admin' OR '1'='1'
+```
+
+参数绑定的安全用法
+
+```java
+// 命名参数绑定（推荐）
+String hql = "FROM User WHERE username=:username";
+Query query = session.createQuery(hql);
+query.setParameter("username", username);
+
+// 位置参数绑定
+String hql = "FROM User WHERE username=?1";
+Query query = session.createQuery(hql);
+query.setParameter(1, username);
+```
+
+Hibernate配置安全增强
+
+```xml
+<!-- hibernate.cfg.xml -->
+<property name="hibernate.connection.driver_class">
+    com.mysql.cj.jdbc.Driver
+</property>
+<property name="hibernate.connection.url">
+    jdbc:mysql://localhost:3306/phpstudy?useSSL=true&allowPublicKeyRetrieval=true
+</property>
+<property name="hibernate.hbm2ddl.auto">validate</property>
+<!-- validate代替update，避免生产环境表结构意外变更 -->
+```
+
+四、MyBatis框架的注入防护
+
+#{}与${}的本质区别
+
+```xml
+<!-- AdminMapper.xml -->
+<!-- 安全写法：预编译处理 -->
+<select id="selectAdminById" resultType="Admin">
+    SELECT * FROM admin WHERE id = #{id}
+</select>
+
+<!-- 危险写法：直接拼接 -->
+<select id="selectAdminByIdUnsafe" resultType="Admin">
+    SELECT * FROM admin WHERE id = ${id}
+</select>
+```
+
+技术原理深度解析
+
+1. #{}工作原理：
+   · MyBatis会创建PreparedStatement
+   · 参数被替换为?占位符
+   · 执行时通过setXXX方法设置参数值
+   · 自动处理类型转换和特殊字符转义
+2. ${}工作原理：
+   · 直接进行字符串替换
+   · 生成完整的SQL语句
+   · 无参数类型检查和转义处理
+
+动态SQL的安全编写
+
+```xml
+<!-- 安全的分页查询示例 -->
+<select id="findUsers" parameterType="map" resultType="User">
+    SELECT * FROM users
+    WHERE 1=1
+    <if test="username != null and username != ''">
+        AND username = #{username}
+    </if>
+    <if test="role != null">
+        AND role = #{role}
+    </if>
+    ORDER BY ${sortField} ${sortOrder}
+    LIMIT #{offset}, #{pageSize}
+</select>
+```
+
+注意：ORDER BY子句中的字段名和排序方向不能使用#{}，此时需要：
+
+· 在业务层进行严格的参数校验
+· 使用白名单机制验证字段名的合法性
+
+五、综合防护策略与实践建议
+
+1. 分层防御体系
+
+```
+应用层防护 → 框架层防护 → 数据库层防护
+    ↓              ↓              ↓
+输入验证    参数绑定      最小权限原则
+    +       +       +
+编码输出  预编译机制  存储过程/视图
+```
+
+2. 输入验证与过滤
+
+```java
+// 多层输入验证示例
+public class InputValidator {
+    
+    // 1. 客户端验证（JavaScript）
+    // 2. 服务端验证
+    public static boolean isValidId(String id) {
+        if (id == null || id.trim().isEmpty()) {
+            return false;
+        }
+        // 正则表达式验证数字格式
+        return id.matches("\\d+") && id.length() < 10;
+    }
+    
+    // 3. SQL关键词过滤（辅助措施）
+    public static String filterSQLKeywords(String input) {
+        String[] keywords = {"SELECT", "INSERT", "DELETE", "UPDATE", 
+                           "DROP", "UNION", "--", "/*", "*/"};
+        for (String keyword : keywords) {
+            input = input.replace(keyword, "");
+        }
+        return input;
+    }
+}
+```
+
+3. 安全的Servlet实现模式
+
+```java
+@WebServlet("/secure/user")
+public class SecureUserServlet extends HttpServlet {
+    
+    private UserService userService = new UserService();
+    
+    protected void doGet(HttpServletRequest request, 
+                        HttpServletResponse response) {
+        
+        String idParam = request.getParameter("id");
+        
+        // 输入验证
+        if (!InputValidator.isValidId(idParam)) {
+            response.sendError(HttpServletResponse.SC_BAD_REQUEST);
+            return;
+        }
+        
+        try {
+            int id = Integer.parseInt(idParam);
+            // 使用预编译的持久层操作
+            User user = userService.findUserById(id);
+            
+            // 安全的响应输出
+            response.setContentType("application/json");
+            response.setCharacterEncoding("UTF-8");
+            
+            // 使用JSON库而不是字符串拼接
+            String json = new Gson().toJson(user);
+            response.getWriter().write(json);
+            
+        } catch (NumberFormatException e) {
+            response.sendError(HttpServletResponse.SC_BAD_REQUEST);
+        }
+    }
+}
+```
+
+4. 数据库权限最小化原则
+
+```sql
+-- 创建最小权限的数据库用户
+CREATE USER 'webapp'@'localhost' IDENTIFIED BY 'StrongPassword123!';
+GRANT SELECT, INSERT, UPDATE ON mydb.users TO 'webapp'@'localhost';
+-- 不授予DELETE、DROP等危险权限
+```
+
+六、高级防护与最佳实践
+
+1. 使用连接池的安全配置
+
+```xml
+<!-- HikariCP 安全配置示例 -->
+<property name="dataSourceClassName">com.mysql.cj.jdbc.MysqlDataSource</property>
+<property name="connectionTestQuery">SELECT 1</property>
+<property name="maximumPoolSize">20</property>
+<property name="leakDetectionThreshold">60000</property>
+```
+
+2. MyBatis插件增强安全
+
+```java
+// 自定义插件进行SQL审计
+@Intercepts({
+    @Signature(type = StatementHandler.class, 
+              method = "prepare", 
+              args = {Connection.class, Integer.class})
+})
+public class SqlAuditInterceptor implements Interceptor {
+    
+    @Override
+    public Object intercept(Invocation invocation) throws Throwable {
+        StatementHandler handler = (StatementHandler) invocation.getTarget();
+        BoundSql boundSql = handler.getBoundSql();
+        
+        // 记录SQL日志
+        logSQL(boundSql.getSql());
+        
+        // 检查潜在的注入风险
+        checkInjectionRisk(boundSql);
+        
+        return invocation.proceed();
+    }
+}
+```
+
+3. 定期安全扫描与测试
+
+```yaml
+# OWASP ZAP 扫描配置示例
+- 名称: SQL注入测试
+  类型: 主动扫描
+  参数:
+    - 测试所有参数
+    - 使用预定义攻击模式
+    - 深度: 中等
+  目标: 
+    - 登录接口
+    - 搜索接口
+    - 用户输入端点
+```
+
+七、Spring JPA的安全实践展望
+
+虽然资料提到Spring JPA将在后续讲解，但需要明确的是：
+
+· Spring Data JPA底层使用Hibernate
+· 同样面临JPQL注入风险
+· 推荐使用方法名查询或@Query注解配合参数绑定
+· Spring Security可提供额外的防护层
+
+结论：构建纵深防御体系
+
+SQL注入防护不是单一技术或框架能够完全解决的问题，而需要建立从应用到数据库的纵深防御体系：
+
+1. 前端：输入验证与用户教育
+2. 应用层：参数化查询、输入过滤、输出编码
+3. 框架层：合理使用ORM框架的安全特性
+4. 数据库层：最小权限、存储过程、定期审计
+5. 运维层：WAF、IDS/IPS、安全扫描
+
+通过理解SQL注入的理论原理，结合JavaEE各持久层技术的实践特点，开发者能够在日常编码中自觉运用安全编程模式，从根本上减少安全漏洞的产生。记住：安全不是产品特性，而是开发过程中必须贯彻的基本要求。
+
+---
+
+参考资料：
+
+· OWASP SQL Injection Prevention Cheat Sheet
+· Java Persistence with Hibernate, Second Edition
+· MyBatis官方文档安全章节
+· MySQL官方安全指南
