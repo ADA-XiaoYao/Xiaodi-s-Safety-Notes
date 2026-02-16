@@ -1,0 +1,327 @@
+引言：当浏览器成为安全战场
+
+在现代Web应用中，前端代码早已不再是简单的页面展示，而是承载了大量业务逻辑、加密算法和安全策略。JS逆向工程，通俗地说，就是利用浏览器的调试器对前端代码（HTML、JS、CSS等）进行分析，从中解析出路由规则、加密方式、敏感信息，甚至发现安全漏洞。无论是安全测试人员、爬虫工程师，还是前端开发者，理解JS逆向技术都能帮助我们更好地理解Web应用的内在机制，发现潜在风险。
+
+典型应用场景
+
+1. 登录爆破：某登录框使用前端加密传输密码，通过逆向加密算法，可还原明文密码进行枚举攻击。
+2. 价格篡改：某电商在前端计算折扣，逆向后修改JS逻辑，实现低价购买。
+3. 验证码预测：验证码生成算法可预测，逆向后自动生成有效验证码。
+4. 签名伪造：某平台请求携带X-Sign签名，逆向签名算法后，可构造任意API请求。
+5. 参数加密绕过：参数经过前端加密，逆向算法后可修改Payload进行深度测试。
+
+这些场景揭示了JS逆向在安全研究中的核心价值。本文将系统性地讲解JS逆向的必备技能，从开发者工具的使用，到反调试对抗，再到Hook技术的灵活运用，最后通过真实案例将理论与实践融合。
+
+---
+
+一、JS逆向基础：JS文件与安全
+
+JS逆向的起点是获取目标JS文件。除了直接通过浏览器“查看源代码”外，更高效的方式是利用工具或脚本提取页面中加载的所有JS文件。前期课程中常用的方法包括：
+
+· Chrome开发者工具的Network面板：筛选JS类型，记录所有加载的JS文件URL。
+· 爬虫框架配合动态渲染：如Selenium、Puppeteer，可获取页面执行后加载的JS。
+· 浏览器插件：如“Resource Override”或油猴脚本，可拦截并替换JS文件。
+
+提取JS文件后，需要进行静态分析和动态调试，而这一切都离不开开发者工具的支持。
+
+---
+
+二、开发者工具使用详解
+
+Chrome/Firefox的开发者工具（F12）是JS逆向的瑞士军刀。掌握其核心面板和功能，是逆向分析的基石。
+
+1. F12面板概览
+
+· Elements（元素）：查看DOM结构，定位页面元素对应的JS事件。
+· Console（控制台）：执行JavaScript代码，查看日志，测试函数。
+· Sources（源代码/来源）：最重要的面板，用于查看所有加载的资源、设置断点、调试代码。
+· Network（网络）：监控网络请求，查看请求参数、响应头、堆栈信息。
+
+2. 作用域与调用堆栈
+
+· 作用域：在Sources面板中断点时，右侧Scope区域显示当前函数内部的局部变量、闭包变量以及全局变量。通过观察变量值变化，可推断代码逻辑。
+· 调用堆栈：Call Stack区域记录了当前断点处的函数调用顺序。当遇到复杂加密函数时，通过堆栈回溯可以找到加密的入口和参数传递过程。
+
+3. 断点调试
+
+断点是逆向的核心手段。常用的断点类型包括：
+
+· 行断点：在代码行号上单击，执行到该行时暂停。
+· 条件断点：右键行号设置，输入表达式，仅当表达式为真时暂停（例如i === 5）。
+· DOM断点：在Elements面板对DOM元素设置，当元素被修改、子节点变化或属性变化时触发。
+· XHR断点：在Sources面板右侧XHR Breakpoints中设置，当XHR请求URL包含特定字符串时暂停。
+· 事件监听断点：在Sources右侧Event Listener Breakpoints中勾选，当特定事件（如click、keydown）触发时暂停。
+
+详细断点调试指南可参考：某公众号文章（注：此处为假设链接）。
+
+---
+
+三、案例分析：实战中的断点与堆栈
+
+案例1：某应用加密算法的调用堆栈分析
+
+假设目标网站登录时密码被加密。我们想找到加密函数。
+
+1. 打开Network面板，找到登录请求，查看“Initiator”列，显示是哪个JS文件发起的请求。
+2. 点击Initiator中的链接，跳转到Sources面板，并定位到发送请求的代码附近。
+3. 在该行设置断点，重新触发登录，程序暂停。
+4. 观察Call Stack，逐层向上查找，直到发现一个函数接收了原始密码并返回加密字符串。
+5. 进入该函数，即可分析加密逻辑（如AES、RSA、自定义混淆）。
+
+案例2：JS文件代码挖掘隐藏接口
+
+某些JS文件中可能包含隐藏的API路由或调试接口。通过搜索关键词（如api、/v1/、admin），往往能找到未公开的端点。例如：
+
+```javascript
+// 在某JS中发现
+var apiRoutes = {
+    getUser: '/user/info',
+    adminDelete: '/admin/deleteUser'  // 可能未授权访问
+};
+```
+
+这些信息可用于后续渗透测试。
+
+---
+
+四、反调试技术：代码的保护与对抗
+
+为了防止开发者工具调试，网站会实施各种反调试手段。了解这些技术，是逆向工程师的必修课。
+
+常见反调试方法
+
+1. 无限Debugger
+   ```javascript
+   function enableDebugProtection() {
+       var dbg = new Function("debugger");
+       setInterval(dbg, 3000); // 每3秒触发一次debugger
+   }
+   ```
+   或者使用Function构造函数动态生成debugger指令，使调试器不断暂停。
+2. 键盘监听（F12禁用）
+   ```javascript
+   window.addEventListener('keydown', function(e) {
+       if (e.key === 'F12') e.preventDefault();
+   });
+   ```
+3. 检测浏览器窗口尺寸变化
+      开发者工具打开时，往往会改变窗口内外尺寸。通过检测window.outerWidth与window.innerWidth的差值，或window.outerHeight与window.innerHeight的差值，若超过阈值则判定为开发者工具打开。
+4. 检测开发者工具变量
+      Chrome中，开发者工具打开时，某些属性会变化，例如console.log被调用时会产生堆栈，或console对象被修改后恢复原样。常见检测：
+   ```javascript
+   if (console.log.toString().indexOf('native') === -1) { /* 被hook */ }
+   ```
+5. console.log调用次数检测
+      周期性输出大量日志，若控制台被打开，日志显示会导致性能差异，通过时间差判断。
+6. 代码运行时间差
+      某些操作在开发者工具打开时执行速度变慢，通过测量时间差判断。
+7. toString检测
+      检测原生函数是否被篡改，例如Function.prototype.toString检测是否被重写。
+8. 检测非浏览器环境
+      检查navigator.webdriver属性（Headless浏览器通常为true），或document对象是否存在。
+
+绕过技巧
+
+1. 禁用所有断点：在Sources面板左上角，有一个“Deactivate breakpoints”按钮，点击后可临时忽略所有断点，绕过无限debugger。
+2. 禁用局部断点：针对特定debugger语句，右键行号选择“Never pause here”。
+3. 条件断点：在debugger行设置条件断点，条件为false，使其永不暂停。
+4. 替换文件执行：使用浏览器Overrides功能，将修改后的JS文件保存到本地，覆盖远程文件。
+5. Burp Suite修改响应：拦截服务器返回的JS文件，替换反调试代码为空。
+6. 油猴插件配合Hook：通过油猴脚本在页面加载前删除或修改反调试函数。
+
+---
+
+五、Hook技术：动态拦截与修改
+
+Hook（钩子）是一种通过拦截并修改JavaScript函数或对象行为的技术，常用于动态分析、功能修改、逆向工程和安全研究。
+
+Hook开发前置
+
+编写油猴脚本（Tampermonkey）时，需在脚本头部声明元信息：
+
+```javascript
+// ==UserScript==
+// @name         反调试绕过示例
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  绕过无限debugger
+// @author       YourName
+// @match        https://target.com/*
+// @icon         https://target.com/favicon.ico
+// @grant        none
+// ==/UserScript==
+```
+
+Hook原理
+
+Hook的核心思想是：在目标函数执行前，替换为自定义函数，先执行自定义逻辑，再决定是否调用原函数。例如：
+
+```javascript
+// 保存原始构造函数
+const originalFunction = window.Function;
+// 替换为自定义函数
+window.Function = function(...args) {
+    console.log('Function被调用:', args);
+    // 如果参数包含debugger，进行过滤
+    if (args.some(arg => arg.includes('debugger'))) {
+        return function(){}; // 返回空函数
+    }
+    return originalFunction.apply(this, args);
+};
+```
+
+案例1：改掉显示长宽
+
+某网站检测窗口尺寸，若发现开发者工具打开，则显示空白。可以通过Hook window.outerWidth的getter来伪造尺寸：
+
+```javascript
+Object.defineProperty(window, 'outerWidth', {
+    get: function() { return 1920; } // 始终返回固定值
+});
+```
+
+案例2：Debug绕过（本地）
+
+针对无限debugger的典型实现：
+
+```javascript
+function enableDebugProtection() {
+    var dbg = new Function("debugger");
+    setInterval(dbg, 3000);
+}
+```
+
+我们可以编写Hook脚本拦截setInterval和Function：
+
+```javascript
+(function() {
+    // 拦截Function构造函数
+    const originalFunction = Function;
+    Function = function(...args) {
+        if (args.includes('debugger')) {
+            return function(){}; // 忽略debugger
+        }
+        return originalFunction(...args);
+    };
+    // 拦截setInterval
+    const originalSetInterval = window.setInterval;
+    window.setInterval = function(cb, time) {
+        if (cb.toString().includes('debugger')) {
+            return; // 不执行
+        }
+        return originalSetInterval(cb, time);
+    };
+})();
+```
+
+案例3：真实Debug绕过（实战）
+
+某网站使用更隐蔽的方式：
+
+```javascript
+function() {}.constructor("debugger")()
+```
+
+这里{}.constructor指向Function，通过它动态创建debugger并立即执行。Hook思路：拦截Function.prototype的调用。
+
+```javascript
+// 保存原始的Function构造函数
+const OriginalFunction = Function;
+// 重写Function
+Function = function(...args) {
+    if (args.includes('debugger')) {
+        console.log('拦截debugger');
+        return function(){}; // 返回空函数
+    }
+    return OriginalFunction.apply(this, args);
+};
+// 同时保护原型链
+Function.prototype.constructor = Function;
+```
+
+将上述代码放入油猴脚本中，匹配目标网站，即可绕过debugger。
+
+---
+
+六、实战案例：真实Debug绕过全流程
+
+目标网站
+
+假设https://debug-demo.com，登录后每3秒弹出debugger，严重影响分析。
+
+步骤1：定位反调试代码
+
+打开开发者工具，当debugger暂停时，查看Call Stack，找到最外层的调用，通常是setInterval或setTimeout的回调函数。例如发现：
+
+```javascript
+(function() {}.constructor("debugger")())()
+```
+
+这行代码通过匿名函数的构造函数创建debugger并执行。
+
+步骤2：编写Hook脚本
+
+在油猴中新建脚本，使用@match匹配目标域名，并注入Hook代码：
+
+```javascript
+// ==UserScript==
+// @name         Debugger Killer
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  拦截Function构造函数中的debugger
+// @author       SecurityResearcher
+// @match        https://debug-demo.com/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+    const originalFunction = window.Function;
+    window.Function = function(...args) {
+        // 检查参数是否包含debugger字符串
+        for (let arg of args) {
+            if (typeof arg === 'string' && arg.includes('debugger')) {
+                console.log('Blocked debugger from Function');
+                return function(){}; // 返回空函数
+            }
+        }
+        return originalFunction.apply(this, args);
+    };
+    // 确保构造函数被正确覆盖
+    Function.prototype.constructor = Function;
+    // 额外拦截setInterval，防止其他变种
+    const originalSetInterval = window.setInterval;
+    window.setInterval = function(cb, time) {
+        if (cb && cb.toString && cb.toString().includes('debugger')) {
+            console.log('Blocked debugger in setInterval');
+            return;
+        }
+        return originalSetInterval(cb, time);
+    };
+})();
+```
+
+步骤3：测试效果
+
+刷新页面，观察控制台输出“Blocked debugger...”字样，且不再出现无限暂停。此时可自由进行断点调试。
+
+步骤4：深入分析
+
+绕过反调试后，继续在Sources面板搜索加密函数或敏感API，完成逆向目标。
+
+---
+
+七、总结
+
+JS逆向是安全测试中不可或缺的技能。本文从开发者工具的基础使用入手，逐步深入到反调试对抗和Hook技术，并通过真实案例展示了如何在实际环境中绕过保护、分析代码。关键要点如下：
+
+· 掌握开发者工具：熟练使用Sources面板、断点、调用堆栈，是逆向的基本功。
+· 理解反调试原理：只有知道攻击者如何防御，才能找到有效的绕过方法。
+· 灵活运用Hook：通过油猴脚本拦截关键函数，是动态修改行为的利器。
+· 实践出真知：在真实网站（授权测试）中反复练习，才能应对复杂场景。
+
+随着Web安全对抗的升级，前端防护手段层出不穷，但逆向技术也在不断进化。希望本文能为你打开JS逆向的大门，在后续的探索中不断积累经验，成为真正的调试高手。
+
+---
+
+注：本文所有案例均为技术研究目的，请勿用于非法用途。在进行任何安全测试前，请确保获得授权。
