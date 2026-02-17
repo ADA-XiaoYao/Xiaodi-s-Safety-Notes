@@ -1,0 +1,263 @@
+引言
+
+JS逆向，即对前端JavaScript代码进行逆向分析，是Web安全研究中的一项核心技能。它通过浏览器的调试工具，深入分析HTML、JS、CSS等前端资源，揭示隐藏的逻辑、路由、加密方式乃至敏感信息。无论是渗透测试中的加密参数突破，还是漏洞挖掘中的逻辑缺陷定位，JS逆向都扮演着关键角色。
+
+典型应用场景：
+
+· 登录框加密传输：通过逆向加密算法，实现爆破攻击。
+· 电商价格篡改：前端折扣计算被逆向，导致价格可被恶意修改。
+· 验证码可预测：生成算法被逆向，验证码失效。
+· 签名伪造：如某平台的X-Sign签名被逆向，可构造任意请求。
+· 参数加密绕过：逆向算法后修改Payload，测试服务端漏洞。
+
+本文将结合理论与实践，从开发者工具的基础使用开始，逐步深入到反调试绕过、HOOK注入、算法解密等高级话题，并通过真实案例演示完整分析流程。
+
+---
+
+一、基础篇：开发者工具——逆向的瑞士军刀
+
+1.1 F12面板概览
+
+浏览器开发者工具（F12）是逆向分析的主战场。核心面板包括：
+
+· 网络（Network）：监控所有HTTP请求，查看提交参数、返回数据及请求头。
+· 源代码（Sources）：查看和调试加载的JS文件，设置断点，跟踪执行流。
+· 控制台（Console）：执行临时JS代码，查看日志，与页面交互。
+· 元素（Elements）：查看DOM结构，定位与JS交互的HTML元素。
+
+1.2 关键调试功能
+
+· 作用域（Scope）：在断点暂停时，查看当前函数内的局部变量、闭包及全局变量，直接获取运行时的数据值。
+· 调用堆栈（Call Stack）：显示当前断点处的函数调用链，帮助追溯代码执行逻辑，快速定位加密函数入口。
+· 断点调试（Breakpoints）：可在指定行设置断点，或通过条件断点、DOM断点、XHR断点等精细化控制。例如，在参数加密前下断点，观察原始数据与加密结果的变换。
+
+参考链接：https://mp.weixin.qq.com/s/E-eip5LXjGHFYmNlrNK-bg（详细断点调试技巧）
+
+---
+
+二、进阶篇：反调试技术与绕过策略
+
+为了防止逆向分析，前端代码常嵌入各种反调试机制。理解这些机制并掌握绕过方法，是深入逆向的必修课。
+
+2.1 常见反调试检测手段
+
+· 无限Debugger：通过setInterval或递归调用debugger语句，使开发者工具不断暂停，干扰调试。
+· 键盘监听：拦截F12、Ctrl+Shift+I等快捷键，阻止打开开发者工具。
+· 浏览器特征检测：
+  · 检测窗口内外高度差（window.outerHeight - window.innerHeight）。
+  · 检测开发者工具变量（如window.devtools或window.console的调用次数）。
+  · 利用console.log调用次数判断（开发者工具打开时，console对象行为改变）。
+  · 代码运行时间差：调试时单步执行会导致时间延长，通过时间差检测。
+  · toString检测：检测函数是否被篡改，如Function.prototype.toString。
+  · 非浏览器环境检测：如检测User-Agent或navigator对象特征。
+
+2.2 绕过技巧实战
+
+1. 禁用所有断点：在Sources面板中，点击“Deactivate breakpoints”按钮（或按Ctrl+F8），一次性禁用所有断点，防止无限Debugger暂停。
+2. 条件断点：在debugger行设置条件断点，条件设为false，使其永不触发。
+3. 替换文件执行：通过Overrides功能或本地修改JS文件，重定向到修改后的代码，彻底移除反调试逻辑。
+4. Burp Suite修改：拦截响应包，替换或删除反调试代码段。
+5. 油猴脚本Hook：编写Tampermonkey脚本，在页面加载前Hook关键函数，篡改反调试行为。
+
+案例1：绕过无限Debugger
+
+某网站使用以下代码防调试：
+
+```javascript
+function enableDebugProtection() {
+    var dbg = new Function("debugger");
+    setInterval(dbg, 3000); // 每3秒触发debugger
+}
+```
+
+绕过思路：拦截Function构造函数和setInterval，使debugger字符串失效。
+油猴脚本：
+
+```javascript
+// ==UserScript==
+// @name         Bypass Debugger
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  绕过无限debugger
+// @match        *://*/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    // 拦截Function构造函数
+    const originalFunction = window.Function;
+    window.Function = function(...args) {
+        if (args.includes('debugger')) {
+            console.log('拦截到包含debugger的Function构造');
+            return function(){}; // 返回空函数
+        }
+        return originalFunction.apply(this, args);
+    };
+    // 拦截setInterval
+    const originalSetInterval = window.setInterval;
+    window.setInterval = function(fn, time) {
+        if (fn.toString().includes('debugger')) {
+            console.log('拦截到debugger的setInterval调用');
+            return; // 不执行
+        }
+        return originalSetInterval.apply(this, arguments);
+    };
+})();
+```
+
+案例2：复杂Debugger绕过
+
+另一网站使用：
+
+```javascript
+function() {}.constructor("debugger")()
+```
+
+此代码通过匿名函数的构造函数创建debugger并立即执行。绕过时需Hook Function.prototype.constructor：
+
+```javascript
+const originalConstructor = Function.prototype.constructor;
+Function.prototype.constructor = function(...args) {
+    if (args[0] && args[0].includes('debugger')) {
+        console.log('Hook构造函数debugger');
+        return function(){};
+    }
+    return originalConstructor.apply(this, args);
+};
+```
+
+---
+
+三、核心篇：HOOK技术——动态篡改与行为监控
+
+HOOK（钩子）是一种拦截并修改JavaScript函数或对象行为的技术。在逆向中，HOOK可用于：
+
+· 动态分析：监控参数传递、函数调用。
+· 功能修改：篡改页面逻辑，如绕过限制。
+· 调试辅助：输出关键信息，辅助算法还原。
+
+3.1 HOOK脚本开发基础（油猴元数据）
+
+```javascript
+// ==UserScript==
+// @name         脚本名称
+// @namespace    作用域标识
+// @version      版本号
+// @description  描述
+// @author       作者
+// @match        匹配的URL模式（如 *://example.com/*）
+// @icon         图标URL
+// @grant        需要授权的功能（如 GM_xmlhttpRequest）
+// ==/UserScript==
+```
+
+3.2 案例：篡改页面元素显示
+
+某网站使用JS动态设置元素宽高，通过HOOK篡改：
+
+```javascript
+// 拦截设置宽高的函数
+Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
+    get: function() {
+        return 100; // 固定返回100，绕过检测
+    }
+});
+```
+
+3.3 案例：拦截加密函数
+
+假设加密函数名为encryptData，我们想查看传入参数：
+
+```javascript
+const originalEncrypt = window.encryptData;
+window.encryptData = function(...args) {
+    console.log('加密参数:', args);
+    return originalEncrypt.apply(this, args);
+};
+```
+
+---
+
+四、实战篇：加密算法解密与代码还原
+
+逆向的终极目标往往是还原加密算法，以便模拟请求或测试漏洞。以下通过请求数据加密和返回数据解密两类场景，演示完整分析流程。
+
+4.1 分析方法
+
+· 调用堆栈定位：在XHR断点或参数生成后下断点，查看调用堆栈，回溯到加密函数入口。
+· 搜索定位：根据提交的URL、参数名（如param、sign）在Sources中全局搜索，快速找到相关代码。
+
+4.2 请求数据解密案例
+
+场景：登录请求中，密码被加密为param参数。
+步骤：
+
+1. 在登录请求处打断点（XHR断点或submit事件），观察调用堆栈。
+2. 发现za(c.value, S)调用，c.value为明文密码，S为密钥。
+3. 分析za函数，定位到AES加密算法，确定模式为CBC/Padding。
+4. 扣代码模拟：将相关加密函数提取到本地Node.js环境，使用相同的密钥和算法加密明文，验证结果一致。
+
+```javascript
+// 示例：扣取后的AES加密函数
+const CryptoJS = require('crypto-js');
+function encryptPassword(password, key) {
+    return CryptoJS.AES.encrypt(password, key, {
+        mode: CryptoJS.mode.CBC,
+        padding: CryptoJS.pad.Pkcs7
+    }).toString();
+}
+```
+
+4.3 返回数据解密案例
+
+场景：服务器返回数据为加密字符串，前端解密后展示。
+步骤：
+
+1. 在Network中找到返回加密数据的请求，下断点。
+2. 观察解密调用，如webInstace.shell(data)。
+3. 分析shell函数，发现其引用了Webpack打包的模块。下载相关JS文件，在Node中模拟Webpack环境运行。
+4. 借助AI辅助分析：将代码喂给AI，让其解释解密逻辑，快速提取关键参数（如密钥、IV、算法模式）。
+5. 替代库模拟：若算法为标准AES，可直接用crypto-js模拟。
+
+```javascript
+// 替代库模拟示例（AES ECB解密）
+const CryptoJS = require('crypto-js');
+const key = CryptoJS.SHA1('常量s').toString().substr(0, 32); // 密钥派生
+const decrypted = CryptoJS.AES.decrypt(encryptedData, key, {
+    mode: CryptoJS.mode.ECB,
+    padding: CryptoJS.pad.Pkcs7
+});
+console.log(decrypted.toString(CryptoJS.enc.Utf8));
+```
+
+4.4 复杂场景：多算法组合与Webpack
+
+某些网站使用自定义算法或多种算法组合，此时需：
+
+· 扣取核心函数：将依赖的多个函数提取到一个JS文件中，通过Node运行调试。
+· 借助工具：如使用JStillery、jsdom等模拟浏览器环境。
+· AI辅助：向AI提供关键代码段，请求其解释算法逻辑或生成等效Python/Node代码。
+
+---
+
+五、总结与安全思考
+
+JS逆向是双刃剑。对安全人员而言，它是发现漏洞、提升系统安全性的重要手段；对攻击者而言，它可用于绕过防护、窃取数据。因此，理解逆向技术有助于更好地防御：
+
+· 前端防护建议：
+  · 避免将敏感算法完全暴露在前端，关键逻辑移至后端。
+  · 使用反调试技术增加逆向难度，但不可依赖（总能被绕过）。
+  · 定期更新加密密钥，采用动态令牌、签名机制。
+  · 结合服务端校验，防止参数篡改。
+· 合规提醒：逆向他人网站需获得授权，仅限安全测试与学习目的。
+
+通过本文的梳理，希望读者能系统掌握JS逆向的理论与实践，从基础调试到高级HOOK，再到算法还原，逐步提升Web安全分析能力。记住，技术本身无善恶，关键在于使用者的目的与边界。
+
+---
+
+参考文献与工具：
+
+· 开发者工具官方文档
+· Tampermonkey API
+· Crypto-js库
+· 前期课程中JS信息提取工具（如FindSomething、JSFinder）
