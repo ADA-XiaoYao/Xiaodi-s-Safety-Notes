@@ -1,0 +1,285 @@
+引言：JS逆向与安全
+
+随着Web应用日益复杂，前端代码承载了越来越多的业务逻辑和安全控制。JavaScript逆向（简称JS逆向）指的是在浏览器调试环境中，对前端代码（HTML、JS、CSS）进行分析，以理解其执行流程、加密算法、敏感信息泄露等。这不仅是安全研究人员的必备技能，也是渗透测试中绕过客户端防护、挖掘业务漏洞的重要手段。
+
+典型应用场景：
+
+· 登录爆破：当登录请求参数被加密传输时，需逆向加密逻辑才能构造有效的爆破字典。
+· 价格篡改：电商前端若使用JavaScript计算折扣，攻击者可修改逻辑以低价下单。
+· 验证码预测：若验证码生成算法可预测，可编写脚本自动化绕过。
+· 签名伪造：API请求中的X-Sign签名若被逆向，可构造任意合法请求。
+· 参数注入：加密参数逆向后，可修改Payload测试服务端漏洞。
+
+本文将从基础工具使用出发，逐步深入到反调试绕过、Hook技术、加密算法还原、签名机制分析以及代码混淆解密，并通过真实案例串联理论与实践。
+
+---
+
+一、开发者工具：逆向的“手术刀”
+
+浏览器开发者工具（F12）是JS逆向的起点。熟练掌握其面板能极大提升分析效率。
+
+1. F12核心面板
+
+· 网络（Network）：捕获所有HTTP请求，查看请求参数、响应数据及堆栈信息。通过筛选XHR请求可快速定位API调用。
+· 源代码/来源（Sources）：展示页面加载的所有资源文件，可在此处设置断点、查看作用域和调用堆栈。
+· 控制台（Console）：动态执行JS代码，打印变量、测试函数，也是Hook脚本的临时运行环境。
+· 元素（Elements）：查看DOM结构，便于定位与页面交互相关的JS逻辑。
+
+2. 作用域与调用堆栈
+
+· 作用域（Scope）：断点暂停时，右侧面板显示当前函数内的局部变量、闭包及全局变量。通过观察变量值的变化，可快速追踪加密参数的生成过程。
+· 调用堆栈（Call Stack）：展示当前断点处的函数调用顺序。从顶层到底层，可以还原代码的执行路径，帮助定位加密函数的位置。
+
+3. 断点调试实战
+
+断点是逆向的核心手段，常用类型包括：
+
+· 代码行断点：在Sources面板点击行号，当执行到该行时暂停。
+· 条件断点：右键行号设置条件，如variable === 'target'，只在特定值时暂停，避免频繁中断。
+· XHR断点：在Sources面板的XHR Breakpoints中设置URL包含的关键字，当XHR请求发送时自动断下，直接定位到发起请求的代码。
+· DOM断点：监听DOM属性修改或节点删除，适用于分析页面交互触发的逻辑。
+
+案例：某应用加密算法调用堆栈分析
+某登录页面提交时，参数被加密成param。在Network面板找到登录请求，右键选择“Initiator”或查看调用堆栈，可回溯到发起请求的JS函数。在该函数处设置断点，重新触发登录，程序暂停后查看作用域中的变量，发现调用了za(c.value, S)。通过堆栈逐层向上，最终找到加密函数定义，分析得知其为AES加密，IV和密钥硬编码在代码中。后续可通过扣代码或模拟库实现加密。
+
+---
+
+二、反调试技术与绕过策略
+
+为防止逆向分析，开发者常植入反调试代码。常见的检测手段及绕过方法如下：
+
+1. 常见反调试手法
+
+· 无限Debugger：利用setInterval或Function构造循环debugger，导致开发者工具持续暂停。
+  ```javascript
+  function enableDebugProtection() {
+      var dbg = new Function("debugger");
+      setInterval(dbg, 3000);
+  }
+  ```
+· 键盘监听：禁止F12或右键菜单。
+  ```javascript
+  document.onkeydown = function(e) { if (e.key === 'F12') return false; }
+  ```
+· 浏览器环境检测：检查窗口尺寸差异、console对象是否被修改、代码执行时间差等。
+· toString检测：检测函数原型是否被篡改。
+
+2. 绕过技巧
+
+· 禁用所有断点：在Sources面板点击“Deactivate breakpoints”按钮，或使用快捷键（Ctrl+F8），可暂时禁用所有断点，让无限debugger失效。
+· 局部断点禁用：在debugger代码行设置条件断点，条件设为false，使其永远不会暂停。
+· 替换文件执行：通过Overrides功能将修改后的JS文件保存到本地，浏览器自动加载本地文件，从而删除反调试代码。
+· Burp Suite修改响应：拦截服务器返回的JS文件，替换掉反调试代码段。
+· 油猴脚本Hook：编写Tampermonkey脚本，在页面加载前Hook关键函数，如替换Function构造函数，使debugger语句失效。
+
+实战案例：绕过无限Debugger
+
+某网站使用function() {}.constructor("debugger")()动态生成debugger。分析发现其核心是调用了Function构造函数。编写油猴脚本：
+
+```javascript
+// ==UserScript==
+// @name         Bypass Debugger
+// @namespace    http://tampermonkey.net/
+// @version      0.1
+// @description  拦截Function构造函数，过滤debugger
+// @author       You
+// @match        *://target.com/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    var originalFunction = Function;
+    Function = function() {
+        var args = Array.from(arguments);
+        if (args[0] && args[0].includes('debugger')) {
+            console.log('拦截到debugger构造');
+            return function(){};  // 返回空函数
+        }
+        return originalFunction.apply(this, args);
+    };
+})();
+```
+
+脚本通过重写Function，在构造字符串包含debugger时返回空函数，从而绕过。
+
+---
+
+三、Hook技术：动态注入与行为修改
+
+Hook（钩子）是一种拦截并修改JavaScript函数或对象行为的技术，广泛应用于动态分析、自动化测试和安全研究。
+
+1. Hook前置知识
+
+油猴脚本（Tampermonkey）是浏览器端Hook的常用工具，其头部声明如下：
+
+· @name：脚本名称
+· @match：匹配的URL规则
+· @grant：申请的特殊权限，如GM_xmlhttpRequest
+
+2. Hook原理
+
+通过保存原始函数，用自定义函数替换，在自定义函数中执行额外操作（如打印参数、修改返回值），再调用原始函数。
+
+案例：改掉显示长宽
+某网站通过window.screen.width和window.screen.height检测是否为开发者工具窗口（小窗口）。Hook这两个属性，使其返回固定值：
+
+```javascript
+Object.defineProperty(window.screen, 'width', { get: () => 1920 });
+Object.defineProperty(window.screen, 'height', { get: () => 1080 });
+```
+
+3. Hook实战：绕过Debugger检测
+
+如前文所述，HookFunction和setInterval是绕过无限debugger的通用方法。再举一例：某网站在代码中多次调用eval执行混淆代码，可通过Hookeval打印解密后的真实代码，辅助分析。
+
+---
+
+四、加密算法解密：从扣代码到替代库模拟
+
+在逆向中，最耗时但最关键的部分是还原加密算法。通常有两种路径：扣代码（直接复制加密函数到本地运行）和模拟库（用Python/Node.js的加密库重新实现）。
+
+1. 分析方法
+
+· 根据调用堆栈：在参数生成后下断点，向上追溯找到加密函数。
+· 全局搜索关键词：如encrypt、AES、sign、md5，或参数名（如param）。
+
+2. 请求数据解密案例
+
+案例1：单函数扣代码
+某登录页参数pwd被加密为hidetxtPassword。在调用堆栈中找到加密函数za，其内部调用了CryptoJS.AES.encrypt。通过查看za的完整定义，复制其依赖的库（CryptoJS）和函数，在Node.js中运行即可得到相同密文。
+
+案例2：Webpack打包的扣取
+某网站加密函数被包裹在Webpack模块中。找到加载器webpackJsonp，定位加密模块的ID，编写Node.js脚本引入该模块的导出函数。例如：
+
+```javascript
+// 在浏览器中获取模块
+var encrypt = window.webpackJsonp.push([[], {id: function(module, exports, require){}}, [['id']]]);
+// 在Node中模拟window对象，导入模块调用
+```
+
+3. 返回数据解密案例
+
+案例1：单个使用扣代码调用
+某API返回加密数据，断点后发现通过webInstace.shell方法解密。下载该JS文件，分析其依赖，发现使用了Webpack打包。借助AI辅助分析模块结构，编写Node脚本调用webInstace.shell解密。
+
+案例2：多个使用替代库模拟
+某应用返回数据AES加密，密钥由固定字符串s经过SHA1取前32位生成。分析后可在Node中安装crypto-js模拟：
+
+```javascript
+const CryptoJS = require('crypto-js');
+let s = 'fixed_string';
+let key = CryptoJS.SHA1(s).toString().substr(0, 32);
+let decrypted = CryptoJS.AES.decrypt(encryptedData, key, { mode: CryptoJS.mode.ECB, padding: CryptoJS.pad.Pkcs7 });
+console.log(decrypted.toString(CryptoJS.enc.Utf8));
+```
+
+---
+
+五、Sign签名机制：影响与绕过
+
+签名（Sign）机制用于保证请求的完整性和来源可信性。它对渗透测试既是挑战也是机遇。
+
+1. Sign对渗透测试的影响
+
+· 正面：提高安全性，防止篡改、重放和未授权访问，迫使测试人员深入业务逻辑。
+· 负面：增加逆向分析工作量，自动化工具失效，可能掩盖其他漏洞（如越权）。
+
+2. 绕过思路
+
+· 客户端签名计算：若签名在客户端生成，逆向算法后可在测试工具中动态计算签名。
+· 签名逻辑缺陷：如签名参数可预测、密钥硬编码、时间戳未校验等。
+· 重放漏洞：若时间戳未校验，截获请求后可无限重放。
+
+案例1：Yakit登录爆破
+
+某登录接口需要签名校验。使用Yakit的Web Fuzzer时，需先逆向签名算法，在Yakit中编写插件计算签名，才能正常爆破。
+
+案例2：某应用签名逆向
+
+API路径：/api/questions/lists
+通过XHR断点定位到签名生成代码：
+
+```javascript
+t.headers.Sign = h;
+h = bs()(o + c + r + n + o);
+```
+
+断点进入bs，发现是MD5。各参数含义：
+
+· o：固定字符串12b6bb84e093532fb72b4d65fec3f00b
+· c：Cookie中的uu值
+· r：/api/questions/lists去掉/api
+· n：时间戳
+  签名逻辑：MD5(o + c + r + n + o)
+  编写Python脚本模拟，即可绕过签名校验。
+
+案例3：翻译接口签名
+
+搜索sign=定位到加密函数：
+
+```javascript
+// 密钥 w.LI = '6dVjYLFyzfkFkk'
+// 算法 y()("6key_web_new_fanyi".concat(w.LI).concat(t.q)).toString().substring(0,16);
+// 返回数据的解密密钥 s(t) 得到 'L4fBtD5fLC9FQw22'
+```
+
+分析后发现是AES ECB加密，密钥固定，直接模拟即可。
+
+---
+
+六、代码混淆：保护与还原
+
+混淆旨在增加代码可读性难度，保护知识产权，但也为逆向设置了障碍。
+
+1. 常见混淆手法及特征
+
+· Eval混淆：代码被包裹在eval()中，特征为eval(function(...))。
+· JJEncode/AAEncode/JSFuck：分别以$、颜文字、[]()!+为特征，最终通过执行得到原始代码。
+· Obfuscator：专业混淆工具，变量名替换为_0x1234，代码结构扁平化，控制流平坦化。
+
+2. 还原方法
+
+· 人工分析：去掉eval()后在控制台输出，或使用AST（抽象语法树）技术还原。
+· 在线工具：
+  · jsdec.js.org
+  · lelinhtinh.github.io/de4js
+  · sojson.com/jsjiemi
+· AST辅助：使用@babel/parser解析代码，遍历节点进行反混淆。
+
+案例：Obfuscator混淆还原
+
+某混淆代码通过数组位移、字符串拼接隐藏真实逻辑。使用AST工具，编写脚本将_0x1234形式的变量还原为可读名称，恢复控制流。具体可参考AST还原教程。
+
+---
+
+七、AST语法树与AI辅助
+
+AST（抽象语法树）是源代码的树状表示，每个节点对应一种语法结构。在JS逆向中，AST可用于自动化反混淆、代码格式化、提取关键信息。
+
+1. AST基础
+
+· 词法分析：将代码拆分为token序列。
+· 语法分析：将token转换为AST，如const name = "qc"被解析为VariableDeclaration节点，包含Identifier（name）和Literal（"qc"）。
+· 生成指令：将AST转换为可执行代码。
+
+2. AST在反混淆中的应用
+
+OB混淆常使用数组位移、字符串拆分等技巧。通过遍历AST，可以将数组引用替换为实际值，合并字符串，简化表达式。
+
+3. AI辅助
+
+借助AI（如ChatGPT）分析混淆代码，可以快速理解代码逻辑，甚至自动生成反混淆脚本。例如将混淆代码输入，要求解释其功能，或生成等效的清晰代码。
+
+---
+
+结语
+
+JavaScript逆向是一门实践性极强的技术，它融合了Web开发知识、调试技巧、加密算法和代码分析能力。本文从基础工具入手，通过反调试绕过、Hook注入、算法还原、签名分析及混淆解密等多个维度，结合真实案例，展示了JS逆向的完整流程。在实际工作中，应结合多种手段灵活运用，并时刻关注新的防护技术。希望本文能成为读者探索JS逆向世界的实用指南。
+
+---
+
+参考文献
+
+· F12开发者工具使用指南
+· AST相关教程及在线工具
+· 各大JS混淆/反混淆平台
