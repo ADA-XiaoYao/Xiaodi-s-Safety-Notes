@@ -1,0 +1,202 @@
+Java作为企业级应用开发的主流语言，其生态体系庞大且复杂，各类安全漏洞层出不穷。无论是传统的SQL注入、XXE，还是框架特有的SPEL、SSTI，都成为攻击者眼中的突破口。本文将从理论原理出发，结合具体代码案例和审计方法，深入剖析Java常见漏洞的形成原因与实战利用技巧，并推荐相关靶场供读者动手实践。
+
+一、常规漏洞篇
+
+1. SQL注入：预编译并非万能
+
+SQL注入是Web安全中最古老的漏洞之一，但在Java项目中仍屡见不鲜。根据数据库交互技术的不同，SQL注入的表现形式也有所差异。
+
+JDBC层注入
+
+JDBC提供了三种常见的数据库操作方式：
+
+· Statement：直接拼接SQL语句，存在严重注入风险。
+  ```java
+  String sql = "SELECT * FROM users WHERE username='" + username + "'";
+  Statement stmt = connection.createStatement();
+  ResultSet rs = stmt.executeQuery(sql);
+  ```
+· PreparedStatement：预编译机制能有效防止注入，但若开发人员误用字符串拼接构造SQL，预编译将失效。
+  ```java
+  // 错误示例：拼接参数导致预编译失效
+  String sql = "SELECT * FROM users WHERE username='" + username + "'";
+  PreparedStatement pstmt = connection.prepareStatement(sql);
+  ```
+· JdbcTemplate：Spring对JDBC的封装，若直接使用拼接方式同样存在注入。
+  ```java
+  jdbcTemplate.query("SELECT * FROM users WHERE username='" + username + "'", new RowMapper<>());
+  ```
+
+安全写法：始终使用占位符（?）配合预编译。
+
+```java
+PreparedStatement pstmt = conn.prepareStatement("SELECT * FROM users WHERE username=?");
+pstmt.setString(1, username);
+```
+
+MyBatis的陷阱
+
+MyBatis支持两种参数符号：#{}（预编译）和${}（字符串拼接）。开发者在以下场景中容易错误使用${}：
+
+· order by注入：因为#{}会将参数转为字符串，导致order by 'username' desc语法错误，所以部分开发直接使用${}。
+  ```xml
+  <select id="getUserList" resultType="User">
+      SELECT * FROM users ORDER BY ${orderColumn} ${orderType}
+  </select>
+  ```
+· like注入：模糊查询时'%#{q}%'会报错，若改为'%${q}%'则产生注入。
+· in注入：in (#{ids})无法解析多个值，开发者可能用${ids}拼接。
+
+审计要点：全局搜索${}，重点关注上述三个场景，确认参数是否来自用户输入且未经过严格过滤。
+
+Hibernate与JPA
+
+两者均支持命名参数或位置参数，通过setParameter或:username方式实现预编译。但若使用原生SQL拼接或createSQLQuery时拼接字符串，同样会导致注入。
+
+白盒审计流程：
+
+1. 确定应用使用的数据库交互技术（JDBC / MyBatis / Hibernate / JPA）。
+2. 定位SQL操作的关键代码（如executeQuery、select标签等）。
+3. 检查参数传递方式：是否使用占位符/预编译，参数是否来自外部输入。
+
+2. XXE注入：XML解析器的盲区
+
+XXE（XML External Entity）漏洞通常出现在XML解析功能中，攻击者可利用外部实体读取本地文件、发起SSRF攻击等。Java中常见的XML解析库及存在风险的函数包括：
+
+· XMLReader (parse)
+· SAXReader (parse)
+· DocumentBuilder (parse)
+· XMLStreamReader
+· SAXBuilder
+· SAXParser
+· SAXSource
+· TransformerFactory
+· SAXTransformerFactory
+· SchemaFactory
+· Unmarshaller
+· XPathExpression
+
+审计方法：搜索上述12类函数的调用，追踪其parse方法的参数是否可控。若未禁用外部实体解析，则存在风险。
+
+防御措施：解析XML前需禁用DTD外部实体。以DocumentBuilderFactory为例：
+
+```java
+DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
+factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+```
+
+3. RCE：命令执行的多种姿势
+
+Java中执行系统命令的常见方式：
+
+· Runtime.getRuntime().exec()
+· ProcessBuilder
+· ProcessImpl（底层实现）
+· GroovyShell（若允许动态执行Groovy脚本）
+
+审计关注点：搜索以上关键类，检查传递给exec或start的参数是否包含用户可控数据，且未做严格过滤。特别注意ProcessBuilder的command参数可拆分为多部分，可能绕过简单黑名单。
+
+4. SSRF与URL跳转
+
+· SSRF：常见于URL类（new URL(url).openConnection()）、HttpURLConnection、Request等发起网络请求的地方。可控的url参数可能指向内网地址。
+· URL跳转：Spring MVC中通过ModelAndView、sendRedirect、ResponseEntity设置Location头实现重定向。若跳转地址完全由用户控制，可能导致钓鱼或Open Redirect。
+
+审计技巧：全局搜索sendRedirect、setHeader("Location")、ModelAndView构造函数等，追踪URL参数的来源。
+
+二、专题漏洞篇
+
+1. SSTI模板注入
+
+服务端模板注入（SSTI）发生在模板引擎将用户输入作为模板内容解析的场景。Java主流模板引擎包括：
+
+· Thymeleaf：默认开启HTML转义，但若使用th:inline="text"或${...}表达式未正确转义，可能导致注入。
+· Velocity：#evaluate指令可动态执行模板语句，若参数可控则直接RCE。
+· Freemarker：?new、?eval等内建函数可执行Java代码，如${"freemarker.template.utility.Execute"?new()("ls")}。
+
+审计方法：搜索模板渲染函数，如Template.process()、Velocity.evaluate()等，检查模板内容或变量是否来自用户输入。
+
+2. SPEL表达式注入
+
+Spring Expression Language（SpEL）广泛用于Spring框架的配置、注解和模板中。关键类是SpelExpressionParser的parseExpression方法。攻击者若能够控制表达式内容，即可执行任意代码。
+
+常见场景：
+
+· 使用@Value注解中引用外部属性，但若属性值可控可能导致注入。
+· Spring Security的@PreAuthorize注解中动态表达式。
+· XML配置中的<property>值使用SpEL。
+
+审计关注点：搜索parseExpression、EvaluationContext以及@Value、@PreAuthorize等注解，分析表达式是否可被外部篡改。
+
+3. Swagger UI API接口泄露
+
+Swagger（现为OpenAPI）是一种API文档工具，若在生产环境开启且未配置访问控制，所有接口信息将暴露，甚至可直接通过界面调用API，造成数据泄露或未授权操作。
+
+发现方法：
+
+· 扫描器识别常见路径：/swagger-ui.html、/v2/api-docs、/swagger-resources。
+· 手工访问，查看接口列表。
+
+利用方式：
+
+· 将Swagger JSON导入工具（如Apifox），批量分析接口并测试未授权漏洞。
+· 直接通过Swagger UI界面调用接口，获取敏感数据。
+
+防御：生产环境关闭Swagger，或通过Spring Security配置访问权限。
+
+4. SpringBoot框架安全
+
+SpringBoot因其微服务架构的便捷性成为主流，但默认配置常带来安全隐患。
+
+框架识别与扫描
+
+通过图标（绿色小叶子）、响应头（X-Application-Context）或特定路径（/actuator、/heapdump）可快速识别SpringBoot应用。推荐使用专用扫描工具：
+
+· SBSCAN
+· Spring-Scan
+· YYBaby-Spring_Scan
+· SpringBootVul-GUI
+
+Actuator端点泄露
+
+Actuator提供了一系列监控和管理端点，若未妥善防护，可能泄露大量敏感信息。
+
+· 常用端点：/actuator、/actuator/health、/actuator/env、/actuator/heapdump、/actuator/dump、/actuator/mappings等。
+· Heapdump利用：/actuator/heapdump可下载JVM堆内存快照，其中可能包含数据库密码、API密钥、配置信息等。
+  · 提取工具：
+    · JDumpSpider
+    · heapdump_tool
+    · JDumpSpiderGUI
+  · 利用步骤：下载heapdump → 使用工具提取敏感字符串 → 寻找配置账号密码、接口凭证等。
+
+其他端点风险
+
+· /druid：Druid数据库连接池监控页面，若未授权访问可查看SQL执行记录、session等信息。
+· /jolokia：JMX over HTTP，可能通过调用MBean执行命令或获取配置。
+
+防御建议：
+
+· 生产环境禁用敏感端点：management.endpoints.web.exposure.exclude=env,heapdump等。
+· 引入Spring Security为Actuator端点设置访问认证。
+· 避免在内存中存储明文密码。
+
+三、防御与最佳实践
+
+1. 输入验证与过滤：所有外部输入视为不可信，进行白名单验证、类型转换。
+2. 预编译与参数化：SQL、表达式、模板等尽量使用预编译/参数化机制，避免拼接。
+3. 安全配置：关闭调试功能、默认端点、Swagger等；启用Security。
+4. 最小权限原则：应用运行时使用低权限用户，限制网络访问内网。
+5. 定期扫描与更新：使用OWASP Dependency Check检查第三方库漏洞，及时升级补丁。
+
+四、结语
+
+Java安全涉及面广，从基础语言特性到主流框架配置，每一个环节都可能成为攻击切入点。本文梳理了常见漏洞的原理、审计方法和利用技巧，但纸上得来终觉浅，建议读者结合推荐的靶场（JavaSec、JavaSecLab、Hello-Java-Sec）动手实践，将理论转化为实战能力。唯有深入理解漏洞本质，才能在攻防博弈中立于不败之地。
+
+---
+
+参考资料：
+
+· 文中提及的靶场及工具仓库
+· OWASP Top 10
+· Spring官方安全文档
