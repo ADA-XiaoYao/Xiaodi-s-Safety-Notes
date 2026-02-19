@@ -1,0 +1,205 @@
+随着Java在企业级应用中的广泛使用，其安全性愈发重要。攻击者常通过注入、服务端请求伪造、远程代码执行等手段突破防线。本文将从理论层面剖析Java Web中常见的漏洞原理，并结合代码审计实战，展示如何发现并防御这些漏洞。我们将基于多个开源靶场（如JavaSec、JavaSecLab、Hello-Java-Sec）进行案例演示，帮助读者建立“白盒+黑盒”的立体思维。
+
+---
+
+一、SQL注入：预编译的陷阱与绕过
+
+SQL注入的本质是攻击者通过拼接恶意SQL片段，改变原始查询语义。在Java生态中，数据持久化技术多样，但核心问题往往落在是否使用了预编译上。
+
+1. JDBC层
+
+· 不安全写法：直接使用Statement拼接字符串。
+  ```java
+  String sql = "SELECT * FROM users WHERE name = '" + input + "'";
+  Statement stmt = conn.createStatement();
+  stmt.executeQuery(sql);
+  ```
+· 看似安全的预编译：PreparedStatement如果仍然采用字符串拼接构造SQL，则预编译失效。
+  ```java
+  String sql = "SELECT * FROM users WHERE name = '" + input + "'";  // 拼接
+  PreparedStatement pstmt = conn.prepareStatement(sql);  // 此时预编译的已是完整SQL，变量部分未被参数化
+  ```
+· 安全写法：使用占位符?，并设置参数。
+  ```java
+  PreparedStatement pstmt = conn.prepareStatement("SELECT * FROM users WHERE name = ?");
+  pstmt.setString(1, input);
+  ```
+
+2. MyBatis框架
+
+MyBatis中#{}和${}的区别是安全审计的关键：
+
+· #{}：预编译，参数占位符，安全。
+· ${}：直接拼接，易产生注入。
+· 典型场景：
+  · order by注入：由于order by后需跟字段名，若用#{}会变成order by '字段名'导致语法错误，开发者可能改用${}引发注入。
+  · like注入：'%#{q}%'会报错，错误写法'%${q}%'导致注入。
+  · in注入：多参数场景错误使用${}。
+
+审计建议：全局搜索${}，重点排查order by、like、in等场景。
+
+3. Hibernate与JPA
+
+两者均支持参数绑定：
+
+```java
+// Hibernate
+Query q = session.createQuery("from User where name = :name");
+q.setParameter("name", input);
+
+// JPA
+@Query("select u from User u where u.name = :name")
+List<User> findByName(@Param("name") String name);
+```
+
+若直接拼接HQL/JPQL（如使用+），则存在注入风险。
+
+4. 自定义过滤
+
+部分系统采用黑/白名单过滤，但绕过方式层出不穷（如大小写、编码、注释）。根本解决仍应依赖预编译。
+
+实战Tips：
+
+· 黑盒：正常SQL注入检测，注意报错信息。
+· 白盒：定位持久层技术（JDBC/MyBatis等）→ 追踪SQL语句构造方式 → 确认是否预编译。
+
+---
+
+二、XXE注入：XML解析器的默认配置陷阱
+
+XML外部实体注入（XXE）发生在解析XML时加载了外部实体，可能导致文件读取、SSRF、DoS等。Java中许多XML解析库默认是开启外部实体的。
+
+易受攻击的函数列表
+
+审计时需重点关注以下类的parse()方法：
+
+1. javax.xml.parsers.DocumentBuilder (通过DocumentBuilderFactory)
+2. javax.xml.parsers.SAXParser (通过SAXParserFactory)
+3. org.xml.sax.XMLReader
+4. org.dom4j.io.SAXReader
+5. javax.xml.stream.XMLStreamReader
+6. org.jdom2.input.SAXBuilder
+7. javax.xml.transform.sax.SAXSource
+8. javax.xml.transform.TransformerFactory
+9. javax.xml.transform.sax.SAXTransformerFactory
+10. javax.xml.validation.SchemaFactory
+11. javax.xml.bind.Unmarshaller
+12. javax.xml.xpath.XPathExpression
+
+不安全示例
+
+```java
+DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+DocumentBuilder builder = factory.newDocumentBuilder();
+Document doc = builder.parse(request.getInputStream());  // 若未禁用外部实体，则存在XXE
+```
+
+防御配置
+
+```java
+factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
+factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+```
+
+审计思路：搜索上述12类解析器的实例化及parse调用，检查是否禁用了外部实体。
+
+---
+
+三、RCE执行：危险的函数调用
+
+Java中执行系统命令或动态代码的方式多样，审计时需警惕外部输入流入执行函数。
+
+常见执行函数
+
+· Runtime.getRuntime().exec()
+· new ProcessBuilder().command()
+· ProcessImpl（底层实现）
+· 脚本引擎：GroovyShell.evaluate()、JavaScriptEngine等
+
+典型漏洞
+
+```java
+String cmd = request.getParameter("cmd");
+Runtime.getRuntime().exec(cmd);  // 命令注入
+```
+
+注意：exec不支持管道、重定向等，但攻击者可通过调用shell解释器（如/bin/sh -c）实现复杂命令。
+
+防御：避免外部输入直接拼接到命令中；若必须，使用白名单过滤。
+
+---
+
+四、SSRF：服务端请求伪造
+
+当服务端根据用户提供的URL发起请求时，若未做限制，攻击者可构造内网地址探测端口或读取元数据。
+
+触发点
+
+· java.net.URL类及其openConnection()、openStream()。
+· 第三方HTTP库：OkHttp、Apache HttpClient等。
+· 文件下载、图片抓取等功能。
+
+审计示例
+
+```java
+String url = request.getParameter("img");
+URL u = new URL(url);
+HttpURLConnection conn = (HttpURLConnection) u.openConnection();
+// 读取内容并返回
+```
+
+防御：限制协议（只允许http/https）、禁止内网IP、设置域名白名单。
+
+---
+
+五、URL跳转：重定向的开放重定向风险
+
+未经验证的重定向参数可导致钓鱼攻击。
+
+常见实现方式
+
+· Spring MVC：ModelAndView设置视图名或redirect:前缀。
+· HttpServletResponse：sendRedirect()。
+· 设置响应头Location：response.setHeader("Location", url)。
+· Spring ResponseEntity设置头部。
+
+不安全代码
+
+```java
+@GetMapping("/redirect")
+public String redirect(String url) {
+    return "redirect:" + url;  // 若url为外部恶意网站
+}
+```
+
+防御：使用相对路径或白名单校验。
+
+---
+
+六、其他漏洞简述
+
+· XSS：反射型、存储型，审计模板引擎（如JSP EL、Velocity）是否未转义。
+· CSRF：检查关键操作是否有Token验证。
+· 文件安全：文件上传路径遍历、文件下载任意文件读取。
+· 业务逻辑：越权、订单篡改等。
+
+这些漏洞虽不如注入类显眼，但同样需结合业务逻辑审计。
+
+---
+
+结语：白盒审计的核心方法论
+
+综合以上案例，白盒审计可总结为三步：
+
+1. 确定技术栈：识别使用的框架、库版本。
+2. 定位危险函数：如SQL的${}、XXE的parse、RCE的exec、SSRF的URL。
+3. 追踪输入源：确认参数是否可控，是否经过有效过滤。
+
+推荐靶场：
+
+· JavaSec
+· JavaSecLab
+· Hello-Java-Sec
+
+通过理论结合实战，开发者能更深刻理解漏洞成因，写出安全的代码；安全人员能更高效地挖掘风险。安全无小事，每一个细节都值得深思。
