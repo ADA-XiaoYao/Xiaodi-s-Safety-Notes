@@ -1,0 +1,225 @@
+摘要
+
+随着移动互联网的普及，移动应用已成为企业业务的核心入口，同时也成为攻击者的重点目标。在移动应用安全测试（渗透测试）中，资产收集与动态分析是两大关键环节：前者帮助测试者快速了解应用的攻击面，后者则允许在运行时监视和篡改应用行为，发现隐藏的漏洞。本文结合理论背景，详细介绍云真机平台、Frida Hook技术、多款资产提取工具以及iOS端的SSL绕过工具的使用方法，并通过实战案例展示如何将这些技术有机结合，提升移动安全测试的效率与深度。
+
+---
+
+1. 引言
+
+根据OWASP Mobile Top 10，移动应用面临的风险包括不安全的身份验证、敏感数据泄露、证书锁定绕过等。为了有效评估应用的安全性，测试人员需要掌握两方面的能力：
+
+· 资产收集：从应用包中提取关键信息，如API端点、密钥、第三方服务凭证等，这些信息往往成为后续攻击的突破口。
+· 动态分析：通过Hook技术监控和修改应用的运行时行为，绕过防护机制（如SSL Pinning）以拦截加密流量，或直接篡改逻辑验证漏洞。
+
+传统的手动分析耗时且容易遗漏，而现代工具链（如Frida、MobSF）的出现，使得自动化与半自动化的测试成为可能。本文将从云真机环境搭建开始，逐步深入Frida Hook的核心用法，并结合多个开源工具，展示一套完整的移动应用资产收集与动态测试方案。
+
+---
+
+2. 云真机：突破设备限制的资产收集平台
+
+在进行移动应用测试时，测试人员往往面临设备碎片化的问题：不同厂商、系统版本、屏幕尺寸的设备可能导致应用行为差异。本地维护多台真机成本高昂，而模拟器又无法完全模拟真实环境（如传感器、特定硬件特性）。云真机服务应运而生，它通过远程访问真实设备，为测试者提供即用型的测试环境。
+
+2.1 云真机的作用
+
+· 跨设备兼容性测试：快速在多种型号的设备上安装并运行应用，观察其表现。
+· 免维护硬件：无需购买和保养大量物理手机，降低测试成本。
+· 自动化支持：许多云真机平台提供API接口，可集成到CI/CD流水线中，实现自动化安全测试。
+
+2.2 实践：使用云真机平台
+
+以 http://www.gc.com.cn/ 为例（具体平台可根据实际选择），注册登录后，用户可以远程连接到一台真实的Android或iOS设备。操作方式通常为：
+
+1. 在网页端选择需要的设备型号和系统版本。
+2. 通过ADB或VNC远程连接设备。
+3. 上传待测APK/IPA并安装。
+4. 进行后续的动态分析（如安装Frida Server、抓包等）。
+
+云真机的使用大大简化了环境准备过程，让测试者可以专注于分析本身。
+
+---
+
+3. Frida Hook技术详解
+
+Frida是一款跨平台的动态插桩工具，支持Windows、macOS、Linux、Android、iOS等主流系统。它允许测试人员向正在运行的应用进程中注入JavaScript代码，动态地监控函数调用、修改返回值、调用内部方法等。Frida的强大之处在于：
+
+· 同时支持Java层和Native层：可以Hook Java方法，也可以Hook C/C++函数。
+· 脚本化：使用JavaScript编写Hook逻辑，易于分享和复用。
+· 无需重打包：直接在运行时修改应用行为，避免破坏应用签名。
+
+3.1 安装与配置
+
+3.1.1 本地安装Frida工具
+
+在测试机（PC）上，通过pip安装frida和frida-tools：
+
+```bash
+pip install frida
+pip install frida-tools
+```
+
+安装完成后，可以使用frida --version查看版本，后续在目标设备上安装的frida-server必须与此版本一致。
+
+3.1.2 在目标设备（模拟器/真机）上安装frida-server
+
+1. 下载frida-server
+      访问 https://github.com/frida/frida/releases ，根据目标设备的CPU架构选择合适的版本。例如：
+   · ARM64真机：frida-server-<version>-android-arm64.xz
+   · x86模拟器：frida-server-<version>-android-x86.xz
+   可以通过ADB命令查看设备CPU架构：
+   ```bash
+   adb shell getprop ro.product.cpu.abi
+   ```
+2. 推送并运行frida-server
+   ```bash
+   adb push frida-server /data/local/tmp/
+   adb shell
+   cd /data/local/tmp/
+   chmod 777 frida-server
+   ./frida-server &
+   ```
+   运行后，可用ps | grep frida确认进程是否存在。
+3. 端口转发
+      在PC上执行端口转发，使Frida客户端能与设备上的服务通信：
+   ```bash
+   adb forward tcp:27042 tcp:27042
+   ```
+4. 连接测试
+   ```bash
+   frida-ps -U   # 列出通过USB连接的设备上的进程
+   frida-ps -R   # 列出通过远程连接（如TCP）的设备上的进程
+   ```
+   如果能看到进程列表，说明Frida环境配置成功。
+
+3.2 实践：使用Frida绕过SSL Pinning
+
+许多应用为了防止中间人攻击，会实现证书锁定（SSL Pinning），即只信任特定的服务器证书。这使得安全测试人员无法通过代理工具（如Burp Suite）抓包分析HTTPS流量。Frida可以通过Hook验证证书的代码，强制应用接受任何证书。
+
+常见的绕过脚本是SSLUnpinning.js，可以从 https://github.com/apkunpacker/FridaScripts 获取。使用方式：
+
+```bash
+frida -U -f <应用包名> -l SSLUnpinning.js --no-pause
+```
+
+例如，针对某个应用：
+
+```bash
+frida -U -f ddns.android.vuls -l SSLUnpinning.js
+frida -U -f com.p1.mobile.putong -l SSLUnpinning.js
+frida -U -f com.tencent.gamehelper.smoba -l SSLUnpinning.js
+```
+
+-f参数表示启动并挂起应用，注入脚本后再恢复运行。注入成功后，应用将不再验证证书，此时即可通过Burp Suite等代理抓取HTTPS流量。
+
+---
+
+4. 综合资产提取工具的应用
+
+除了动态Hook，静态分析也是资产收集的重要手段。以下三款开源工具可以帮助测试者快速从APK中提取敏感信息。
+
+4.1 apkleaks
+
+项目地址：https://github.com/dwisiswant0/apkleaks
+apkleaks是一款扫描APK文件中敏感信息的工具，它通过正则表达式匹配硬编码的API密钥、端点、IP地址、电子邮件等。使用方法简单：
+
+```bash
+apkleaks -f app.apk -o output.txt
+```
+
+它会反编译APK并扫描所有文件，将发现的结果输出到文件中。
+
+4.2 AppMessenger
+
+项目地址：https://github.com/sulab999/AppMessenger
+AppMessenger是一个集成了多种信息收集功能的工具，可以提取APK的权限、组件、第三方库等，并生成报告。它支持批量分析，适合在测试多个应用时使用。
+
+4.3 MobSF（Mobile Security Framework）
+
+项目地址：https://github.com/MobSF/Mobile-Security-Framework-MobSF
+MobSF是一款功能强大的移动安全测试框架，集成了静态分析、动态分析、恶意软件检测等功能。它可以自动解析APK/IPA，提取出所有资产信息（如URL、API端点、硬编码密钥等），并提供可视化的报告界面。
+
+使用Docker快速启动MobSF：
+
+```bash
+docker pull opensecurity/mobile-security-framework-mobsf
+docker run -it -p 8000:8000 opensecurity/mobile-security-framework-mobsf
+```
+
+然后访问http://localhost:8000上传APK进行分析。
+
+4.4 工具协同
+
+在实际测试中，可以先使用apkleaks或MobSF进行静态资产收集，获取应用的API端点、密钥等；然后在动态测试中，利用这些信息指导抓包和漏洞验证。例如，发现某个API端点使用了硬编码的API Key，就可以尝试修改该Key或利用它进行越权访问测试。
+
+---
+
+5. iOS端的双向认证绕过
+
+iOS应用同样存在证书锁定机制，且由于系统封闭性，传统的代理抓包更加困难。SSL Kill Switch 2是一个专门用于绕过iOS SSL Pinning的工具，它通过注入代码禁用系统的证书验证逻辑。
+
+5.1 SSL Kill Switch 2 简介
+
+项目地址：https://github.com/nabla-c0d3/ssl-kill-switch2
+它通过替换iOS中负责SSL验证的函数，使得应用信任所有证书。支持越狱和非越狱设备（需配合重签名）。
+
+5.2 安装与使用
+
+详细教程可参考：https://testerhome.com/topics/17249
+简要步骤如下：
+
+1. 下载最新版本的SSLKillSwitch2.deb（从GitHub Releases获取）。
+2. 将deb文件传输到越狱设备，使用Cydia或手动安装。
+3. 安装后，在设置中启用SSL Kill Switch 2。
+4. 重启应用，即可使用代理抓取HTTPS流量。
+
+对于非越狱设备，可以通过Frida实现类似功能，但SSL Kill Switch 2提供了更直接的解决方案。
+
+---
+
+6. 综合实践案例：对某应用进行资产收集与SSL绕过
+
+假设我们有一个待测的Android应用demo.apk，目标是提取其敏感信息并抓取加密流量。
+
+步骤1：静态资产收集
+
+将demo.apk上传至MobSF，等待分析完成。在报告中找到“Hardcoded Secrets”和“Endpoints”部分，记录下所有发现的URL、API密钥、Token等。同时使用apkleaks进行二次验证：
+
+```bash
+apkleaks -f demo.apk -o secrets.txt
+```
+
+步骤2：动态环境准备
+
+使用云真机平台（如http://www.gc.com.cn/）选择一台Android 11设备，连接后通过ADB安装demo.apk。然后按照第3节的方法，推送并运行frida-server。
+
+步骤3：绕过SSL Pinning
+
+找到应用的包名（可通过frida-ps -U或aapt查看），执行：
+
+```bash
+frida -U -f com.example.demo -l SSLUnpinning.js --no-pause
+```
+
+此时应用启动，同时Burp Suite设置代理（需在设备上安装Burp证书）。尝试浏览应用功能，观察Burp中是否出现了HTTPS流量。
+
+步骤4：结合资产信息进行深度测试
+
+在抓包过程中，对照之前提取的API端点，重点关注那些包含敏感参数或未经认证的接口。例如，发现一个/api/user/info接口，尝试修改用户ID参数，检查是否存在越权漏洞。如果某个接口使用了硬编码的API Key，可以尝试在其他请求中重用该Key。
+
+通过以上步骤，我们完成了从资产收集到动态验证的完整流程，有效发现了应用潜在的安全风险。
+
+---
+
+7. 总结与展望
+
+本文从移动应用安全测试的实际需求出发，介绍了云真机、Frida Hook、静态资产提取工具以及iOS SSL绕过工具的综合应用。这些工具和技术相互补充，构成了一个高效的测试体系：
+
+· 云真机解决了设备碎片化问题，提供真实的测试环境。
+· Frida作为动态插桩的核心，能够灵活地修改应用行为，突破防护机制。
+· 静态分析工具（apkleaks、MobSF等）快速提取资产，指导后续测试方向。
+· SSL Kill Switch 2针对iOS平台提供了专门的绕过方案。
+
+随着移动应用安全对抗的升级，测试人员需要不断更新知识，掌握更多底层Hook技术（如Frida的Stalker用于指令跟踪），并将工具链整合到自动化平台中。未来，结合人工智能的资产识别与漏洞挖掘也将成为发展趋势。希望本文能为移动安全测试人员提供实用的参考，助力提升测试的深度与效率。
+
+---
+
+注：文中提及的工具和脚本仅供安全测试和学习使用，请勿用于非法目的。
