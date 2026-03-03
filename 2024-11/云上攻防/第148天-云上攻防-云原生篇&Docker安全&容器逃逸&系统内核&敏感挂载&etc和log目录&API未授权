@@ -1,0 +1,143 @@
+引言
+
+随着云原生技术的普及，Docker已成为应用交付与部署的核心工具。然而，容器并非“轻量级虚拟机”，其与宿主机共享内核的特性引入了新的攻击面。攻击者一旦在容器内获得初始权限，便可能通过内核漏洞逃逸、API未授权访问或敏感路径挂载等手段突破隔离边界，直接控制宿主机。本文结合具体漏洞（CVE-2022-0492、CVE-2022-0847）与实践操作，深入剖析三类典型逃逸技术的原理、复现过程及防御思路，帮助安全人员与运维工程师构建纵深防御体系。
+
+---
+
+一、内核漏洞逃逸：突破隔离的最后一道防线
+
+容器共享宿主机内核，因此内核漏洞可能成为逃逸的“万能钥匙”。当容器以较高权限（如SYS_ADMIN）运行时，漏洞利用的成功率会显著提升。
+
+1. CVE-2022-0492：控制组绕过逃逸
+
+漏洞原理
+CVE-2022-0492是Linux内核控制组（cgroup）中的逻辑缺陷。在未开启额外安全措施（如AppArmor或Seccomp）的容器中，拥有root权限的攻击者可借助cgroup的release_agent机制执行任意命令，实现逃逸。
+
+影响范围
+Linux kernel 5.17-rc3及之前版本（实际影响更广）。
+
+实践复现
+
+· 环境准备：Ubuntu 16.04，内核版本需在受影响范围内。
+· 启动特权容器（需手动添加SYS_ADMIN并关闭AppArmor）：
+  ```bash
+  docker run --rm -it --cap-add=SYS_ADMIN --security-opt="apparmor=unconfined" ubuntu:20.04 /bin/bash
+  ```
+· 利用步骤：容器内执行预编译的exp.sh，尝试读取宿主机/etc/passwd。
+  ```bash
+  ./exp.sh "cat /etc/passwd"
+  ```
+· 效果验证：若成功，exp将输出宿主机密码文件内容。
+
+防御建议
+
+· 避免使用--cap-add=SYS_ADMIN等高危权限。
+· 启用AppArmor、Seccomp等安全配置。
+· 及时更新内核至修复版本。
+
+---
+
+2. CVE-2022-0847（Dirty Pipe）：任意文件覆盖提权
+
+漏洞原理
+CVE-2022-0847被称为“Dirty Pipe”，是Linux内核管道机制中的竞争条件漏洞。攻击者可利用它覆盖任意可读文件（如/etc/passwd），实现本地提权，并可能借助宿主机挂载点完成容器逃逸。
+
+影响范围
+Linux内核 5.8 及以上版本（直至修复版本）。
+
+实践复现
+
+· 环境：Ubuntu 16.04（需内核≥5.8）。
+· 工具：使用公开的PoC项目CVE-2022-0847-DirtyPipe-Exploits。
+· 核心命令：
+    在容器内编译并执行exp，覆盖宿主机上可写的挂载文件（如通过-v挂载的目录），从而在宿主机上执行任意代码。
+
+防御建议
+
+· 内核升级至5.16.11、5.15.25或更高版本。
+· 限制容器对宿主机文件系统的写入权限。
+
+---
+
+二、API未授权访问：从网络入口接管主机
+
+Docker守护进程（dockerd）默认以root权限运行，并通过本地Unix Socket（/var/run/docker.sock）接受请求。若管理员将其暴露在TCP端口（如2375）且未配置认证，则相当于将主机的控制权拱手让人。
+
+漏洞原理
+
+攻击者通过扫描开放2375端口的服务器，可直接调用Docker API。例如，利用docker -H tcp://target:2375 run在宿主机上启动特权容器，并将宿主机根目录挂载至容器，从而获取完整控制权。
+
+实践复现
+
+· 靶场搭建：使用vulhub项目快速搭建未授权环境。
+  ```bash
+  git clone https://github.com/vulhub/vulhub.git
+  cd vulhub/docker/unauthorized-rce
+  docker-compose up -d
+  ```
+· 攻击步骤：
+  1. 探测目标2375端口是否开放。
+  2. 使用工具或脚本创建恶意容器，挂载宿主机根目录：
+     ```bash
+     # 利用现有PoC脚本
+     python dockerRemoteApiGetRootShell.py -h target_ip -p 2375
+     ```
+  3. 在容器内通过chroot /mnt切换至宿主机文件系统，执行任意命令。
+
+防御建议
+
+· 绝对禁止将Docker守护进程暴露在公网，除非配置TLS认证。
+· 使用防火墙限制2375端口的访问来源。
+· 启用RBAC和客户端证书验证。
+
+---
+
+三、危险挂载：宿主敏感目录的“特洛伊木马”
+
+Docker支持将宿主机目录挂载到容器中，这本是数据共享的便利设计。但若挂载了/var/log、/etc等敏感路径，攻击者便可借此窃取信息或实现逃逸。
+
+案例1：挂载/var/log
+
+· 场景：容器需读取宿主机日志。
+· 风险：攻击者可尝试覆盖日志文件，或利用日志目录中的可写文件（如某些服务产生的socket）进行攻击。
+
+案例2：挂载/etc
+
+· 实践：
+  ```bash
+  docker run -it --name etc_container -v /etc:/host_etc alpine:latest /bin/sh
+  ```
+· 信息窃取：进入容器后，攻击者可直接查看/host_etc/passwd、/host_etc/shadow、/host_etc/hostname等敏感文件，为后续横向移动铺路。
+
+进阶利用：挂载docker.sock
+
+· 高危操作：若容器挂载了宿主机的/var/run/docker.sock，则容器内可直接与宿主机Docker守护进程通信，启动任意容器，相当于获得宿主机控制权。
+
+防御建议
+
+· 严格审查挂载需求，避免挂载敏感目录。
+· 使用只读挂载（:ro）限制写入。
+· 对docker.sock的挂载实行零信任策略。
+
+---
+
+总结：构建容器安全纵深防线
+
+容器逃逸并非单一漏洞所致，而是权限配置不当、内核漏洞与运维疏忽共同作用的结果。基于上述分析，建议采取以下措施：
+
+1. 最小权限原则：禁止容器以--privileged或添加高危--cap-add运行。
+2. 内核与软件更新：及时修补已知内核漏洞。
+3. 网络隔离：Docker API绝不暴露于外网，必须暴露时需配置TLS与IP白名单。
+4. 挂载管控：对/etc、/var/run/docker.sock等敏感路径实施严格准入。
+5. 运行时安全：启用AppArmor、Seccomp等配置，并借助工具（如Falco）监控异常行为。
+
+云原生安全是动态对抗的过程。只有深入理解攻击手法，并将防御措施嵌入容器生命周期的每个环节，才能真正筑牢安全基石。
+
+---
+
+参考文献
+
+· CVE-2022-0492 PoC: github.com/chenaotian/CVE-2022-0492
+· CVE-2022-0847 DirtyPipe: github.com/AlexisAhmed/CVE-2022-0847-DirtyPipe-Exploits
+· Docker API未授权利用: github.com/xiju2003/dockerRemoteApiGetRootShell-fix
+· Vulhub靶场: github.com/vulhub/vulhub
