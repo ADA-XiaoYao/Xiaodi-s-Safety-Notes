@@ -1,0 +1,207 @@
+引言
+
+随着Web应用的复杂度不断提升，MVC（Model-View-Controller）模式已成为现代开发框架的主流架构。它将业务逻辑、数据展示和用户交互分离，极大地提高了代码的可维护性和扩展性。然而，这种分层架构也为安全审计带来了新的挑战和切入点。攻击者往往利用MVC各层之间的数据流转和过滤疏漏实施攻击。本文将从MVC架构的基本原理出发，梳理代码审计的核心思路，并结合LmxCMS和Rockoa的实际漏洞案例，展示如何将理论方法应用于实战发现。
+
+---
+
+一、MVC架构与审计影响
+
+1. MVC流程与各层职能
+
+· Controller（控制器）：截获用户请求，调用Model处理数据，选择View渲染结果。
+· Model（模型）：管理业务逻辑与数据库交互，提供数据抽象层。
+· View（视图）：负责前端模板渲染，将数据以HTML等形式呈现给用户。
+
+2. MVC对代码审计的主要影响
+
+· 文件定位：路由规则决定了控制器与方法的对应关系，审计时需首先解析URL映射。
+· 过滤分析：数据可能在Controller、Model或全局配置中被过滤，审计需追踪完整的数据流。
+· 前端安全：View层直接输出数据，容易引入XSS等漏洞，需关注模板引擎的转义机制。
+
+---
+
+二、漏洞类型与审计关键字
+
+在PHP环境中，常见漏洞及其关键函数/特征如下表所示：
+
+漏洞类型 关键函数/特征
+SQL注入 select, insert, update, mysql_query, mysqli 等
+文件上传 $_FILES, type="file", move_uploaded_file()
+XSS跨站 print, print_r, echo, sprintf, die, var_dump 等输出函数
+文件包含 include, include_once, require, require_once
+代码执行 eval, assert, preg_replace (e修饰符), call_user_func 系列
+命令执行 system, exec, shell_exec, 反引号, passthru, popen 等
+变量覆盖 extract(), parse_str(), import_request_variables(), $$ 动态变量
+反序列化 serialize(), unserialize(), __construct, __destruct 魔术方法
+其他 unlink(), file_get_contents(), show_source(), file(), fopen()
+
+通用输入变量：$_GET, $_POST, $_REQUEST, $_FILES, $_SERVER 等是漏洞的主要入口。
+
+注释关键字：开发者留下的优化或功能注释（如“TODO”、“FIXME”）往往能快速定位业务逻辑段，提高审计效率。
+
+---
+
+三、审计入口方法与流程
+
+1. 审计入口方法
+
+· 搜索法：在源码中直接搜索上述关键字，快速定位潜在风险点。
+· 功能法：通过抓包分析功能点（如用户注册、文件上传），反向追踪代码实现。
+· 对比法：对比不同版本或修复补丁，发现新增或修改的漏洞点。
+· 特征法：监控特定操作（如SQL查询、文件删除）对应的函数调用。
+· 工具法：借助SAST、DAST、IAST等自动化工具辅助分析。
+· 调试法：动态插桩调试，观察变量传递和过滤过程。
+
+2. 审计流程
+
+· 搞清URL路由对应：确定每个URL指向的具体控制器与方法（例如ThinkPHP的路由规则）。
+· 搞清核心配置文件：分析全局过滤、数据库配置、自动加载等设置。
+· 搞清是否为开发框架：不同框架的过滤机制和漏洞模式差异较大（如ThinkPHP、Laravel、Yii）。
+
+---
+
+四、实战案例分析
+
+案例1：LmxCMS MVC SQL注入（CNVD-2023-98192）
+
+漏洞背景
+
+LmxCMS是一款基于PHP+MVC架构的内容管理系统。该漏洞存在于标签页（Tags）模块，由于对用户输入的name参数进行了两次URL解码，导致全局过滤被绕过。
+
+漏洞分析
+
+路由映射：/index.php?m=Tags&name=xxx 指向 Tags 控制器，name 参数传入后经历如下处理：
+
+1. Web服务器自动进行一次URL解码。
+2. 程序调用自定义过滤函数 filter_sql 进行安全过滤。
+3. 过滤后再次对参数进行URL解码，然后拼接SQL语句。
+
+攻击者利用两次解码的间隙，将恶意Payload进行双重URL编码，使得第一次解码后仍为编码状态，从而绕过 filter_sql，第二次解码后才还原为真实Payload。
+
+利用方式
+
+原始Payload：1' and updatexml(0,concat(0x7e,user()),1)#
+双重编码后传入：%2531%2527%2520%2561%256e%2564%2520...（省略）
+最终导致SQL报错注入，可获取数据库信息。
+
+审计思路
+
+· 搜索法：搜索 filter_sql 函数，发现其对常见SQL关键字进行了过滤。
+· 功能法：访问标签页，抓包观察参数传递，定位到 Tags 控制器中的 name 参数处理代码。
+· 特征法：注意到两次 urldecode 操作，意识到可能存在绕过风险。
+
+修复建议
+
+避免多次解码，统一在入口处进行过滤，或使用参数化查询。
+
+---
+
+案例2：LmxCMS MVC 文件安全（CNVD-2020-59469）
+
+漏洞背景
+
+后台数据库备份管理功能存在任意文件删除漏洞，攻击者可删除任意文件。
+
+漏洞分析
+
+路由：admin.php?m=backdb&a=delbackdb&filename=../../1.txt
+对应 BackdbAction.class.php 中的 delbackdb 方法，该方法调用 delOne()，直接使用 unlink() 删除用户传入的 filename，且未做路径限制。
+
+审计思路
+
+· 搜索法：搜索 unlink 函数，定位到 BackdbAction.class.php 中的删除操作。
+· 功能法：进入后台备份管理，点击“删除备份”并抓包，发现请求中包含 filename 参数。
+· 对比法：对比官方修复版本，发现增加了路径过滤和目录限制。
+
+利用方式
+
+构造路径穿越，删除任意文件，如 ../../config.php。
+
+修复建议
+
+严格限制删除路径，使用 basename() 或检查文件是否在允许的目录内。
+
+---
+
+案例3：Rockoa MVC SQL注入（一）
+
+漏洞背景
+
+Rockoa是一款企业协同办公系统，采用自定义MVC路由：index.php?m=模块|目录&d=外层目录&a=方法。漏洞存在于考勤功能中。
+
+漏洞分析
+
+URL：/index.php?m=opendkq|openapi&d=task&a=zktime
+对应文件：/task/openapi/opendkqAction.php 中的 zktimeAction 方法。
+方法中调用 addkqjs() 进而调用 senddata()，最终在 zktimeAction 中直接将POST的JSON数据拼接至SQL语句，导致注入。
+
+审计思路
+
+· 路由解析：根据 m 参数（opendkq|openapi）定位到 opendkqAction.php，a=zktime 定位到 zktimeAction 方法。
+· 搜索法：在方法中搜索SQL操作函数（如 insert），发现未对JSON中的字段进行过滤。
+· 功能法：模拟考勤数据提交，观察请求包格式为JSON，尝试注入。
+
+利用方式
+
+POST JSON：
+
+```json
+{"xxx":{"sn":"123' and sleep(0)#"}}
+```
+
+导致数据库延时注入。
+
+修复建议
+
+使用参数化查询或严格过滤JSON输入。
+
+---
+
+案例4：Rockoa MVC SQL注入（二）
+
+漏洞背景
+
+另一个注入点位于相同模块的 querydata 方法。
+
+漏洞分析
+
+URL：/index.php?m=openbase|openapi&d=task&a=querydata
+对应文件：/task/openapi/openbaseAction.php 中的 querydata 方法。
+方法中调用 getuserid()，最终在SQL查询中拼接了用户输入的 basemodenum 参数，同样未过滤。
+
+审计思路
+
+· 特征法：关注 select 查询，定位到 openbaseAction.php 的 querydata 方法。
+· 调试法：动态输出SQL语句，确认参数拼接位置。
+
+利用方式
+
+POST JSON：
+
+```json
+{"baseoptid":"1","basemodenum":"xxx' OR SLEEP(0.04)#"}
+```
+
+修复建议
+
+同案例3，加强输入验证。
+
+---
+
+五、总结与建议
+
+MVC架构的代码审计需要审计人员既理解框架的设计思想，又掌握具体的漏洞挖掘技巧。通过本文的案例分析，我们可以总结出以下要点：
+
+1. 路由解析是起点：必须准确理解URL到控制器方法的映射，才能快速定位代码。
+2. 数据流追踪是关键：从入口参数到数据库操作，中间可能经过多次过滤、解码、转换，任何一环的疏漏都可能成为突破口。
+3. 多种审计方法结合：搜索法可快速发现敏感函数，功能法有助于理解业务逻辑，对比法和调试法能发现隐蔽问题。
+4. 关注框架特性：不同框架的默认过滤机制（如ThinkPHP的自动参数绑定）和常见安全缺陷（如Laravel的批量赋值）需额外留意。
+
+对于开发者而言，应在框架层面建立统一的输入过滤和输出转义机制，避免在各控制器中重复实现易错的安全逻辑；对于审计人员，则需深入理解这些机制，才能发现绕过或遗漏的风险点。只有理论与实践紧密结合，才能构建真正安全的Web应用。
+
+---
+
+参考文献
+
+· CNVD漏洞库：CNVD-2023-98192, CNVD-2019-05674, CNVD-2020-59469
+· 先知社区：Rockoa SQL注入分析 https://xz.aliyun.com/news/18185
