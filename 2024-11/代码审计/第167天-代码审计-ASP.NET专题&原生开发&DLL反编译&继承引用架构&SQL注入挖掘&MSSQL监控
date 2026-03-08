@@ -1,0 +1,119 @@
+引言
+
+在Web应用安全领域，代码审计是发现漏洞最直接有效的手段。与PHP等动态语言不同，ASP.NET应用采用编译型架构，其代码组织方式、文件类型以及运行机制都有独特之处。本文将深入探讨.NET环境下的代码审计技术，重点讲解如何通过反编译获取核心逻辑，并以SQL注入漏洞为切入点，结合三个真实案例，展示从定位入口点到挖掘漏洞的全过程。
+
+一、ASP.NET应用结构解析
+
+在进行代码审计之前，首先需要理解ASP.NET应用的典型构成。一个ASP.NET Web应用通常包含以下文件类型：
+
+· .aspx：页面文件，负责前端展示（HTML、控件）。其后台逻辑通过@Page指令关联到代码隐藏类。
+· .cs / .vb：代码隐藏文件或类文件，包含C#或VB.NET编写的业务逻辑、事件处理等。
+· .ashx：一般处理程序，用于处理HTTP请求，类似轻量级的HttpHandler，不包含UI。
+· .dll：编译后的程序集，通常由.cs文件编译生成，部署在bin目录下。在生产环境中，源码往往被隐藏，只能通过反编译获取。
+
+页面与代码的关联方式
+
+在.aspx文件头部，@Page指令通过以下属性指定代码隐藏类的位置：
+
+· Inherits：指定页面继承的类名（如Inherits="AppLeave.AppLeave.Search"）。
+· CodeFile：指向代码隐藏文件的路径（开发时使用，编译后不必要）。
+· CodeBehind：Visual Studio项目中使用，标识关联的.cs文件（仅在开发环境有效）。
+
+对于已编译部署的应用，.aspx文件中通常只保留Inherits属性，而实际代码存在于bin目录的DLL中。此时，代码审计必须借助反编译工具。
+
+二、反编译工具链
+
+常用的.NET反编译工具包括：
+
+· ILSpy：开源免费，支持IL代码查看和C#还原，可导出项目。
+· dotPeek：JetBrains出品，功能强大，支持符号服务器和PDB生成。
+· dnSpyEx：不仅可反编译，还能直接调试和修改IL代码，是动态分析利器。
+· de4dot：用于去除混淆，恢复原始程序集，常作为反编译前置工具。
+
+在审计时，推荐将反编译得到的代码导入IDE（如Visual Studio或VS Code），便于全文搜索、语法高亮和引用跳转。
+
+三、审计流程：从页面到代码
+
+对于已有源码的审计，直接阅读.cs文件即可。但对于只有部署包的情况，需按以下步骤：
+
+1. 收集目标文件：获取bin目录下的所有DLL，以及.aspx、.ashx等文件。
+2. 反编译DLL：使用ILSpy或dnSpyEx打开DLL，导出为C#项目。
+3. 建立映射关系：根据.aspx中的Inherits属性，找到对应的反编译类。
+   · 例如，Search.aspx中声明Inherits="AppLeave.AppLeave.Search"，则在反编译代码中寻找命名空间AppLeave.AppLeave下的Search类。
+4. 定位入口点：在页面类中查找与用户输入交互的方法，如按钮点击事件、Page_Load、自定义方法等。
+5. 追踪数据流：从输入点（如控件ID、Request对象）开始，跟踪变量传递，直到SQL执行或输出函数。
+6. 确认漏洞：若发现未经验证直接拼接SQL语句，则判定为SQL注入。
+
+四、实战案例：SQL注入漏洞挖掘
+
+案例1：启明星系统
+
+漏洞文件：Search.aspx
+后台类：AppLeave.AppLeave.Search
+关键方法：Bind()
+
+审计过程：
+
+· 查看Search.aspx，发现其Inherits指向AppLeave.AppLeave.Search。
+· 反编译对应的DLL，找到AppLeave.AppLeave.Search类。
+· 在类中定位Bind方法，发现其从控件txt_id获取用户输入：
+  ```csharp
+  string id = this.txt_id.Text.Trim();
+  string sql = "SELECT * FROM Leave WHERE ID = " + id;
+  ```
+· 直接拼接字符串，未做任何过滤或参数化处理，导致SQL注入。
+
+验证：在txt_id中输入1 or 1=1，返回所有数据，确认漏洞存在。
+
+案例2：HDHCMS
+
+漏洞文件：login.aspx
+后台类：Admin_login
+关键方法：FunAdminLoginTo() → FunGetCookies()
+
+审计过程：
+
+· login.aspx中Inherits指向Admin_login。
+· 反编译后查看Admin_login类，发现登录验证方法FunAdminLoginTo。
+· 该方法调用FunGetCookies生成Cookie值，其中使用了用户输入：
+  ```csharp
+  string user = Request.Form["username"];
+  string cookie = "AdminUser=" + user + ";AdminCook=" + SomeFunction(user);
+  ```
+· SomeFunction中可能存在二次拼接，但源头未对user进行过滤。
+· 进一步追踪发现AdminCook的生成依赖用户输入，且最终拼接进SQL查询。
+
+注入点：用户名参数直接拼接到Cookie中，而后在验证Cookie的查询语句中未作处理，形成二次注入。
+
+案例3：McOA
+
+漏洞文件：某页面（如News.aspx）
+过滤机制：MojoCube.Api.Text.CheckSql.Filter
+关键参数：Request.QueryString["typeId"]
+
+审计过程：
+
+· 发现系统使用了全局SQL注入过滤函数CheckSql.Filter。
+· 跟踪该函数实现：它通过正则替换部分危险关键字，但存在绕过可能（如大小写、编码、嵌套等）。
+· 在目标页面中，直接从QueryString获取typeId：
+  ```csharp
+  string typeId = Request.QueryString["typeId"];
+  string sql = "SELECT * FROM News WHERE TypeId = " + typeId;
+  ```
+· 虽然调用了Filter，但尝试构造1 /*!or*/ 1=1等绕过形式，成功执行恶意语句。
+
+教训：基于黑名单的过滤往往不彻底，参数化查询才是根本解决方案。
+
+五、审计技巧与要点
+
+1. 关键字搜索：在反编译代码中搜索SqlCommand、SqlDataAdapter、ExecuteQuery、"select"拼接等模式，快速定位数据访问点。
+2. 关注控件绑定：如GridView、Repeater等控件的数据绑定方法（如DataSource、DataBind），常伴随SQL查询。
+3. 跟踪Request对象：Request.QueryString、Request.Form、Request.Cookies是外部输入的源头，需追踪其流向。
+4. 注意过滤函数：若存在全局过滤，需分析其实现是否可绕过。常见绕过技巧包括：注释符、空白字符、函数嵌套、二次注入等。
+5. 分析DLL依赖：某些业务逻辑可能封装在多个DLL中，需通过反编译理清调用链。
+
+六、总结
+
+.NET代码审计的核心在于理解编译型应用的代码组织形式，并掌握反编译技术以还原源码。通过建立页面与后台类的映射，追踪用户输入的数据流，结合手动测试，可以有效挖掘SQL注入等漏洞。在实际工作中，应始终以参数化查询、存储过程等安全编码实践为目标，而非依赖脆弱的过滤机制。
+
+安全是一场持续的攻防博弈，掌握审计技术不仅有助于发现漏洞，更能深入理解漏洞成因，从而编写更安全的代码。希望本文能为.NET安全研究人员提供实用的参考。
