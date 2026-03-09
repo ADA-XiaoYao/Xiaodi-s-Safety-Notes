@@ -1,0 +1,190 @@
+摘要
+
+鉴权是Web应用安全的第一道防线，然而在Java EE开发中，由于框架配置不当、组件版本漏洞或代码逻辑缺陷，常常导致鉴权被绕过。本文从理论和实践结合的角度，深入剖析Shiro框架和JWT技术中典型的鉴权漏洞，通过Tumo、JEBS、FastCMS、Nacos四个真实案例，展示漏洞的成因、利用方式及审计方法，最后给出防御与审计建议，帮助开发者和安全人员构建更安全的鉴权体系。
+
+---
+
+1. 引言
+
+在Java Web应用中，鉴权（Authentication & Authorization）负责识别用户身份并控制其访问权限。常见的实现方式包括基于会话的Shiro框架和基于令牌的JWT技术。然而，在实际代码审计中，我们经常发现开发者对鉴权机制的理解不够深入，导致出现未授权访问、权限绕过等严重漏洞。本文将结合Shiro和JWT的底层原理，通过具体案例，逐步剖析这些漏洞的产生与利用。
+
+---
+
+2. Shiro框架鉴权审计
+
+2.1 Shiro鉴权机制概述
+
+Apache Shiro是一个强大且易用的Java安全框架，提供身份验证、授权、加密和会话管理。其核心是FilterChain机制，通过配置URL路径与过滤器的对应关系来决定是否放行请求。常见的过滤器含义：
+
+· anon：无需认证即可访问。
+· authc：需要认证（登录）才能访问。
+· user：需要用户已登录或记住我。
+· logout：退出登录。
+
+在配置时，Shiro通过URL模式匹配来决定请求应经过哪些过滤器。若anon配置范围过大，或存在路径解析差异，就可能导致漏洞。
+
+2.2 案例一：Tumo项目未授权访问漏洞
+
+项目背景：Tumo是一个基于Spring Boot + Shiro的博客系统，其Shiro版本为1.5.2。
+
+2.2.1 配置分析
+查看pom.xml，确认shiro-spring版本为1.5.2。在Shiro配置类中，anon的配置如下：
+
+```java
+tumo.shiro.anon_url=\
+  /login,/logout,/register,\
+  /,/about,/p/**,/links,/comment/**,/link/list,/article/list,\
+  /css/**,/js/**,/img/**
+```
+
+其中/comment/**被标记为anon，意味着所有以/comment/开头的路径都不需要认证。
+
+2.2.2 漏洞点定位
+在CommentController.java中发现如下接口：
+
+```java
+@RequestMapping("/comment")
+@GetMapping("/{id}")
+public Result getComment(@PathVariable Long id) { ... }
+
+@DeleteMapping("/{id}")
+public Result deleteComment(@PathVariable Long id) { ... }
+```
+
+由于/comment/**被配置为anon，因此GET /comment/1和DELETE /comment/1均未受保护，任何用户都可访问。
+
+2.2.3 漏洞复现
+
+· 访问GET /comment/1，返回评论详情，无需登录。
+· 发送DELETE /comment/1请求，直接删除评论，造成数据丢失。
+
+漏洞成因：开发者在配置anon时误将业务接口/comment/**加入了白名单，导致敏感操作暴露。
+
+2.3 案例二：JEBS项目Shiro版本漏洞绕过
+
+项目背景：JEBS使用Shiro 1.4.0进行鉴权，其配置如下：
+
+```java
+filterChainDefinitionMap.put("/css/**", "anon");
+filterChainDefinitionMap.put("/js/**", "anon");
+...
+filterChainDefinitionMap.put("/**", "user");
+```
+
+即所有请求都需要登录后才能访问（user），但静态资源目录/css/**等为白名单。
+
+2.3.1 漏洞原理
+Shiro 1.4.0及之前版本存在一个路径规范化绕过漏洞（CVE-2020-11989等）。其根源在于Shiro与Spring对URL的解析方式不一致：
+
+· Spring会先将URL进行标准化（如去除/../、处理;等）后再匹配路由。
+· Shiro则是基于原始URL进行匹配。
+
+攻击者可以利用;（分号）在URL中的特殊含义（如/js/..;/user/list），使得Shiro匹配到/js/**的anon规则而放行，但Spring处理后的实际路径为/user/list，导致权限绕过。
+
+2.3.2 利用方式
+目标接口：/user/list（需要登录）。
+构造请求：GET /js/..;/user/list
+
+· Shiro解析路径为/js/..;/user/list，由于/js/**规则匹配（**匹配任意子路径），判定为anon，直接放行。
+· Spring收到请求后，将路径标准化为/user/list，交由UserController处理，从而未授权访问。
+
+漏洞验证：在JEBS中，直接访问/user/list被重定向到登录页，而访问/js/..;/user/list则成功返回用户列表数据。
+
+2.3.3 修复建议
+升级Shiro至1.6.0及以上版本，或确保Shiro与Spring的URL解析逻辑一致，避免使用;作为路径分隔符的差异。
+
+---
+
+3. JWT技术鉴权审计
+
+3.1 JWT鉴权机制概述
+
+JWT（JSON Web Token）由三部分组成：Header、Payload、Signature。服务端生成Token返回客户端，后续请求携带Token，服务端验证签名以确认身份。常见的安全问题源于对JWT规范的错误实现。
+
+3.2 JWT常见安全问题
+
+· 空加密算法（None算法）：将Header中的alg设为none，强制服务端不验证签名。
+· 服务端未校验签名：代码中仅解析Payload而未验证Signature。
+· 硬编码默认密钥：密钥写在代码或配置文件中且未修改，攻击者可获得密钥伪造任意Token。
+· 弱密钥爆破：密钥过于简单（如secret），可通过暴力破解获得。
+
+3.3 案例一：FastCMS默认密钥导致JWT伪造
+
+项目背景：FastCMS是一个基于Spring Boot的内容管理系统，使用JWT进行身份验证。
+
+3.3.1 审计发现密钥配置
+通过抓包发现登录后返回的Token为JWT格式。查看源码，在AuthConfigs类中：
+
+```java
+@Value("${fastcms.jwt.secret}")
+private String secretKey;
+```
+
+在application.yml中：
+
+```yaml
+fastcms:
+  jwt:
+    secret: 123456
+```
+
+密钥为默认的123456，且生产环境未修改。
+
+3.3.2 构造伪造JWT
+使用在线工具（如jwt.io）或脚本，以123456为密钥生成一个新的Token，将用户名改为管理员（如admin）。替换请求中的Token，即可获得管理员权限。
+
+漏洞成因：密钥硬编码且未强制修改，导致攻击者可伪造任意用户身份。
+
+3.4 案例二：Nacos默认密钥导致JWT伪造
+
+项目背景：Nacos是阿里巴巴的服务发现和配置管理平台，其1.x版本默认开启鉴权时使用JWT。
+
+3.4.1 环境搭建与密钥定位
+下载Nacos 1.4.0，以单机模式启动：startup.cmd -m standalone。
+查阅文档或源码发现，JWT密钥配置项为：nacos.core.auth.plugin.nacos.token.secret.key。在默认未配置时，Nacos使用硬编码的默认密钥（如SecretKey012345678901234567890123456789012345678901234567890123456789，不同版本略有差异）。
+
+3.4.2 JWT伪造与登录绕过
+攻击者获取到默认密钥后，可以构造一个包含管理员身份的JWT。登录时，若服务端开启鉴权，会验证Token。攻击者可直接在请求头中携带伪造的JWT，绕过登录页面进入管理后台。
+
+实际利用：参考公开的POC，通过修改返回包中的JWT值，或直接伪造Token访问/nacos/v1/auth/users等接口，实现权限提升。
+
+---
+
+4. 鉴权漏洞的防御与审计建议
+
+4.1 Shiro配置审计要点
+
+· 白名单最小化：避免将业务接口加入anon，静态资源应单独放置于固定目录（如/static/**）。
+· 路径匹配顺序：Shiro按顺序匹配，应将具体路径放在通配符之前，如先写/comment/add再写/comment/**。
+· 版本更新：及时升级Shiro，修复已知的路径绕过漏洞。
+· 测试绕过：使用..;/、%2e等畸形路径测试是否存在解析差异。
+
+4.2 JWT安全实践
+
+· 签名强制校验：服务端必须验证签名，且拒绝alg=none的Token。
+· 密钥管理：禁止硬编码密钥，应从环境变量或配置中心读取，且默认值必须修改为强密钥（长度足够、随机）。
+· 密钥轮换：定期更换密钥，减少泄露风险。
+· 短时效与刷新：设置Token过期时间，并提供刷新机制，降低Token泄露的影响。
+
+4.3 代码审计流程建议
+
+1. 识别鉴权框架：查看pom.xml或build.gradle，确定使用的Shiro、JWT库版本。
+2. 定位配置文件：搜索anon、authc、secret、jwt等关键词，分析鉴权规则。
+3. 跟踪敏感接口：列出增删改查等操作对应的Controller，检查其是否受鉴权保护。
+4. 验证漏洞：构造请求测试未授权访问或绕过。
+5. 检查JWT实现：跟踪Token生成与验证逻辑，确认签名算法、密钥来源及校验强度。
+
+---
+
+5. 结语
+
+鉴权漏洞是Web应用的高危风险之一，Shiro和JWT作为Java生态中主流的鉴权方案，其配置复杂性和实现细节往往成为攻击者的突破口。通过本文的案例分析，我们可以看到，无论是Shiro的配置疏漏还是JWT的密钥管理不当，都可能导致严重的安全问题。开发者在选用这些技术时，必须深入理解其原理，遵循最小权限原则，并定期进行安全审计。安全人员也应掌握从代码层面发现鉴权漏洞的方法，从而在研发阶段提前消除隐患，筑牢应用的安全防线。
+
+---
+
+参考文献
+
+· Apache Shiro Documentation
+· JWT RFC 7519
+· CVE-2020-11989 (Shiro路径绕过)
+· Nacos官方安全公告
