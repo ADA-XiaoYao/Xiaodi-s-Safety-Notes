@@ -1,0 +1,125 @@
+在Java EE的Web应用安全体系中，权限控制是至关重要的防线。开发者通常使用Interceptor（拦截器） 或Filter（过滤器）对请求进行前置处理，通过校验Session或Token来识别用户身份。然而，当复杂的URL解析逻辑遇到开发者的惯性思维，往往会产生致命的“认知偏差”——开发者眼中的路径与容器最终路由的路径可能并不一致。
+
+本文将结合多个开源系统的真实漏洞案例，深入探讨在Interceptor和Filter中因路径解析差异导致的鉴权绕过技术，并剖析其背后的根本原因。
+
+1. 基础概念：Interceptor与Filter的定位
+
+在进入实战之前，需要明确两者的区别。虽然在鉴权功能上它们有重叠，但执行层级不同：
+
+· Filter（过滤器）：基于Servlet规范，在请求进入ServletContainer后、进入Servlet前生效。它是基于回调函数实现的，对请求和响应进行拦截，通常用于字符编码、日志记录、以及最核心的URL级别的访问控制 。
+· Interceptor（拦截器）：基于Spring MVC等框架，依赖于IoC容器。它工作在DispatcherServlet之后，Controller之前，作用于方法层面，可以获取具体的Handler对象，更适合做细粒度的权限验证或日志审计。
+
+无论是Filter还是Interceptor，鉴权的核心逻辑通常都包含一段相似的代码：获取请求URI，判断是否包含特定的管理路径（如/admin），并检查用户是否已登录。
+
+2. Interceptor鉴权绕过案例实战
+
+案例1：NewbeeMall的 ; 截断利用
+
+漏洞原理：AdminLoginInterceptor 的 preHandle 方法中，通过 request.getRequestURI() 获取路径，判断是否以 /admin 开头且Session中无 loginUser 属性。
+利用方式：
+
+```
+/;/admin/xxx
+//admin/xxx
+```
+
+深层原因：虽然URI以 / 开头，但由于Tomcat等容器的解析特性，; 作为矩阵参数的标识符，在处理时会被忽略或特殊解析。导致拦截器判断路径并非严格意义上的 /admin 开头（或匹配失败），而实际路由却成功定位到了后台Controller 。
+
+案例2：医药管理系统的@IgnoreAuth误用
+
+漏洞原理：该系统使用 AuthorizationInterceptor 进行拦截，对于配置了 @IgnoreAuth 注解的接口（如重置密码、文件上传）放行。
+利用方式1 - 路径穿越：
+
+```
+/dictionary/page/../../yonghu/resetPass
+```
+
+当拦截器校验 /dictionary/page 时，发现其不在白名单且需要权限，但校验通过后，实际Servlet解析的路径却是 yonghu/resetPass。
+利用方式2 - 逻辑调用：
+攻击者直接寻找标记了 @IgnoreAuth 的接口（如 resetPass），通过调用这些本应结合权限校验的接口来修改他人密码。
+
+案例3：个人博客系统的/admin/login/..;/绕过
+
+漏洞原理：BaseInterceptor 在校验时，判断如果Session存在，则允许访问。开发者意图是放过 /admin/login 让其执行登录逻辑，但在路径处理上存在缺陷 。
+利用方式：
+
+```
+/admin/login/../../admin/article/publish
+```
+
+攻击者利用 ..;/ 进行路径回溯。/admin/login 被拦截器放行，但经过路径标准化（normalize）后，实际请求映射到了需要更高权限的 /admin/article/publish。这里的关键点在于标准化函数（如 StringUtils.cleanPath）的执行时机与拦截器校验顺序不一致 。
+
+3. Filter鉴权绕过案例实战
+
+案例4：华夏ERP的contains逻辑缺陷
+
+漏洞原理：LogCostFilter 在 doFilter 中，使用 requestUrl.contains(allowUrl) 来判断请求URL是否包含白名单字符串（如 /login.html、.css）。
+利用方式：
+
+```
+/login.html/../account/getAccount
+/xiaodi.css/../account/getAccount
+/user/login/../../account/getAccount
+```
+
+成因分析：这是一个典型的黑名单逻辑绕过。由于使用了 contains 而非 startsWith 或精确的路径匹配，只要URL字符串中包含 .css 或 login.html，过滤器就放行。经过路径解析后，.. 回退路径，最终指向了真实的业务接口 。
+
+案例5：Tmall商城的路径前缀误判
+
+漏洞原理：AdminPermissionFilter 在 doFilter 中通过 requestURI.contains("/xx/xx") 来校验是否包含管理员路径前缀，企图绕过管理权限验证 。
+利用方式：
+
+```
+/xx/xx/../../tmall/admin/uploadAdminHeadImage
+```
+
+通过在URL前添加一个包含特定字符串（/xx/xx）的路径，先骗过Filter的校验，再利用路径回溯寻址到真正的 admin 接口。这本质上是利用了Filter对路径的校验与Servlet对路径的路由之间的时间差与解析差异。
+
+4. 原理深化：为什么路径解析会有差异？
+
+要理解上述攻击手法，必须深入理解Java Web容器（如Tomcat）对URL的解析过程。
+
+根据对Tomcat源码的分析 ，请求的处理分为几个关键步骤：
+
+1. CoyoteAdapter 解析：接收原始请求，调用 postParseRequest() 处理URL。
+2. Mapper 路由：Tomcat的 Mapper 组件负责将请求映射到具体的 Host -> Context -> Wrapper (Servlet)。这个过程包括对路径的标准化处理，如：
+   · 移除路径中的 /./ 和 /../。
+   · 处理矩阵变量 ;。
+   · 处理多个连续的斜杠 //。
+3. FilterChain 执行：路由确定后，请求才进入配置好的Filter链。
+
+绕过漏洞的核心矛盾在于：
+过滤器/拦截器在判断权限时，往往直接基于原始字符串进行简单的逻辑判断（如 startsWith("/admin") 或 contains("/admin/")）。
+而容器在最后分发请求时，会执行URL标准化（如处理 .. 和 ;）。
+
+攻击者正是利用了这种不一致性：构造一个既能被Filter放行（如包含/admin/login），又能让容器解析到受限资源（如/admin/user）的复杂路径。
+
+5. 安全设计与修复方案
+
+基于上述案例分析，要构建健壮的鉴权体系，不能仅依赖简单的字符串匹配，而需要建立统一、严格的路径处理机制。
+
+1. 使用标准化的路径进行比较
+   在Filter或Interceptor中获取请求URI后，必须先进行标准化处理（如Spring中的 StringUtils.cleanPath，或 new URI(uri).normalize()），再对标准化后的路径进行权限校验 。
+   ```java
+   // 错误示例
+   if (requestURI.startsWith("/admin")) { checkLogin(); }
+   
+   // 正确示例
+   String requestURI = request.getRequestURI();
+   String normalizedPath = normalize(requestURI); // 处理掉 ../ ; // 等
+   if (isAdminPath(normalizedPath)) { // 比如 /admin 开头
+       checkLogin();
+   }
+   ```
+2. 避免模糊的包含匹配
+   严禁使用 String.contains() 来判断路径权限。必须明确区分“精确匹配”、“前缀匹配”和“后缀匹配”。对于静态资源（.css, .js, .png）的放行，应基于标准化路径后的文件扩展名进行精确判断，并注意防范 /1.css/../ 的绕过 。
+3. 统一的安全层
+   建议采用业界成熟的安全框架（如Apache Shiro、Spring Security）。它们内部已经处理了大量的路径解析歧义问题，并提供了Ant风格路径匹配规则（如 /admin/**），能有效避免手写逻辑带来的漏洞 。
+4. 多重验证
+   对于核心业务（如修改密码、转账），除了Filter/Interceptor的URL级别校验，在Controller的业务逻辑中也应从Session或Token中再次校验用户身份，确保即使请求绕过拦截器，也无法执行非法操作 。
+
+结语
+
+从NewbeeMall的简单 ; 绕过，到华夏ERP复杂的 contains 逻辑漏洞，再到个人博客系统的 ..; 攻击，这些案例都揭示了一个核心原则：在安全领域，不能依赖“我以为”的逻辑，而必须遵循“实际上是”的规范。
+
+开发者在编写鉴权代码时，必须将自己置于攻击者的视角，深刻理解容器对URL的解析规则。只有这样，才能在Interceptor与Filter这两道重要防线上，真正守护好应用的后花园。
