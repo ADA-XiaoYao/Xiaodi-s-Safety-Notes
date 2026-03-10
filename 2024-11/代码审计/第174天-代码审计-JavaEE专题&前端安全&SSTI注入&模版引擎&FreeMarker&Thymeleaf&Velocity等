@@ -1,0 +1,98 @@
+摘要：模板注入（SSTI）漏洞是Java Web应用中一类严重的安全威胁。攻击者通过向模板中注入恶意代码，可在服务端执行任意命令。本文以FreeMarker、Thymeleaf和Velocity三大常用模板引擎为例，深入剖析SSTI漏洞的形成原理、多种利用手法及相应的修复策略，帮助开发者与安全人员构建更安全的Java应用。
+
+一、引言：当模板成为攻击入口
+
+在现代化的Java Web开发中，模板引擎广泛应用于视图层渲染，实现了业务逻辑与展示逻辑的分离。然而，当用户输入被未经严格过滤地拼接到模板中时，便可能引发服务端模板注入漏洞。攻击者可借此绕过模板引擎的沙箱限制，执行任意系统命令，直接威胁服务器安全。
+
+二、FreeMarker引擎漏洞分析（以Halo、Mtons为例）
+
+FreeMarker是Java生态中使用广泛的模板引擎，其通过<#assign>指令和?new()操作符提供了强大的扩展能力，但也因此引入风险。
+
+1. 漏洞原理与利用
+
+FreeMarker模板中包含多种FTL指令，其中<#assign>指令可创建变量并实例化类。攻击者常利用内置的危险工具类构造Payload，最典型的如：
+
+```ftl
+<#assign value="freemarker.template.utility.Execute"?new()>${value("calc.exe")}
+```
+
+该Payload通过Execute类的exec方法直接执行系统命令。除Execute外，ObjectConstructor类同样危险，可利用反射调用ProcessBuilder：
+
+```ftl
+<#assign value="freemarker.template.utility.ObjectConstructor"?new()>
+${value("java.lang.ProcessBuilder","calc").start()}
+```
+
+理论上，JythonRuntime类可执行Python脚本，但依赖特定环境，利用价值相对有限。
+
+2. 漏洞触发过程
+
+从源码层面分析，FreeMarker处理模板时，Environment.visit()方法会递归遍历模板节点。当解析到${value("calc.exe")}时，调用栈最终进入Execute.exec()，通过ProcessBuilder启动进程。整个过程本质是模板引擎将用户控制的FTL代码作为合法指令解析执行。
+
+3. 修复与防御
+
+FreeMarker官方提供了多层防御机制：
+
+· 配置类解析器：通过setNewBuiltinClassResolver()限制可加载的类。推荐使用SAFER_RESOLVER，它直接禁止Execute、ObjectConstructor等危险类的加载。
+· 禁用危险API：2.3.22版本后api_builtin_enabled默认为false，防止调用getClassLoader()等敏感方法。最新版本内置了详尽的unsafeMethods.properties黑名单。
+· 开发者需主动配置：需注意，上述安全配置并非默认开启，开发者必须显式设置，例如：
+  ```java
+  config.setNewBuiltinClassResolver(TemplateClassResolver.SAFER_RESOLVER);
+  config.setSetting("api_builtin_enabled", "false"); // 确保为false
+  ```
+
+三、Thymeleaf引擎漏洞分析（以RuoYi为例）
+
+Thymeleaf是Spring Boot官方推荐的模板引擎，其漏洞模式有别于FreeMarker。
+
+1. 漏洞原理与利用
+
+当Controller中使用@ResponseBody注解或返回值直接为字符串且拼接用户输入时，若配置了特定的TemplateResolver，攻击者可通过可控的return值或fragment参数注入表达式。典型Payload如下：
+
+```java
+${T(java.lang.Runtime).getRuntime().exec("calc.exe")}
+```
+
+Thymeleaf的表达式语法（${...}）支持完整的Spring表达式语言（SpEL），攻击者可利用T()操作符调用任意Java类。在Ruoyi等后台管理系统中，若未对fragment参数进行严格过滤，攻击者可通过访问/index::${...}类似路径触发漏洞。
+
+2. 修复建议
+
+· 避免用户控制返回值：严禁直接将用户输入作为视图名称或片段表达式的一部分。
+· 配置严格的模板解析器：限制表达式所能访问的类与方法，启用Spring Security的表达式求值沙箱。
+
+四、Velocity引擎漏洞分析（以JPress为例）
+
+Velocity虽较老旧，但在JPress等CMS中仍有应用，其漏洞利用常需结合其他组件。
+
+1. 漏洞原理与利用
+
+在JPress V4.2中，评论功能存在SSTI漏洞。当管理员开启邮件通知后，用户评论中的#(comment.id)等占位符会被Velocity模板引擎渲染。攻击者构造包含Velocity指令的评论，可导致命令执行。一个关键PoC利用了Fastjson的AutoType特性：
+
+```velocity
+#set(x=com.alibaba.fastjson.parser.ParserConfig::getGlobalInstance())
+#(x.setAutoTypeSupport(true))
+#set(sem=...省略...)  // 通过字符串操作绕过引号过滤
+#(e.eval('java.lang.Runtime.getRuntime().exec("calc")'))
+```
+
+此案例展示了两个关键点：多组件联合利用（Velocity + Fastjson）以及针对过滤的绕过（通过comment.content获取无引号字符串）。
+
+2. 漏洞修复
+
+JPress在后续版本中采用输入转义作为主要防御手段。在请求入口处，通过XSSHttpServletRequestWrapper的escapeHtml()方法对参数进行HTML转义，破坏了模板指令的结构。这种方式简单有效，但需注意转义需在模板渲染之前完成。
+
+五、总结与纵深防御体系
+
+引擎 典型利用方式 核心防御点
+FreeMarker <#assign ...?new()>调用Execute等内置类 配置类解析器为SAFER_RESOLVER，禁用危险API
+Thymeleaf 通过return或fragment注入SpEL表达式（T(...).exec） 避免用户控制视图名，严格限制表达式上下文
+Velocity 结合#set、#foreach等指令与Fastjson等第三方库 在输入层进行严格的字符转义与过滤
+
+构建对SSTI漏洞的防御能力，需要建立纵深防御体系：
+
+1. 输入层：实施严格的输入验证与输出编码，对所有用户可控的模板内容进行转义，防止其被解析为指令。
+2. 模板配置层：遵循最小权限原则，禁用不必要的危险内置函数（如FreeMarker的?new），配置安全的类解析器。
+3. 运行环境层：利用Java安全管理器（Security Manager）限制模板引擎代码的权限，禁止其执行exec等系统级操作。
+4. 审计与测试层：在开发与CI/CD流程中集成自动化代码审计工具，扫描模板中是否拼接了用户输入，并对所有模板渲染接口进行渗透测试。
+
+理解SSTI漏洞的本质——即用户输入被模板引擎当作代码执行——是有效防御的前提。开发者需时刻警惕：任何将用户输入直接嵌入模板的行为，都可能为攻击者打开通往服务器内部的大门。
