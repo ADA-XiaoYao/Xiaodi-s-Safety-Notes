@@ -1,0 +1,349 @@
+> 本文档旨在详细阐述如何从零开始，构建一个基于 AI 的代码审计系统（AI Code Audit System）。我们将采用 ThinkPHP 8 框架作为后端基础，结合 Bootstrap 5 构建现代化前端界面，并利用大语言模型（LLM）的潜力赋能代码安全审计。本文将从系统概述、技术原理、环境准备、实战开发、关键细节到安全总结，提供一个完整的开发与学习路径。
+
+## **一、 概述 (Overview)**
+
+在软件开发生命周期（SDL）中，代码审计是保障应用安全至关重要的一环。传统的代码审计依赖于人工经验和静态/动态分析工具（SAST/DAST），这些方法虽然有效，但面临着效率低下、规则库更新滞后、误报率高等挑战。
+
+本项目 `CodeqlGPT` 旨在探索一种新的代码审计模式：将强大的 AI 能力与经典的开发框架相结合，构建一个自动化、智能化、可扩展的代码审计平台。系统核心功能包括：
+
+*   **项目管理**：支持创建和管理代码审计项目。
+*   **代码源管理**：通过 Git 地址批量拉取待审计的源代码。
+*   **自动化分析**：未来将集成 CodeQL 等静态分析引擎进行初步扫描。
+*   **AI 赋能审计**：将代码片段和漏洞上下文提交给大语言模型（如 GPT 系列），获取深度的安全分析、漏洞解释和修复建议。
+*   **可视化报告**：以清晰直观的界面展示审计结果。
+
+通过本项目的实践，开发者不仅能掌握 Web 全栈开发技能，更能深入理解如何将 AI 技术应用于网络安全领域，实现 SDL 流程的智能化升级。
+
+## **二、 技术原理 (Technical Principles)**
+
+本系统的技术架构基于经典的 MVC（Model-View-Controller）模式，并在此基础上引入 AI 服务作为核心分析引擎。
+
+1.  **后端框架 (Backend)**
+    *   我们选用 **ThinkPHP 8** 作为后端开发框架。ThinkPHP 是一个轻量级、高性能的国产 PHP 框架，拥有完善的文档和活跃的社区。其强大的数据库操作、路由机制和中间件支持，为快速开发提供了坚实基础。
+
+2.  **前端框架 (Frontend)**
+    *   前端界面采用 **Bootstrap 5** 构建。Bootstrap 是一个流行的前端组件库，提供了丰富的响应式布局和 UI 组件（如模态框、表格、导航栏），能够帮助我们快速搭建专业且美观的管理后台界面。
+
+3.  **数据库 (Database)**
+    *   系统使用 **MySQL** 作为关系型数据库，负责持久化存储项目信息、Git 仓库地址、审计结果等核心数据。通过 `MyISAM` 或 `InnoDB` 存储引擎，确保数据的完整性和可靠性。
+
+4.  **核心交互流程 (Core Workflow)**
+    *   **用户**通过前端界面创建项目并提交一组 Git 仓库地址。
+    *   **控制器 (Controller)** 接收到请求，对数据进行验证和处理。
+    *   **模型 (Model)** 与数据库交互，将项目名称和 Git 地址分别存入 `project` 表和 `git_addr` 表。
+    *   **视图 (View)** 从控制器获取数据（如项目列表），并动态渲染成 HTML 页面展示给用户。
+    *   后续版本中，后台任务将克隆 Git 仓库，调用 CodeQL 或其他分析工具扫描代码，并将发现的潜在漏洞点提交给 **AI 服务**进行深度分析和研判。
+
+## **三、 环境准备 (Environment Setup)**
+
+在开始编码之前，请确保您的开发环境已正确配置。
+
+1.  **Web 服务器**
+    *   推荐使用集成的开发环境，如 **phpStudy**、XAMPP 或 Laragon。这些工具内置了 Apache/Nginx、PHP 和 MySQL，可以一键启动和管理 Web 服务。
+    *   **关键配置**：启动服务后，需要配置 URL 重写。对于 Apache，请确保 `mod_rewrite` 模块已启用，并在项目根目录的 `.htaccess` 文件中添加以下规则，以便将所有请求路由到 `index.php` 入口文件，这是现代 PHP 框架实现优雅链接（Pretty URLs）的基础。
+
+        ```apache
+        <IfModule mod_rewrite.c>
+          Options +FollowSymlinks -Multiviews
+          RewriteEngine On
+        
+          RewriteCond %{REQUEST_FILENAME} !-d
+          RewriteCond %{REQUEST_FILENAME} !-f
+          RewriteRule ^(.*)$ index.php [L,E=PATH_INFO:$1]
+        </IfModule>
+        ```
+
+2.  **PHP 环境**
+    *   **版本要求**：ThinkPHP 8 要求 PHP 版本 >= 8.0。
+    *   **环境变量**：将 PHP 的可执行文件路径添加到系统的 `PATH` 环境变量中。这样您就可以在任何目录下通过命令行直接执行 `php` 命令。
+        *   验证安装：`php -v`
+
+3.  **Composer**
+    *   Composer 是 PHP 的依赖管理工具，用于安装和管理项目所需的各种库。
+    *   **安装**：请从 [getcomposer.org](https://getcomposer.org/) 下载并根据官方指引进行安装。
+    *   **环境变量**：同样，确保 Composer 的路径已加入系统 `PATH`。
+    *   **更换镜像源（推荐）**：由于网络原因，建议将 Composer 的默认源更换为国内镜像，以加快下载速度。
+        ```bash
+        composer config -g repo.packagist composer https://mirrors.aliyun.com/composer/
+        ```
+    *   验证安装：`composer --version`
+
+## **四、 实战示例 (Implementation)**
+
+接下来，我们将分步实现系统的核心功能。
+
+### **步骤 1：安装 ThinkPHP 框架**
+
+打开命令行工具，进入您的 Web 服务器根目录（如 `phpstudy/www`），执行以下命令创建一个名为 `CodeqlGPT` 的新项目。
+
+```bash
+composer create-project topthink/think CodeqlGPT
+```
+
+### **步骤 2：集成视图与前端资源**
+
+为了渲染 HTML 页面，我们需要引入 ThinkPHP 的视图驱动。
+
+```bash
+cd CodeqlGPT
+composer require topthink/think-view
+```
+
+接下来，将 Bootstrap 5 的 CSS 和 JS 文件下载到 `public` 目录下，并在视图模板中正确引用。一个典型的基础模板 `app/view/index/index.html` 结构如下：
+
+```html
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CodeqlGPT - AI 代码审计系统</title>
+    <!-- 确保路径正确指向 public 目录下的资源 -->
+    <link href="/static/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <!-- 页面内容将在这里填充 -->
+    <h1>Hello, world!</h1>
+
+    <!-- 确保路径正确指向 public 目录下的资源 -->
+    <script src="/static/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+```
+
+修改控制器 `app/controller/Index.php`，使其渲染该视图。
+
+```php
+<?php
+namespace app\controller;
+
+use app\BaseController;
+use think\facade\View;
+
+class Index extends BaseController
+{
+    public function index()
+    {
+        // 使用 View::fetch 方法渲染视图文件
+        return View::fetch('index');
+    }
+}
+```
+
+### **步骤 3：数据库设计与创建**
+
+根据系统需求，我们设计两张核心表：`project` 用于存储项目信息，`git_addr` 用于存储项目关联的 Git 仓库地址。
+
+在 MySQL 客户端（如 Navicat 或 phpMyAdmin）中执行以下 SQL 语句创建数据库和表。
+
+```sql
+-- 创建数据库
+CREATE DATABASE `codeql_gpt` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+
+-- 切换到该数据库
+USE `codeql_gpt`;
+
+-- 创建项目表
+CREATE TABLE `project` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `name` varchar(255) DEFAULT NULL COMMENT '项目名称',
+  `create_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `update_time` datetime DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  PRIMARY KEY (`id`)
+) ENGINE=MyISAM DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- 创建 Git 地址表
+CREATE TABLE `git_addr` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `project_id` int(11) NOT NULL DEFAULT '0' COMMENT '关联的项目ID',
+  `addr` varchar(255) NOT NULL DEFAULT '' COMMENT 'Git仓库地址',
+  `create_time` datetime DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `update_time` datetime DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  PRIMARY KEY (`id`)
+) ENGINE=MyISAM DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+```
+
+### **步骤 4：实现项目管理功能**
+
+我们将创建一个 `Project` 控制器来处理项目的增、删、查等操作。
+
+**1. 创建控制器**
+
+在 `app/controller` 目录下新建 `Project.php`。
+
+**2. 添加项目功能**
+
+*   **前端**：在视图文件中，使用 Bootstrap 的模态框（Modal）作为添加项目的表单。
+
+    ```html
+    <!-- 触发模态框的按钮 -->
+    <button type="button" class="btn btn-outline-primary" data-bs-toggle="modal" data-bs-target="#addProjectModal">
+      添加项目
+    </button>
+    
+    <!-- 模态框 -->
+    <div class="modal fade" id="addProjectModal" tabindex="-1">
+      <!-- ... 模态框的 HTML 结构 ... -->
+      <form action="{:url('project/_add')}" method="post">
+          <div class="mb-3">
+              <label for="projectName" class="form-label">项目名称</label>
+              <input type="text" class="form-control" id="projectName" name="name" required>
+          </div>
+          <div class="mb-3">
+              <label for="gitAddrs" class="form-label">Git 地址 (每行一个)</label>
+              <textarea class="form-control" id="gitAddrs" name="git_addrs" rows="5"></textarea>
+          </div>
+          <button type="submit" class="btn btn-primary">提交</button>
+      </form>
+      <!-- ... -->
+    </div>
+    ```
+
+*   **后端**：在 `Project.php` 控制器中创建 `_add` 方法处理表单提交。
+
+    ```php
+    <?php
+    namespace app\controller;
+    
+    use app\BaseController;
+    use think\facade\Db;
+    use think\Request;
+    
+    class Project extends BaseController
+    {
+        public function _add(Request $request)
+        {
+            // 接收前端传递的参数
+            $name = $request->param('name');
+            $gitAddrs = $request->param('git_addrs');
+    
+            // 使用数据库事务确保数据一致性
+            Db::startTrans();
+            try {
+                // 1. 在 project 表中插入项目名称，并获取自增ID
+                $projectId = Db::table('project')->insertGetId([
+                    'name' => $name,
+                ]);
+    
+                // 2. 处理 Git 地址
+                $gitAddrArr = explode("\n", $gitAddrs);
+                $gitData = [];
+                foreach ($gitAddrArr as $gitAddr) {
+                    $gitAddr = trim($gitAddr);
+                    if (!empty($gitAddr)) { // 忽略空行
+                        $gitData[] = [
+                            'project_id' => $projectId,
+                            'addr' => $gitAddr,
+                        ];
+                    }
+                }
+    
+                // 3. 批量插入 Git 地址到 git_addr 表
+                if (!empty($gitData)) {
+                    Db::table('git_addr')->insertAll($gitData);
+                }
+    
+                // 提交事务
+                Db::commit();
+            } catch (\Exception $e) {
+                // 回滚事务
+                Db::rollback();
+                // 此处可以记录日志或返回错误信息
+                return '添加失败：' . $e->getMessage();
+            }
+    
+            // 操作成功后重定向到项目列表页
+            return redirect((string)url('project/index'));
+        }
+    }
+    ```
+
+**3. 列表展示与删除功能**
+
+*   **后端**：在 `Project.php` 中添加 `index` 方法查询数据并分配到视图，以及 `_del` 方法处理删除请求。
+
+    ```php
+    // ... 在 Project 控制器中 ...
+    
+    public function index()
+    {
+        // 查询 project 表的所有数据，并按创建时间降序排列
+        $list = Db::table('project')->order('create_time', 'desc')->select();
+        
+        // 将数据分配给视图
+        return View::fetch('index', ['list' => $list]);
+    }
+    
+    public function _del(Request $request)
+    {
+        $id = $request->param('id');
+        if ($id) {
+            // 同时删除 project 表和关联的 git_addr 表中的数据
+            Db::startTrans();
+            try {
+                Db::table('project')->where('id', $id)->delete();
+                Db::table('git_addr')->where('project_id', $id)->delete();
+                Db::commit();
+            } catch (\Exception $e) {
+                Db::rollback();
+                return '删除失败：' . $e->getMessage();
+            }
+        }
+        return redirect((string)url('project/index'));
+    }
+    ```
+
+*   **前端**：在 `project/index.html` 视图中，使用循环遍历 `$list` 数据并生成表格。
+
+    ```html
+    <table class="table table-hover">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>项目名称</th>
+                <th>创建时间</th>
+                <th>操作</th>
+            </tr>
+        </thead>
+        <tbody>
+            <?php foreach ($list as $item) { ?>
+            <tr>
+                <td>{$item['id']}</td>
+                <td>{$item['name']}</td>
+                <td>{$item['create_time']}</td>
+                <td>
+                    <a href="#" class="btn btn-sm btn-outline-info">详情</a>
+                    <!-- 使用 ThinkPHP 的 url 函数生成删除链接 -->
+                    <a href="{:url('_del', ['id' => $item['id']])}" class="btn btn-sm btn-outline-danger" onclick="return confirm('确定要删除此项目及其所有关联数据吗？');">删除</a>
+                </td>
+            </tr>
+            <?php } ?>
+        </tbody>
+    </table>
+    ```
+
+## **五、 关键细节 (Key Details)**
+
+1.  **数据库事务 (Database Transactions)**
+    *   在“添加项目”功能中，我们同时操作了 `project` 和 `git_addr` 两张表。为了保证数据的一致性（要么都成功，要么都失败），必须使用数据库事务。通过 `Db::startTrans()`、`Db::commit()` 和 `Db::rollback()` 可以轻松实现。
+
+2.  **URL 生成与路由**
+    *   在视图中，我们使用 `{:url('controller/action', ['param' => 'value'])}` 的方式动态生成 URL。这样做的好处是，即使未来修改了路由规则，也无需更改模板代码，增强了代码的可维护性。
+
+3.  **安全输入**
+    *   虽然 ThinkPHP 框架在底层对输入做了一定的过滤，但在接收用户输入时，始终要保持警惕。对于 `_add` 方法中的 `$name` 和 `$gitAddrs`，在存入数据库前应进行严格的验证和清理，例如限制长度、过滤特殊字符，以防止 XSS 或 SQL 注入等攻击。
+
+4.  **用户体验**
+    *   在删除操作上，增加了一个 `onclick` JavaScript 确认框 (`return confirm(...)`)。这是一个简单但非常有效的防止用户误操作的设计。
+
+## **六、 安全总结 (Security Summary)**
+
+从零构建一个代码审计系统本身就是一次深刻的安全实践。在当前阶段，我们已经搭建了基础框架，但从安全角度看，仍有许多工作要做：
+
+*   **输入验证**：所有来自用户的输入都必须被视为不可信的。需要对项目名称、Git 地址等参数进行严格的格式和内容验证。
+*   **权限控制**：当前系统没有任何用户认证和授权机制。下一步需要引入用户登录、注册和基于角色的访问控制（RBAC），确保只有授权用户才能执行敏感操作。
+*   **依赖安全**：定期使用 `composer outdated` 或 `composer audit` 命令检查项目依赖是否存在已知的安全漏洞，并及时更新。
+*   **安全配置**：确保生产环境关闭了 ThinkPHP 的调试模式，并配置了详细的错误日志记录，避免敏感信息泄露。
+*   **后续风险**：当系统集成代码拉取和分析功能时，将引入新的攻击面。例如，恶意的 Git 仓库可能包含导致命令注入的 payload，执行代码分析的沙箱环境必须被严格隔离。
+
+本文档为 `CodeqlGPT` 项目奠定了坚实的第一步。后续的开发将聚焦于自动化代码拉取、集成静态分析引擎以及与大语言模型 API 的交互，最终实现一个真正智能化的代码审计平台。
