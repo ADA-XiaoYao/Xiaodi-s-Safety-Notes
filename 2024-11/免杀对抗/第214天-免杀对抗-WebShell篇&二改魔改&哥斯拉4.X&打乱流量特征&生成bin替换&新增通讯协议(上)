@@ -1,0 +1,156 @@
+
+## 1. 概述 (Overview)
+
+本文档旨在深入探讨 Webshell 免杀技术，以知名 Webshell 管理工具“哥斯拉”（Godzilla）为例，详细阐述如何通过修改其客户端源码，实现对默认通信协议、数据特征及行为指纹的深度定制，从而有效规避 WAF、IDS 等网络安全设备的检测。本文将从技术原理出发，结合实际的代码修改和攻击流程，提供一份可操作性强的实战指南。
+
+**学习目标：**
+- 掌握反编译 Java JAR 文件并重建项目工程的方法。
+- 理解哥斯拉的流量特征和指纹，并学会如何修改它们。
+- 学习自定义哥斯拉的加密协议和 Shell 生成逻辑，实现基础免杀。
+- 培养从攻防对抗角度分析工具、发现弱点并进行二次开发的能力。
+
+---
+
+## 2. 技术原理 (Technical Principles)
+
+哥斯拉客户端与 Webshell 服务端之间的通信具有明显的特征，这些特征是安全设备检测和识别的关键依据。魔改的核心思想就是**消除或伪装这些固有特征**。
+
+- **静态特征：**
+    - **默认 Shell 模板：** 哥斯拉为 PHP、JSP、ASPX 等语言提供了默认的 Webshell 脚本模板。这些模板的代码结构（如使用 `eval`、`assert`、base64 解码等）是静态扫描的重点对象。
+    - **客户端指纹：** 客户端 JAR 文件本身的 Hash 值、内置的字符串（如版权信息、默认 User-Agent）等都可能被用作识别特征。
+
+- **动态特征（流量特征）：**
+    - **HTTP 请求头：** 默认的 `User-Agent`、`Accept`、`Cookie` 等字段组合构成了固定的请求指纹。
+    - **HTTP 请求体：** 哥斯拉使用一套独特的加密和编码机制来传输数据。例如，它会将原始 payload 进行加密（如 XOR 异或加密），然后进行 Base64 编码。这种“加密+编码”的固定模式是流量分析的突破口。
+    - **HTTP 响应体：** Webshell 的回显数据同样经过加密处理。安全设备可以通过分析响应包的结构（例如，一段看似随机但具有特定格式的数据）来识别哥斯拉的通信。
+
+我们的魔改工作将围绕以上三点展开，通过修改源码，让哥斯拉的静态文件和动态流量都变得“独一无二”。
+
+---
+
+## 3. 环境准备 (Environment Setup)
+
+在开始魔改之前，需要准备以下开发环境和工具：
+
+- **Java Development Kit (JDK):** 推荐使用 JDK 8 或 JDK 17，具体版本取决于哥斯拉原项目编译时使用的版本。
+- **IntelliJ IDEA:** 一款功能强大的 Java 集成开发环境，其内置的 Java Decompiler 工具非常适合本次任务。
+- **哥斯拉客户端 JAR 包:** 从官方或已知渠道获取 `godzilla.jar` 文件。
+- **Java Decompiler:** 虽然 IDEA 自带，但也可以使用独立的 JD-GUI 或在线反编译工具作为辅助。
+
+---
+
+## 4. 实战示例 (Hands-on Examples)
+
+### 4.1. 反编译 JAR 并构建项目
+
+第一步是将哥斯拉的 `.jar` 文件反编译成可读的 Java 源码，并在 IDEA 中重建项目。
+
+**步骤 1：使用 IDEA 插件进行反编译**
+
+推荐使用 IDEA 内置的反编译器，因为它能更好地还原项目结构。可以使用以下命令行（请根据您的实际路径修改）：
+
+```bash
+# 语法: java -cp "[IDEA插件路径]" org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler [选项] [目标JAR] [输出目录]
+# 示例 (Windows):
+d:\JDK17\bin\java.exe -cp "D:/IntelliJ IDEA 2025.2.3/plugins/java-decompiler/lib/java-decompiler.jar" org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler -dgs=true godzilla.jar godzillasrc
+```
+> **命令解释:**
+> - `-cp`: 指定 classpath，这里指向 IDEA 的反编译工具库。
+> - `org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler`: 指定要运行的主类。
+> - `-dgs=true`: 一个高级选项，有助于生成更可读的源码。
+> - `godzilla.jar`: 需要反编译的目标文件。
+> - `godzillasrc`: 存放反编译后源码的目录。
+
+**步骤 2：在 IDEA 中创建新项目**
+
+1.  在 IDEA 中创建一个新的空 Java 项目。
+2.  将反编译生成的 `godzillasrc` 目录下的所有源码文件复制到新项目的 `src` 目录下。
+3.  哥斯拉可能依赖一些外部库，通常在原始 JAR 的 `lib` 目录中。将这些库文件（如 `javafx-*.jar`）复制到新项目的 `lib` 文件夹下，并在 IDEA 中将它们添加为项目依赖（`File` -> `Project Structure` -> `Modules` -> `Dependencies` -> `+` -> `JARs or directories...`）。
+4.  配置项目的 Artifacts（工件），以便能将修改后的代码重新打包成可执行的 JAR 文件。
+    - 进入 `File` -> `Project Structure` -> `Artifacts` -> `+` -> `JAR` -> `From modules with dependencies...`。
+    - **Main Class:** 选择哥斯拉的启动主类，通常是 `core.ApplicationConfig` 或类似的入口类。
+    - 确保所有依赖项都已包含在内。
+
+### 4.2. 修改静态特征与流量指纹
+
+完成项目构建后，我们开始修改代码中的硬编码特征。
+
+**步骤 1：修改版权和UI信息**
+
+这是最基础的修改，可以改变工具的表面特征。
+
+- **文件路径:** `core/ui/MainActivity.java`
+- **修改内容:** 搜索并替换窗口标题、关于信息等字符串，使其不再包含 "Godzilla" 等关键字。
+
+**步骤 2：修改默认 HTTP 请求头**
+
+修改默认的 `User-Agent` 和 `Accept` 等字段，是绕过基于请求头规则检测的第一步。
+
+- **文件路径:** `core/ui/component/frame/ShellSetting.java`
+- **定位方法:**
+    - `initAddShellValue()`: 用于添加新 Shell 时的默认配置。
+    - `initUpdateShellValue()`: 用于修改已有 Shell 时的配置。
+- **修改示例:**
+
+```java
+// 在 ShellSetting.java 中找到类似下面的代码
+this.httpHeaderTextField.setText("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:84.0) Gecko/20100101 Firefox/84.0\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8\r\nAccept-Language: zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2");
+
+// 修改为更常见或更具迷惑性的值
+this.httpHeaderTextField.setText("User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1\r\nAccept: */*\r\nAccept-Language: en-US,en;q=0.9");
+```
+
+**步骤 3：去除客户端 Hash 验证（可选）**
+
+某些版本的哥斯拉可能有自校验机制，修改后可能无法启动。可以尝试定位并移除这些校验。
+
+- **文件路径:** `core/ApplicationConfig.java`
+- **修改内容:** 查找与文件完整性、Hash 校验相关的代码块，并将其注释或移除。
+
+### 4.3. 自定义加密协议与 Shell 生成
+
+这是魔改的核心，通过改变加密方式和 Shell 代码来绕过深度包检测（DPI）。
+
+**步骤 1：修改默认 Shell 生成模板**
+
+哥斯拉的 Shell 模板通常以 `.bin` 文件的形式存储在资源中，并在运行时由对应的 Java 类加载和处理。
+
+- **相关文件:**
+    - `payload/php/base64.bin` (加密 Shell 模板)
+    - `core/shell/payload/php/PhpXor.java` (处理该模板的 Java 类)
+- **修改思路:**
+    1.  **修改 `PhpXor.java`:** 这个类负责生成最终的 PHP Webshell。可以修改其中的 `generate` 方法，改变 PHP 代码的结构。例如，将 `eval(base64_decode(...))` 替换为 `include(data://text/plain;base64,...)` 或使用其他 PHP 的代码执行技巧。
+    2.  **修改 `base64.bin`:** 这个二进制文件实际上是 PHP Shell 的核心代码模板。可以直接修改其内容，或者在 `PhpXor.java` 中完全重写一个新的模板。
+
+**步骤 2：增加新的加密协议**
+
+为了彻底摆脱默认流量特征，我们可以新增一套自定义的通信协议。
+
+- **示例：创建一个 `PhpXorMessage` 协议**
+    1.  **复制并重命名:** 复制 `PhpXor.java` 为 `PhpXorMessage.java`，并复制 `base64.bin` 为 `xormessage.bin`。
+    2.  **修改 `PhpXorMessage.java`:**
+        - 改变加密逻辑：将简单的 XOR + Base64，改为“数据 + 密钥”拼接后进行 Base64，或者使用 AES 等更强的加密算法。
+        - 修改 payload 格式：在请求体中加入随机的分隔符或标识，使其不再是纯粹的 Base64 字符串。
+    3.  **修改 `xormessage.bin`:** 调整 PHP 服务端代码，使其能够正确解密并执行来自新协议的 payload。
+    4.  **注册新协议:** 在哥斯拉的UI和配置中，添加对 `PhpXorMessage` 协议的支持，使其可以在生成 Shell 时被选择。
+
+---
+
+## 5. 关键细节 (Key Details)
+
+- **动态密钥：** 默认哥斯拉的密钥（`pass`、`key`）是 payload 的一部分。高级的魔改可以实现动态密钥交换，例如每次通信都使用基于时间或随机数生成的一次性密钥，大大增加破解和分析难度。
+- **插件修改：** 哥斯拉的强大之处在于其插件系统。修改或新增插件（如内存马、代理、反弹 Shell 等）的通信方式，同样是免杀工作的重要组成部分。
+- **回显消除：** 默认情况下，哥斯拉的响应包中包含加密后的执行结果。可以修改服务端 Shell，使其将结果写入一个临时文件，然后客户端通过一个看似正常的“文件下载”请求来获取结果，从而将“命令执行”的流量特征伪装成“文件读取”。
+- **多语言适配：** 本文以 PHP 为例，但同样的技术思路完全适用于 JSP 和 ASPX。需要分别找到并修改对应语言的 `Payload` 处理类和 `.bin` 模板文件。
+
+---
+
+## 6. 安全总结 (Security Summary)
+
+通过对哥斯拉客户端的深度魔改，我们成功地改变了其静态特征和动态流量指纹，显著提升了其在实战中的隐蔽性和对抗能力。本次实践的核心收获如下：
+
+1.  **没有绝对安全的工具：** 任何具有固定特征的工具都可能被安全设备识别。真正的威胁来自于攻击者对工具原理的深刻理解和持续的二次开发能力。
+2.  **对抗的本质是特征的博弈：** 免杀与检测的斗争，本质上是在静态和动态特征层面上的持续博弈。作为防守方，应关注异常的通信模式而非固定的工具指纹；作为攻击方，则需要不断地将自己的行为伪装成正常的业务流量。
+3.  **源码分析是进阶的必经之路：** 只有深入源码，才能理解工具的底层逻辑，发现其弱点，并进行精准、有效的定制和优化。
+
+本文仅为“上篇”，后续我们将继续探讨更高级的对抗技巧，如动态密钥协商、插件流量改造以及对其他 Webshell 管理工具的分析。
